@@ -68,9 +68,13 @@ jobs:
         id: libobs
         shell: bash
         run: |
-          lib="$(find build/obs -name 'libobs*.dylib' -o -name 'libobs*.a' | head -n 1)"
+          lib="$(find build/obs -path '*/libobs.framework' -type d | head -n 1)"
+          if [[ -z "$lib" ]]; then
+            lib="$(find build/obs \( -name 'libobs*.dylib' -o -name 'libobs*.a' \) | head -n 1)"
+          fi
           if [[ -z "$lib" ]]; then
             echo "libobs build artifact not found" >&2
+            find build/obs -maxdepth 5 \( -name '*libobs*' -o -name '*.framework' \) -print >&2
             exit 1
           fi
           echo "library=$lib" >> "$GITHUB_OUTPUT"
