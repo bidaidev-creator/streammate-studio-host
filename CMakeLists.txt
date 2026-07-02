@@ -10,6 +10,7 @@ option(STREAMMATE_REQUIRE_LIBOBS "Require a built libobs SDK and call obs_startu
 set(STREAMMATE_OBS_INCLUDE_DIR "" CACHE PATH "Path to libobs headers, typically external/obs-studio/libobs")
 set(STREAMMATE_OBS_LIBRARY "" CACHE FILEPATH "Path to the built libobs library")
 set(STREAMMATE_OBS_DEPS_INCLUDE_DIR "" CACHE PATH "Path to OBS dependency headers, such as SIMDe")
+set(STREAMMATE_OBS_GENERATED_INCLUDE_DIR "" CACHE PATH "Path to generated OBS headers, such as obsconfig.h")
 
 add_executable(studio-host-smoke src/studio_host_smoke.cpp)
 target_compile_definitions(studio-host-smoke PRIVATE
@@ -25,6 +26,9 @@ if(STREAMMATE_REQUIRE_LIBOBS)
   target_include_directories(studio-host-smoke PRIVATE "${STREAMMATE_OBS_INCLUDE_DIR}")
   if(STREAMMATE_OBS_DEPS_INCLUDE_DIR)
     target_include_directories(studio-host-smoke PRIVATE "${STREAMMATE_OBS_DEPS_INCLUDE_DIR}")
+  endif()
+  if(STREAMMATE_OBS_GENERATED_INCLUDE_DIR)
+    target_include_directories(studio-host-smoke PRIVATE "${STREAMMATE_OBS_GENERATED_INCLUDE_DIR}")
   endif()
   target_link_libraries(studio-host-smoke PRIVATE "${STREAMMATE_OBS_LIBRARY}")
 else()

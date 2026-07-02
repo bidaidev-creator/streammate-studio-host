@@ -77,7 +77,14 @@ jobs:
             find build/obs -maxdepth 5 \( -name '*libobs*' -o -name '*.framework' \) -print >&2
             exit 1
           fi
+          obs_config="$(find build/obs -name obsconfig.h | head -n 1)"
+          if [[ -z "$obs_config" ]]; then
+            echo "generated obsconfig.h not found" >&2
+            find build/obs -maxdepth 6 -name '*obsconfig*' -print >&2
+            exit 1
+          fi
           echo "library=$lib" >> "$GITHUB_OUTPUT"
+          echo "generated_include=$(dirname "$obs_config")" >> "$GITHUB_OUTPUT"
 
       - name: Configure obs_startup smoke against built libobs
         run: |
@@ -85,6 +92,7 @@ jobs:
             -DSTREAMMATE_REQUIRE_LIBOBS=ON \
             -DSTREAMMATE_OBS_INCLUDE_DIR="$PWD/external/obs-studio/libobs" \
             -DSTREAMMATE_OBS_DEPS_INCLUDE_DIR="$PWD/external/obs-studio/.deps/obs-deps-2025-08-23-universal/include" \
+            -DSTREAMMATE_OBS_GENERATED_INCLUDE_DIR="$PWD/${{ steps.libobs.outputs.generated_include }}" \
             -DSTREAMMATE_OBS_LIBRARY="$PWD/${{ steps.libobs.outputs.library }}"
 
       - name: Build obs_startup smoke
