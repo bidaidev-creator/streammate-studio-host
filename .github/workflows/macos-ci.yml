@@ -25,10 +25,9 @@ jobs:
         run: |
           brew update
           brew install pkg-config
-          python3 -m pip install --user 'cmake==3.30.5' ninja
-          echo "$HOME/Library/Python/3.13/bin" >> "$GITHUB_PATH"
-          echo "$HOME/Library/Python/3.12/bin" >> "$GITHUB_PATH"
-          echo "$HOME/Library/Python/3.11/bin" >> "$GITHUB_PATH"
+          python3 -m venv "$RUNNER_TEMP/cmake-venv"
+          "$RUNNER_TEMP/cmake-venv/bin/python" -m pip install 'cmake==3.30.5' ninja
+          echo "$RUNNER_TEMP/cmake-venv/bin" >> "$GITHUB_PATH"
 
       - name: Verify upstream pin and fork guard
         run: |
