@@ -26,7 +26,7 @@ jobs:
           brew update
           brew install pkg-config
           python3 -m venv "$RUNNER_TEMP/cmake-venv"
-          "$RUNNER_TEMP/cmake-venv/bin/python" -m pip install 'cmake==3.30.5' ninja
+          "$RUNNER_TEMP/cmake-venv/bin/python" -m pip install 'cmake==3.28.6' ninja
           echo "$RUNNER_TEMP/cmake-venv/bin" >> "$GITHUB_PATH"
 
       - name: Verify upstream pin and fork guard
