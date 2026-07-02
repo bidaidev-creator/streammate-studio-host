@@ -1,0 +1,95 @@
+name: macos-ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  scaffold-and-libobs-smoke:
+    name: macOS scaffold + pinned libobs smoke
+    runs-on: macos-15
+    timeout-minutes: 90
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          brew update
+          brew install cmake ninja pkg-config
+
+      - name: Verify upstream pin and fork guard
+        run: |
+          chmod +x scripts/*.sh
+          ./scripts/fork-guard.sh
+
+      - name: Configure scaffold smoke without libobs
+        run: cmake -S . -B build/scaffold -G Ninja -DSTREAMMATE_REQUIRE_LIBOBS=OFF
+
+      - name: Build scaffold smoke
+        run: cmake --build build/scaffold --target studio-host-smoke
+
+      - name: Run scaffold smoke
+        run: ./build/scaffold/studio-host-smoke
+
+      - name: Configure upstream OBS without Qt frontend
+        run: |
+          cmake -S external/obs-studio -B build/obs -G Xcode \
+            -DENABLE_UI=OFF \
+            -DENABLE_SCRIPTING=OFF \
+            -DENABLE_WEBRTC=OFF \
+            -DENABLE_VST=OFF \
+            -DENABLE_AJA=OFF \
+            -DENABLE_DECKLINK=OFF
+
+      - name: Build libobs and required upstream modules
+        run: |
+          cmake --build build/obs --config RelWithDebInfo --target libobs
+          cmake --build build/obs --config RelWithDebInfo --target obs-outputs || true
+          cmake --build build/obs --config RelWithDebInfo --target obs-x264 || true
+          cmake --build build/obs --config RelWithDebInfo --target obs-browser || true
+
+      - name: Locate built libobs
+        id: libobs
+        shell: bash
+        run: |
+          lib="$(find build/obs -name 'libobs*.dylib' -o -name 'libobs*.a' | head -n 1)"
+          if [[ -z "$lib" ]]; then
+            echo "libobs build artifact not found" >&2
+            exit 1
+          fi
+          echo "library=$lib" >> "$GITHUB_OUTPUT"
+
+      - name: Configure obs_startup smoke against built libobs
+        run: |
+          cmake -S . -B build/host -G Ninja \
+            -DSTREAMMATE_REQUIRE_LIBOBS=ON \
+            -DSTREAMMATE_OBS_INCLUDE_DIR="$PWD/external/obs-studio/libobs" \
+            -DSTREAMMATE_OBS_LIBRARY="$PWD/${{ steps.libobs.outputs.library }}"
+
+      - name: Build obs_startup smoke
+        run: cmake --build build/host --target studio-host-smoke
+
+      - name: Run obs_startup smoke headlessly
+        run: ./build/host/studio-host-smoke
+
+      - name: Package ad-hoc-signed bundle and checksum manifest
+        run: |
+          mkdir -p dist/StreamMateStudioHost.app/Contents/MacOS
+          cp build/host/studio-host-smoke dist/StreamMateStudioHost.app/Contents/MacOS/studio-host-smoke
+          /usr/bin/codesign --force --sign - --identifier com.streammate.studio-host dist/StreamMateStudioHost.app
+          ./scripts/write-sha256-manifest.sh dist
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: streammate-studio-host-macos-scaffold
+          path: dist/
