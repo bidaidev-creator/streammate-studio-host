@@ -68,7 +68,12 @@ jobs:
         id: libobs
         shell: bash
         run: |
-          lib="$(find build/obs -path '*/libobs.framework' -type d | head -n 1)"
+          lib_binary="$(find build/obs -path '*/libobs.framework/Versions/A/libobs' -type f ! -path '*/EagerLinkingTBDs/*' | head -n 1)"
+          if [[ -n "$lib_binary" ]]; then
+            lib="$(dirname "$(dirname "$(dirname "$lib_binary")")")"
+          else
+            lib="$(find build/obs -path '*/libobs.framework' -type d ! -path '*/EagerLinkingTBDs/*' | head -n 1)"
+          fi
           if [[ -z "$lib" ]]; then
             lib="$(find build/obs \( -name 'libobs*.dylib' -o -name 'libobs*.a' \) | head -n 1)"
           fi
