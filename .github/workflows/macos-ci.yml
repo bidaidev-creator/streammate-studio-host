@@ -40,6 +40,9 @@ jobs:
       - name: Run scaffold smoke
         run: ./build/scaffold/studio-host-smoke
 
+      - name: Fetch OBS version tag metadata for upstream CMake
+        run: git -C external/obs-studio fetch --tags --force --depth 1 origin tag 32.1.2
+
       - name: Configure upstream OBS without Qt frontend
         run: |
           cmake -S external/obs-studio -B build/obs -G Xcode \
