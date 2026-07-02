@@ -84,6 +84,7 @@ jobs:
           cmake -S . -B build/host -G Ninja \
             -DSTREAMMATE_REQUIRE_LIBOBS=ON \
             -DSTREAMMATE_OBS_INCLUDE_DIR="$PWD/external/obs-studio/libobs" \
+            -DSTREAMMATE_OBS_DEPS_INCLUDE_DIR="$PWD/external/obs-studio/.deps/obs-deps-2025-08-23-universal/include" \
             -DSTREAMMATE_OBS_LIBRARY="$PWD/${{ steps.libobs.outputs.library }}"
 
       - name: Build obs_startup smoke
