@@ -49,6 +49,7 @@ jobs:
       - name: Configure upstream OBS without Qt frontend
         run: |
           cmake -S external/obs-studio -B build/obs -G Xcode \
+            -DCMAKE_PROJECT_INCLUDE="$PWD/cmake/obs-enable-swift.cmake" \
             -DENABLE_UI=OFF \
             -DENABLE_SCRIPTING=OFF \
             -DENABLE_WEBRTC=OFF \
