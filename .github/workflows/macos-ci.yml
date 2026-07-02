@@ -97,6 +97,7 @@ jobs:
             -DSTREAMMATE_REQUIRE_LIBOBS=ON \
             -DSTREAMMATE_OBS_INCLUDE_DIR="$PWD/external/obs-studio/libobs" \
             -DSTREAMMATE_OBS_DEPS_INCLUDE_DIR="$PWD/external/obs-studio/.deps/obs-deps-2025-08-23-universal/include" \
+            -DSTREAMMATE_OBS_DEPS_LIBRARY_DIR="$PWD/external/obs-studio/.deps/obs-deps-2025-08-23-universal/lib" \
             -DSTREAMMATE_OBS_GENERATED_INCLUDE_DIR="$PWD/${{ steps.libobs.outputs.generated_include }}" \
             -DSTREAMMATE_OBS_LIBRARY="$PWD/${{ steps.libobs.outputs.library }}"
 
