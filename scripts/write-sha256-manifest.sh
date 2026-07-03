@@ -10,9 +10,12 @@ if [[ ! -d "$root" ]]; then
 fi
 
 tmp="$(mktemp)"
-find "$root" -type f ! -name 'sha256-manifest.txt' -print0 \
-  | sort -z \
-  | xargs -0 shasum -a 256 > "$tmp"
+(
+  cd "$root"
+  find . -type f ! -name 'sha256-manifest.txt' -print0 \
+    | sort -z \
+    | xargs -0 shasum -a 256
+) > "$tmp"
 
 mv "$tmp" "$manifest"
 echo "wrote $manifest"
