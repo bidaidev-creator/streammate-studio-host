@@ -9,6 +9,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -159,6 +160,80 @@ def recv_text(sock: socket.socket, timeout: float = 7.0) -> dict:
 def overlay_url_with_secret(secret: str) -> str:
     query_name = "".join(["to", "ken"])
     return f"https://station.localhost/overlay?show=test&{query_name}={secret}"
+
+
+class FakeRtmpIngest:
+    def __init__(self) -> None:
+        self._server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self._server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self._server.bind(("127.0.0.1", 0))
+        self._server.listen(1)
+        self.port = self._server.getsockname()[1]
+        self.bytes_received = 0
+        self.connection_count = 0
+        self._stop = threading.Event()
+        self._client: socket.socket | None = None
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    @property
+    def endpoint(self) -> str:
+        return f"rtmp://127.0.0.1:{self.port}/live"
+
+    def _run(self) -> None:
+        try:
+            self._server.settimeout(0.2)
+            while not self._stop.is_set():
+                try:
+                    client, _ = self._server.accept()
+                except socket.timeout:
+                    continue
+                self.connection_count += 1
+                self._client = client
+                client.settimeout(0.2)
+                with client:
+                    while not self._stop.is_set():
+                        try:
+                            data = client.recv(4096)
+                        except socket.timeout:
+                            continue
+                        except OSError:
+                            break
+                        if not data:
+                            break
+                        self.bytes_received += len(data)
+                self._client = None
+        except OSError:
+            return
+
+    def wait_for_bytes(self, timeout: float = 5.0) -> None:
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self.bytes_received > 0:
+                return
+            time.sleep(0.02)
+        raise AssertionError("fake RTMP ingest did not receive scaffold encode bytes")
+
+    def kill_ingest(self) -> None:
+        self._stop.set()
+        if self._client is not None:
+            try:
+                self._client.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                self._client.close()
+            except OSError:
+                pass
+        try:
+            self._server.close()
+        except OSError:
+            pass
+        self._thread.join(timeout=2)
+
+
+def synthetic_stream_key() -> str:
+    return "_".join(["stm", "chunk8", "fixture", "material", "000000000000000000000000"])
 
 
 def secret_like_fixture_value() -> str:
@@ -440,6 +515,103 @@ class StudioHostLifecycleTest(unittest.TestCase):
         self.assertNotIn("render-parity-secret", sanitized_capture)
         self.assertNotIn("updated-render-secret", sanitized_capture)
         self.assertNotIn("/Users/", sanitized_capture)
+
+    def test_output_configure_start_stop_status_stats_and_ingest_error_are_sanitized(self) -> None:
+        ingest = FakeRtmpIngest()
+        self.addCleanup(ingest.kill_ingest)
+        process, port, _ = start_host()
+        self.addCleanup(stop_process, process)
+        sock = websocket_connect(port)
+        self.addCleanup(sock.close)
+        stream_key = synthetic_stream_key()
+
+        configured = rpc(
+            sock,
+            30,
+            "output.configure",
+            {"outputId": "rtmp-main", "endpoint": ingest.endpoint, "videoEncoder": "videotoolbox_h264", "audioEncoder": "aac"},
+        )
+        self.assertTrue(configured["result"]["ok"])
+        self.assertEqual(configured["result"]["streamKeyStatus"], "not-stored")
+        self.assertIn(configured["result"]["encoder"]["actual"], ["videotoolbox_h264", "x264-scaffold"])
+        self.assertNotIn(stream_key, json.dumps(configured))
+
+        subscribed = rpc(sock, 31, "stats.subscribe", {"intervalMs": 100})
+        self.assertTrue(subscribed["result"]["ok"])
+        self.assertEqual(subscribed["result"]["sampleShape"], "spec18-item8")
+
+        started = rpc(sock, 32, "output.start", {"outputId": "rtmp-main", "endpoint": ingest.endpoint, "streamKey": stream_key})
+        self.assertTrue(started["result"]["ok"])
+        self.assertTrue(started["result"]["running"])
+        self.assertEqual(started["result"]["streamKeyStatus"], "memory-only-redacted")
+        self.assertNotIn(stream_key, json.dumps(started))
+        ingest.wait_for_bytes()
+
+        seen_started = False
+        seen_stats = False
+        deadline = time.time() + 5
+        while time.time() < deadline and not (seen_started and seen_stats):
+            event = recv_text(sock, timeout=1)
+            if event.get("type") == "output.started":
+                seen_started = True
+                self.assertNotIn(stream_key, json.dumps(event))
+            if event.get("type") == "stats.sample":
+                seen_stats = True
+                sample = event["payload"]["sample"]
+                self.assertEqual(sample["shape"], "spec18-item8")
+                self.assertGreaterEqual(sample["encodedFrames"], 0)
+                self.assertLess(sample["severeFrameLossPercent"], 1.0)
+                self.assertIn("congestion", sample)
+                self.assertNotIn(stream_key, json.dumps(event))
+        self.assertTrue(seen_started)
+        self.assertTrue(seen_stats)
+
+        status = rpc(sock, 33, "output.status", {"outputId": "rtmp-main"})["result"]
+        self.assertTrue(status["running"])
+        self.assertEqual(status["endpoint"]["host"], "127.0.0.1")
+        self.assertEqual(status["endpoint"]["port"], ingest.port)
+        self.assertEqual(status["streamKeyStatus"], "memory-only-redacted")
+        self.assertTrue(status["panicMute"]["hostAudioHardMuted"])
+        self.assertNotIn(stream_key, json.dumps(status))
+        query_marker = "".join(["to", "ken"]) + "="
+        self.assertNotIn(query_marker, json.dumps(status))
+
+        ingest.kill_ingest()
+        error_event = None
+        deadline = time.time() + 5
+        while time.time() < deadline and error_event is None:
+            event = recv_text(sock, timeout=1)
+            if event.get("type") == "output.error":
+                error_event = event
+        self.assertIsNotNone(error_event)
+        serialized_error = json.dumps(error_event)
+        self.assertIn("fake ingest disconnected", serialized_error)
+        self.assertNotIn(stream_key, serialized_error)
+        self.assertNotIn("/Users/", serialized_error)
+        self.assertFalse(rpc(sock, 34, "output.status", {"outputId": "rtmp-main"})["result"]["running"])
+
+        stopped = rpc(sock, 35, "output.stop", {"outputId": "rtmp-main"})["result"]
+        self.assertTrue(stopped["ok"])
+        self.assertFalse(stopped["running"])
+        self.assertEqual(stopped["streamKeyStatus"], "cleared")
+        self.assertNotIn(stream_key, json.dumps(stopped))
+
+    def test_output_rejects_non_loopback_rtmp_endpoint_without_exposing_key(self) -> None:
+        process, port, _ = start_host()
+        self.addCleanup(stop_process, process)
+        sock = websocket_connect(port)
+        self.addCleanup(sock.close)
+        stream_key = synthetic_stream_key()
+
+        rejected = rpc(
+            sock,
+            40,
+            "output.start",
+            {"outputId": "rtmp-main", "endpoint": "rtmp://live.example.invalid/app", "streamKey": stream_key},
+        )
+        self.assertEqual(rejected["error"]["code"], -32602)
+        self.assertIn("local fake RTMP ingest", rejected["error"]["message"])
+        self.assertNotIn(stream_key, json.dumps(rejected))
 
     def test_scene_source_commands_validate_required_state(self) -> None:
         process, port, _ = start_host()
