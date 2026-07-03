@@ -5,7 +5,7 @@
   <key>CFBundleDevelopmentRegion</key>
   <string>en</string>
   <key>CFBundleExecutable</key>
-  <string>studio-host-smoke</string>
+  <string>studio-host</string>
   <key>CFBundleIdentifier</key>
   <string>com.streammate.studio-host</string>
   <key>CFBundleInfoDictionaryVersion</key>
