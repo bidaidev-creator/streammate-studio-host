@@ -251,6 +251,7 @@ def write_obs_fixture(root: Path) -> Path:
         "sources": [
             {"name": "Main", "id": "scene"},
             {"name": "Color Backdrop", "id": "color_source"},
+            {"id": "color_source", "name": "ID First Color"},
             {"name": "Station Overlay", "id": "browser_source", "filters": [{"name": "LUT", "id": "color_filter_v2"}]},
             {"name": "Headline", "id": "text_ft2_source"},
             {"name": "BRB Image", "id": "image_source"},
@@ -302,6 +303,7 @@ def expected_import_report(service_key_action: str = "requires-consent") -> dict
         "mapped": [
             {"id": "scene:Main", "kind": "scene", "label": "Main", "state": "mapped", "reason": "mapped_native"},
             {"id": "source:Color Backdrop", "kind": "source", "label": "Color Backdrop", "state": "mapped", "reason": "mapped_native", "moduleName": "color_source"},
+            {"id": "source:ID First Color", "kind": "source", "label": "ID First Color", "state": "mapped", "reason": "mapped_native", "moduleName": "color_source"},
             {"id": "source:Station Overlay", "kind": "source", "label": "Station Overlay", "state": "mapped", "reason": "mapped_native", "moduleName": "browser_source"},
             {"id": "source:Headline", "kind": "source", "label": "Headline", "state": "mapped", "reason": "mapped_native", "moduleName": "text_ft2_source"},
             {"id": "source:BRB Image", "kind": "source", "label": "BRB Image", "state": "mapped", "reason": "mapped_native", "moduleName": "image_source"},
@@ -352,7 +354,7 @@ class StudioHostLifecycleTest(unittest.TestCase):
                         {
                             "collectionId": "fixture-main",
                             "name": "Fixture Main",
-                            "sourceCount": 11,
+                            "sourceCount": 12,
                             "profileCount": 1,
                             "serviceKeyAction": "requires-consent",
                         }

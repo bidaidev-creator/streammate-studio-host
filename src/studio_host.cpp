@@ -755,10 +755,27 @@ struct ObsSourceEntry {
 };
 
 std::vector<ObsSourceEntry> parse_obs_source_entries(const std::string &json) {
+  struct PositionedEntry {
+    size_t position;
+    ObsSourceEntry entry;
+  };
+  std::vector<PositionedEntry> positioned;
+  std::regex name_then_id("\\\"name\\\"\\s*:\\s*\\\"([^\\\"]+)\\\"[^{}]*?\\\"id\\\"\\s*:\\s*\\\"([^\\\"]+)\\\"");
+  std::regex id_then_name("\\\"id\\\"\\s*:\\s*\\\"([^\\\"]+)\\\"[^{}]*?\\\"name\\\"\\s*:\\s*\\\"([^\\\"]+)\\\"");
+  for (std::sregex_iterator it(json.begin(), json.end(), name_then_id), end; it != end; ++it) {
+    positioned.push_back({static_cast<size_t>(it->position()), {(*it)[1].str(), (*it)[2].str()}});
+  }
+  for (std::sregex_iterator it(json.begin(), json.end(), id_then_name), end; it != end; ++it) {
+    positioned.push_back({static_cast<size_t>(it->position()), {(*it)[2].str(), (*it)[1].str()}});
+  }
+  std::sort(positioned.begin(), positioned.end(), [](const PositionedEntry &left, const PositionedEntry &right) {
+    return left.position < right.position;
+  });
   std::vector<ObsSourceEntry> entries;
-  std::regex pair_re("\\\"name\\\"\\s*:\\s*\\\"([^\\\"]+)\\\"\\s*,\\s*\\\"id\\\"\\s*:\\s*\\\"([^\\\"]+)\\\"");
-  for (std::sregex_iterator it(json.begin(), json.end(), pair_re), end; it != end; ++it) {
-    entries.push_back({(*it)[1].str(), (*it)[2].str()});
+  for (const auto &item : positioned) {
+    if (entries.empty() || entries.back().label != item.entry.label || entries.back().module != item.entry.module) {
+      entries.push_back(item.entry);
+    }
   }
   return entries;
 }
