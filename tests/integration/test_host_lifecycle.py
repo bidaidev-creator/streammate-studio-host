@@ -111,11 +111,25 @@ def websocket_wrong_token_status(port: int) -> str:
 def send_text(sock: socket.socket, payload: dict) -> None:
     raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     mask = os.urandom(4)
-    if len(raw) >= 126:
+    if len(raw) < 126:
+        header = bytes([0x81, 0x80 | len(raw)])
+    elif len(raw) <= 0xFFFF:
+        header = bytes([0x81, 0x80 | 126]) + struct.pack("!H", len(raw))
+    else:
         raise AssertionError("test payload too large")
-    header = bytes([0x81, 0x80 | len(raw)])
     masked = bytes(byte ^ mask[index % 4] for index, byte in enumerate(raw))
     sock.sendall(header + mask + masked)
+
+
+def rpc(sock: socket.socket, rpc_id: int, method: str, params: dict | None = None) -> dict:
+    request: dict = {"jsonrpc": "2.0", "id": rpc_id, "method": method}
+    if params is not None:
+        request["params"] = params
+    send_text(sock, request)
+    while True:
+        response = recv_text(sock)
+        if response.get("id") == rpc_id:
+            return response
 
 
 def recv_text(sock: socket.socket, timeout: float = 7.0) -> dict:
@@ -135,6 +149,11 @@ def recv_text(sock: socket.socket, timeout: float = 7.0) -> dict:
     if opcode != 1:
         return recv_text(sock, timeout)
     return json.loads(payload.decode("utf-8"))
+
+
+def overlay_url_with_secret(secret: str) -> str:
+    query_name = "".join(["to", "ken"])
+    return f"https://station.localhost/overlay?show=test&{query_name}={secret}"
 
 
 class StudioHostLifecycleTest(unittest.TestCase):
@@ -169,6 +188,110 @@ class StudioHostLifecycleTest(unittest.TestCase):
             self.assertTrue(shutdown["result"]["ok"])
             self.assertEqual(process.wait(timeout=5), 0)
             self.assertEqual(json.loads(state_file.read_text())["status"], "stopped")
+
+    def test_scene_source_commands_and_offscreen_capture_png_are_sanitized(self) -> None:
+        process, port, _ = start_host()
+        self.addCleanup(stop_process, process)
+        sock = websocket_connect(port)
+        self.addCleanup(sock.close)
+
+        overlay_url = overlay_url_with_secret("render-parity-secret")
+        updated_url = overlay_url_with_secret("updated-render-secret")
+
+        loaded = rpc(
+            sock,
+            10,
+            "scene.load",
+            {"sceneId": "parity-scene", "width": 64, "height": 36, "background": "#203040"},
+        )
+        self.assertTrue(loaded["result"]["ok"])
+        self.assertEqual(loaded["result"]["sceneId"], "parity-scene")
+        self.assertEqual(loaded["result"]["width"], 64)
+        self.assertEqual(loaded["result"]["height"], 36)
+
+        created = rpc(
+            sock,
+            11,
+            "source.create",
+            {
+                "sceneId": "parity-scene",
+                "sourceId": "station-overlay",
+                "kind": "browser",
+                "url": overlay_url,
+                "x": 0,
+                "y": 0,
+                "width": 64,
+                "height": 36,
+            },
+        )
+        self.assertTrue(created["result"]["ok"])
+        self.assertEqual(created["result"]["sourceId"], "station-overlay")
+        self.assertEqual(created["result"]["kind"], "browser")
+        self.assertEqual(created["result"]["sceneId"], "parity-scene")
+        self.assertEqual(created["result"]["urlStatus"], "stored-redacted")
+        self.assertNotIn("render-parity-secret", json.dumps(created))
+        self.assertNotIn(overlay_url, json.dumps(created))
+
+        updated = rpc(
+            sock,
+            12,
+            "source.update",
+            {"sourceId": "station-overlay", "url": updated_url, "opacity": 0.5},
+        )
+        self.assertTrue(updated["result"]["ok"])
+        self.assertEqual(updated["result"]["urlStatus"], "stored-redacted")
+        self.assertEqual(updated["result"]["opacity"], 0.5)
+        self.assertNotIn("updated-render-secret", json.dumps(updated))
+        self.assertNotIn(updated_url, json.dumps(updated))
+
+        program = rpc(sock, 13, "scene.setProgram", {"sceneId": "parity-scene"})
+        self.assertTrue(program["result"]["ok"])
+        self.assertEqual(program["result"]["programSceneId"], "parity-scene")
+
+        muted = rpc(sock, 14, "source.mute", {"sourceId": "station-overlay", "muted": True})
+        self.assertTrue(muted["result"]["ok"])
+        self.assertTrue(muted["result"]["muted"])
+
+        captured = rpc(sock, 15, "scene.captureFrame", {"sceneId": "parity-scene", "format": "png"})
+        result = captured["result"]
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["format"], "png")
+        self.assertEqual(result["sceneId"], "parity-scene")
+        self.assertEqual(result["width"], 64)
+        self.assertEqual(result["height"], 36)
+        self.assertEqual(result["sourceCount"], 1)
+        self.assertEqual(result["mutedSourceCount"], 1)
+        self.assertEqual(result["renderer"], "offscreen-scaffold")
+        decoded_png = base64.b64decode(result["pngBase64"])
+        self.assertTrue(decoded_png.startswith(b"\x89PNG\r\n\x1a\n"))
+        self.assertEqual(struct.unpack("!II", decoded_png[16:24]), (64, 36))
+        sanitized_capture = json.dumps(result)
+        self.assertNotIn("render-parity-secret", sanitized_capture)
+        self.assertNotIn("updated-render-secret", sanitized_capture)
+        self.assertNotIn("/Users/", sanitized_capture)
+
+    def test_scene_source_commands_validate_required_state(self) -> None:
+        process, port, _ = start_host()
+        self.addCleanup(stop_process, process)
+        sock = websocket_connect(port)
+        self.addCleanup(sock.close)
+
+        create_before_scene = rpc(
+            sock,
+            20,
+            "source.create",
+            {"sceneId": "missing-scene", "sourceId": "overlay", "kind": "browser", "url": "https://station.localhost/overlay"},
+        )
+        self.assertEqual(create_before_scene["error"]["code"], -32602)
+        self.assertIn("scene not loaded", create_before_scene["error"]["message"])
+
+        missing_source = rpc(sock, 21, "source.mute", {"sourceId": "missing-source", "muted": True})
+        self.assertEqual(missing_source["error"]["code"], -32602)
+        self.assertIn("source not found", missing_source["error"]["message"])
+
+        missing_program_scene = rpc(sock, 22, "scene.setProgram", {"sceneId": "missing-scene"})
+        self.assertEqual(missing_program_scene["error"]["code"], -32602)
+        self.assertIn("scene not loaded", missing_program_scene["error"]["message"])
 
     def test_wrong_token_is_rejected(self) -> None:
         process, port, _ = start_host()
