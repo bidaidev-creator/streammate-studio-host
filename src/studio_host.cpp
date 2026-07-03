@@ -1,5 +1,6 @@
 
 #include <arpa/inet.h>
+#include <algorithm>
 #include <array>
 #include <chrono>
 #include <cctype>
@@ -399,6 +400,51 @@ std::string extract_json_id(const std::string &json) {
   return json.substr(start, end == std::string::npos ? std::string::npos : end - start);
 }
 
+std::optional<int> extract_json_int(const std::string &json, const std::string &key) {
+  std::string marker = "\"" + key + "\"";
+  auto pos = json.find(marker);
+  if (pos == std::string::npos) return std::nullopt;
+  pos = json.find(':', pos);
+  if (pos == std::string::npos) return std::nullopt;
+  auto start = json.find_first_not_of(" \t\r\n", pos + 1);
+  if (start == std::string::npos) return std::nullopt;
+  auto end = json.find_first_not_of("-0123456789", start);
+  try {
+    return std::stoi(json.substr(start, end == std::string::npos ? std::string::npos : end - start));
+  } catch (...) {
+    return std::nullopt;
+  }
+}
+
+std::optional<double> extract_json_double(const std::string &json, const std::string &key) {
+  std::string marker = "\"" + key + "\"";
+  auto pos = json.find(marker);
+  if (pos == std::string::npos) return std::nullopt;
+  pos = json.find(':', pos);
+  if (pos == std::string::npos) return std::nullopt;
+  auto start = json.find_first_not_of(" \t\r\n", pos + 1);
+  if (start == std::string::npos) return std::nullopt;
+  auto end = json.find_first_not_of("-0123456789.eE+", start);
+  try {
+    return std::stod(json.substr(start, end == std::string::npos ? std::string::npos : end - start));
+  } catch (...) {
+    return std::nullopt;
+  }
+}
+
+std::optional<bool> extract_json_bool(const std::string &json, const std::string &key) {
+  std::string marker = "\"" + key + "\"";
+  auto pos = json.find(marker);
+  if (pos == std::string::npos) return std::nullopt;
+  pos = json.find(':', pos);
+  if (pos == std::string::npos) return std::nullopt;
+  auto start = json.find_first_not_of(" \t\r\n", pos + 1);
+  if (start == std::string::npos) return std::nullopt;
+  if (json.compare(start, 4, "true") == 0) return true;
+  if (json.compare(start, 5, "false") == 0) return false;
+  return std::nullopt;
+}
+
 std::string rpc_result(const std::string &id, const std::string &result) {
   return "{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":" + result + "}";
 }
@@ -416,6 +462,278 @@ std::string host_event(const std::string &type, int port) {
 std::string heartbeat_event() {
   return "{\"type\":\"host.health\",\"payload\":{\"hostId\":\"studio-host-1\",\"status\":\"ready\",\"heartbeatMs\":" +
          std::to_string(kHeartbeatMs) + "}}";
+}
+
+struct Rgba {
+  uint8_t r = 0;
+  uint8_t g = 0;
+  uint8_t b = 0;
+  uint8_t a = 255;
+};
+
+int hex_digit(char c) {
+  if (c >= '0' && c <= '9') return c - '0';
+  if (c >= 'a' && c <= 'f') return 10 + c - 'a';
+  if (c >= 'A' && c <= 'F') return 10 + c - 'A';
+  return -1;
+}
+
+uint8_t parse_hex_byte(char high, char low, uint8_t fallback) {
+  int hi = hex_digit(high);
+  int lo = hex_digit(low);
+  if (hi < 0 || lo < 0) return fallback;
+  return static_cast<uint8_t>((hi << 4) | lo);
+}
+
+Rgba parse_color(const std::string &value, Rgba fallback = {32, 48, 64, 255}) {
+  if (value.size() != 7 || value[0] != '#') return fallback;
+  return {parse_hex_byte(value[1], value[2], fallback.r),
+          parse_hex_byte(value[3], value[4], fallback.g),
+          parse_hex_byte(value[5], value[6], fallback.b),
+          255};
+}
+
+void append_be32(std::vector<uint8_t> &out, uint32_t value) {
+  out.push_back(static_cast<uint8_t>((value >> 24) & 0xff));
+  out.push_back(static_cast<uint8_t>((value >> 16) & 0xff));
+  out.push_back(static_cast<uint8_t>((value >> 8) & 0xff));
+  out.push_back(static_cast<uint8_t>(value & 0xff));
+}
+
+uint32_t crc32_bytes(const uint8_t *data, size_t len) {
+  uint32_t crc = 0xffffffffU;
+  for (size_t i = 0; i < len; ++i) {
+    crc ^= data[i];
+    for (int bit = 0; bit < 8; ++bit) {
+      crc = (crc >> 1) ^ (0xedb88320U & (0U - (crc & 1U)));
+    }
+  }
+  return crc ^ 0xffffffffU;
+}
+
+uint32_t adler32_bytes(const std::vector<uint8_t> &data) {
+  uint32_t a = 1;
+  uint32_t b = 0;
+  for (uint8_t byte : data) {
+    a = (a + byte) % 65521U;
+    b = (b + a) % 65521U;
+  }
+  return (b << 16) | a;
+}
+
+void append_png_chunk(std::vector<uint8_t> &png, const char type[4], const std::vector<uint8_t> &data) {
+  append_be32(png, static_cast<uint32_t>(data.size()));
+  size_t type_offset = png.size();
+  png.insert(png.end(), type, type + 4);
+  png.insert(png.end(), data.begin(), data.end());
+  append_be32(png, crc32_bytes(png.data() + type_offset, png.size() - type_offset));
+}
+
+std::vector<uint8_t> zlib_store(const std::vector<uint8_t> &raw) {
+  std::vector<uint8_t> out;
+  out.push_back(0x78);
+  out.push_back(0x01);
+  size_t offset = 0;
+  do {
+    size_t block_len = std::min<size_t>(65535, raw.size() - offset);
+    bool final = offset + block_len >= raw.size();
+    out.push_back(final ? 0x01 : 0x00);
+    uint16_t len = static_cast<uint16_t>(block_len);
+    uint16_t nlen = static_cast<uint16_t>(~len);
+    out.push_back(static_cast<uint8_t>(len & 0xff));
+    out.push_back(static_cast<uint8_t>((len >> 8) & 0xff));
+    out.push_back(static_cast<uint8_t>(nlen & 0xff));
+    out.push_back(static_cast<uint8_t>((nlen >> 8) & 0xff));
+    out.insert(out.end(), raw.begin() + static_cast<long>(offset), raw.begin() + static_cast<long>(offset + block_len));
+    offset += block_len;
+  } while (offset < raw.size());
+  append_be32(out, adler32_bytes(raw));
+  return out;
+}
+
+struct SceneModel {
+  std::string id;
+  int width = 128;
+  int height = 72;
+  Rgba background{32, 48, 64, 255};
+};
+
+struct SourceModel {
+  std::string id;
+  std::string scene_id;
+  std::string kind = "browser";
+  std::string url;
+  int x = 0;
+  int y = 0;
+  int width = 128;
+  int height = 72;
+  double opacity = 1.0;
+  bool muted = false;
+};
+
+class RendererState {
+public:
+  std::string load_scene(const std::string &request) {
+    std::string scene_id = extract_json_string(request, "sceneId");
+    if (scene_id.empty()) return rpc_error_result(-32602, "sceneId is required");
+    int width = extract_json_int(request, "width").value_or(128);
+    int height = extract_json_int(request, "height").value_or(72);
+    if (width <= 0 || height <= 0 || width > 128 || height > 72 || width * height > 10000) {
+      return rpc_error_result(-32602, "scene dimensions exceed local offscreen capture limits");
+    }
+    SceneModel scene;
+    scene.id = scene_id;
+    scene.width = width;
+    scene.height = height;
+    std::string background = extract_json_string(request, "background");
+    if (!background.empty()) scene.background = parse_color(background);
+    scenes_[scene_id] = scene;
+    if (program_scene_id_.empty()) program_scene_id_ = scene_id;
+    return "{\"ok\":true,\"sceneId\":\"" + json_escape(scene_id) + "\",\"width\":" + std::to_string(width) +
+           ",\"height\":" + std::to_string(height) + ",\"renderer\":\"offscreen-scaffold\"}";
+  }
+
+  std::string set_program(const std::string &request) {
+    std::string scene_id = extract_json_string(request, "sceneId");
+    if (scene_id.empty() || scenes_.find(scene_id) == scenes_.end()) return rpc_error_result(-32602, "scene not loaded");
+    program_scene_id_ = scene_id;
+    return "{\"ok\":true,\"programSceneId\":\"" + json_escape(scene_id) + "\"}";
+  }
+
+  std::string create_source(const std::string &request) {
+    std::string scene_id = extract_json_string(request, "sceneId");
+    if (scene_id.empty() || scenes_.find(scene_id) == scenes_.end()) return rpc_error_result(-32602, "scene not loaded");
+    std::string source_id = extract_json_string(request, "sourceId");
+    if (source_id.empty()) return rpc_error_result(-32602, "sourceId is required");
+    std::string kind = extract_json_string(request, "kind");
+    if (kind.empty()) kind = "browser";
+    if (kind != "browser") return rpc_error_result(-32602, "only browser sources are supported in phase A");
+    SourceModel source;
+    const SceneModel &scene = scenes_.at(scene_id);
+    source.id = source_id;
+    source.scene_id = scene_id;
+    source.kind = kind;
+    source.url = extract_json_string(request, "url");
+    source.x = extract_json_int(request, "x").value_or(0);
+    source.y = extract_json_int(request, "y").value_or(0);
+    source.width = extract_json_int(request, "width").value_or(scene.width);
+    source.height = extract_json_int(request, "height").value_or(scene.height);
+    source.opacity = std::clamp(extract_json_double(request, "opacity").value_or(1.0), 0.0, 1.0);
+    source.muted = extract_json_bool(request, "muted").value_or(false);
+    sources_[source_id] = source;
+    return source_result(source, true);
+  }
+
+  std::string update_source(const std::string &request) {
+    std::string source_id = extract_json_string(request, "sourceId");
+    auto it = sources_.find(source_id);
+    if (source_id.empty() || it == sources_.end()) return rpc_error_result(-32602, "source not found");
+    std::string url = extract_json_string(request, "url");
+    if (!url.empty()) it->second.url = url;
+    if (auto value = extract_json_int(request, "x")) it->second.x = *value;
+    if (auto value = extract_json_int(request, "y")) it->second.y = *value;
+    if (auto value = extract_json_int(request, "width")) it->second.width = *value;
+    if (auto value = extract_json_int(request, "height")) it->second.height = *value;
+    if (auto value = extract_json_double(request, "opacity")) it->second.opacity = std::clamp(*value, 0.0, 1.0);
+    return source_result(it->second, !url.empty());
+  }
+
+  std::string mute_source(const std::string &request) {
+    std::string source_id = extract_json_string(request, "sourceId");
+    auto it = sources_.find(source_id);
+    if (source_id.empty() || it == sources_.end()) return rpc_error_result(-32602, "source not found");
+    it->second.muted = extract_json_bool(request, "muted").value_or(true);
+    return "{\"ok\":true,\"sourceId\":\"" + json_escape(source_id) + "\",\"muted\":" +
+           std::string(it->second.muted ? "true" : "false") + "}";
+  }
+
+  std::string capture_frame(const std::string &request) {
+    std::string format = extract_json_string(request, "format");
+    if (!format.empty() && format != "png") return rpc_error_result(-32602, "only png capture is supported");
+    std::string scene_id = extract_json_string(request, "sceneId");
+    if (scene_id.empty()) scene_id = program_scene_id_;
+    auto scene_it = scenes_.find(scene_id);
+    if (scene_id.empty() || scene_it == scenes_.end()) return rpc_error_result(-32602, "scene not loaded");
+    int source_count = 0;
+    int muted_count = 0;
+    for (const auto &entry : sources_) {
+      if (entry.second.scene_id == scene_id) {
+        ++source_count;
+        if (entry.second.muted) ++muted_count;
+      }
+    }
+    std::vector<uint8_t> png = render_png(scene_it->second);
+    return "{\"ok\":true,\"sceneId\":\"" + json_escape(scene_id) + "\",\"format\":\"png\",\"renderer\":\"offscreen-scaffold\"," +
+           "\"width\":" + std::to_string(scene_it->second.width) + ",\"height\":" + std::to_string(scene_it->second.height) +
+           ",\"sourceCount\":" + std::to_string(source_count) + ",\"mutedSourceCount\":" + std::to_string(muted_count) +
+           ",\"pngBase64\":\"" + base64(png.data(), png.size()) + "\"}";
+  }
+
+private:
+  std::string rpc_error_result(int code, const std::string &message) const {
+    return "__error__:" + std::to_string(code) + ":" + message;
+  }
+
+  std::string source_result(const SourceModel &source, bool url_touched) const {
+    return "{\"ok\":true,\"sourceId\":\"" + json_escape(source.id) + "\",\"sceneId\":\"" + json_escape(source.scene_id) +
+           "\",\"kind\":\"" + json_escape(source.kind) + "\",\"muted\":" + std::string(source.muted ? "true" : "false") +
+           ",\"opacity\":" + std::to_string(source.opacity) + ",\"urlStatus\":\"" +
+           std::string(url_touched || !source.url.empty() ? "stored-redacted" : "empty") + "\"}";
+  }
+
+  std::vector<uint8_t> render_png(const SceneModel &scene) const {
+    std::vector<uint8_t> raw;
+    raw.reserve(static_cast<size_t>((scene.width * 4 + 1) * scene.height));
+    for (int y = 0; y < scene.height; ++y) {
+      raw.push_back(0);
+      for (int x = 0; x < scene.width; ++x) {
+        Rgba pixel = scene.background;
+        for (const auto &entry : sources_) {
+          const SourceModel &source = entry.second;
+          if (source.scene_id != scene.id || source.muted) continue;
+          if (x >= source.x && y >= source.y && x < source.x + source.width && y < source.y + source.height) {
+            double alpha = std::clamp(source.opacity, 0.0, 1.0) * 0.65;
+            Rgba overlay{136, 72, 216, 255};
+            pixel.r = static_cast<uint8_t>(pixel.r * (1.0 - alpha) + overlay.r * alpha);
+            pixel.g = static_cast<uint8_t>(pixel.g * (1.0 - alpha) + overlay.g * alpha);
+            pixel.b = static_cast<uint8_t>(pixel.b * (1.0 - alpha) + overlay.b * alpha);
+          }
+        }
+        raw.push_back(pixel.r);
+        raw.push_back(pixel.g);
+        raw.push_back(pixel.b);
+        raw.push_back(pixel.a);
+      }
+    }
+
+    std::vector<uint8_t> png = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'};
+    std::vector<uint8_t> ihdr;
+    append_be32(ihdr, static_cast<uint32_t>(scene.width));
+    append_be32(ihdr, static_cast<uint32_t>(scene.height));
+    ihdr.push_back(8);
+    ihdr.push_back(6);
+    ihdr.push_back(0);
+    ihdr.push_back(0);
+    ihdr.push_back(0);
+    append_png_chunk(png, "IHDR", ihdr);
+    append_png_chunk(png, "IDAT", zlib_store(raw));
+    append_png_chunk(png, "IEND", {});
+    return png;
+  }
+
+  std::map<std::string, SceneModel> scenes_;
+  std::map<std::string, SourceModel> sources_;
+  std::string program_scene_id_;
+};
+
+bool is_renderer_error(const std::string &result) { return result.rfind("__error__:", 0) == 0; }
+
+std::string renderer_error_to_rpc(const std::string &id, const std::string &result) {
+  size_t code_start = std::string("__error__:").size();
+  size_t message_start = result.find(':', code_start);
+  if (message_start == std::string::npos) return rpc_error(id, -32603, "renderer error");
+  int code = std::stoi(result.substr(code_start, message_start - code_start));
+  return rpc_error(id, code, result.substr(message_start + 1));
 }
 
 class ControlServer {
@@ -522,6 +840,18 @@ private:
     } else if (method == "host.health") {
       send_text_frame(fd, rpc_result(id, "{\"status\":\"ready\",\"engineStarted\":" + std::string(engine_.started() ? "true" : "false") +
                                       ",\"heartbeatMs\":" + std::to_string(kHeartbeatMs) + "}"));
+    } else if (method == "scene.load") {
+      send_renderer_result(fd, id, renderer_.load_scene(payload));
+    } else if (method == "scene.setProgram") {
+      send_renderer_result(fd, id, renderer_.set_program(payload));
+    } else if (method == "source.create") {
+      send_renderer_result(fd, id, renderer_.create_source(payload));
+    } else if (method == "source.update") {
+      send_renderer_result(fd, id, renderer_.update_source(payload));
+    } else if (method == "source.mute") {
+      send_renderer_result(fd, id, renderer_.mute_source(payload));
+    } else if (method == "scene.captureFrame") {
+      send_renderer_result(fd, id, renderer_.capture_frame(payload));
     } else if (method == "host.shutdown") {
       send_text_frame(fd, rpc_result(id, "{\"ok\":true}"));
       g_stop = 1;
@@ -530,9 +860,18 @@ private:
     }
   }
 
+  void send_renderer_result(int fd, const std::string &id, const std::string &result) {
+    if (is_renderer_error(result)) {
+      send_text_frame(fd, renderer_error_to_rpc(id, result));
+    } else {
+      send_text_frame(fd, rpc_result(id, result));
+    }
+  }
+
   Options options_;
   EngineLifecycle &engine_;
   StateFile &state_;
+  RendererState renderer_;
   int port_ = 0;
 };
 
