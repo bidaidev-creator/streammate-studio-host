@@ -36,7 +36,11 @@ def wait_ready(process: subprocess.Popen[str], timeout: float = 10.0) -> tuple[i
     raise AssertionError(f"timed out waiting for ready: {lines}")
 
 
-def start_host(*extra: str, state_file: Path | None = None) -> tuple[subprocess.Popen[str], int, list[str]]:
+def start_host(
+    *extra: str,
+    state_file: Path | None = None,
+    env: dict[str, str] | None = None,
+) -> tuple[subprocess.Popen[str], int, list[str]]:
     args = [str(HOST_BIN), "--token", TOKEN, "--port", "0"]
     if state_file is not None:
         args.extend(["--state-file", str(state_file)])
@@ -47,6 +51,7 @@ def start_host(*extra: str, state_file: Path | None = None) -> tuple[subprocess.
         stderr=subprocess.STDOUT,
         text=True,
         encoding="utf-8",
+        env={**os.environ, **(env or {})},
     )
     port, lines = wait_ready(process)
     return process, port, lines
@@ -231,7 +236,173 @@ def synthetic_stream_key() -> str:
     return "_".join(["stm", "chunk8", "fixture", "material", "000000000000000000000000"])
 
 
+def secret_like_fixture_value() -> str:
+    return "".join(["fixture", "-", "stream", "-", "key", "-", hashlib.sha256(b"chunk7").hexdigest()[:24]])
+
+
+def write_obs_fixture(root: Path) -> Path:
+    obs_dir = root / "obs-config"
+    scenes_dir = obs_dir / "basic" / "scenes"
+    profile_dir = obs_dir / "basic" / "profiles" / "Fixture Profile"
+    scenes_dir.mkdir(parents=True)
+    profile_dir.mkdir(parents=True)
+    collection = {
+        "name": "Fixture Main",
+        "sources": [
+            {"name": "Main", "id": "scene"},
+            {"name": "Color Backdrop", "id": "color_source"},
+            {"name": "Station Overlay", "id": "browser_source", "filters": [{"name": "LUT", "id": "color_filter_v2"}]},
+            {"name": "Headline", "id": "text_ft2_source"},
+            {"name": "BRB Image", "id": "image_source"},
+            {"name": "Media Clip", "id": "ffmpeg_source"},
+            {"name": "Face Camera", "id": "av_capture_input", "device_id": "fixture-camera"},
+            {"name": "Desk Mic", "id": "coreaudio_input_capture", "device_id": "fixture-mic"},
+            {"name": "Screen Share", "id": "screen_capture", "display_id": "fixture-display"},
+            {"name": "Missing Plugin Source", "id": "third_party_camera_fx", "module": "obs-third-party-fx"},
+            {"name": "Unplugged Camera", "id": "av_capture_input"},
+        ],
+    }
+    (scenes_dir / "fixture-main.json").write_text(json.dumps(collection, indent=2) + "\n", encoding="utf-8")
+    (profile_dir / "basic.ini").write_text(
+        "[Output]\nMode=Advanced\n[AdvOut]\nEncoder=obs_x264\nTrack1Bitrate=320\n",
+        encoding="utf-8",
+    )
+    (obs_dir / "service.json").write_text(
+        json.dumps(
+            {
+                "service": "Twitch",
+                "settings": {
+                    "server": "rtmp://fixture.invalid/app",
+                    "key": secret_like_fixture_value(),
+                },
+            },
+            indent=2,
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+    return obs_dir
+
+
+def hash_tree(root: Path) -> str:
+    digest = hashlib.sha256()
+    for path in sorted(p for p in root.rglob("*") if p.is_file()):
+        digest.update(path.relative_to(root).as_posix().encode("utf-8"))
+        digest.update(b"\0")
+        digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def expected_import_report(service_key_action: str = "requires-consent") -> dict:
+    return {
+        "reportId": "import-fixture-main",
+        "collectionId": "fixture-main",
+        "generatedAt": "1970-01-01T00:00:00.000Z",
+        "mapped": [
+            {"id": "scene:Main", "kind": "scene", "label": "Main", "state": "mapped", "reason": "mapped_native"},
+            {"id": "source:Color Backdrop", "kind": "source", "label": "Color Backdrop", "state": "mapped", "reason": "mapped_native", "moduleName": "color_source"},
+            {"id": "source:Station Overlay", "kind": "source", "label": "Station Overlay", "state": "mapped", "reason": "mapped_native", "moduleName": "browser_source"},
+            {"id": "source:Headline", "kind": "source", "label": "Headline", "state": "mapped", "reason": "mapped_native", "moduleName": "text_ft2_source"},
+            {"id": "source:BRB Image", "kind": "source", "label": "BRB Image", "state": "mapped", "reason": "mapped_native", "moduleName": "image_source"},
+            {"id": "source:Media Clip", "kind": "source", "label": "Media Clip", "state": "mapped", "reason": "mapped_native", "moduleName": "ffmpeg_source"},
+        ],
+        "degraded": [
+            {"id": "source:Face Camera", "kind": "source", "label": "Face Camera", "state": "degraded", "reason": "permission_required", "moduleName": "av_capture_input", "tccClass": "camera", "notes": ["Native import defers camera permission until explicit operator approval."]},
+            {"id": "source:Desk Mic", "kind": "source", "label": "Desk Mic", "state": "degraded", "reason": "permission_required", "moduleName": "coreaudio_input_capture", "tccClass": "microphone", "notes": ["Native import defers microphone permission until explicit operator approval."]},
+            {"id": "source:Screen Share", "kind": "source", "label": "Screen Share", "state": "degraded", "reason": "permission_required", "moduleName": "screen_capture", "tccClass": "screen", "notes": ["Native import defers screen permission until explicit operator approval."]},
+            {"id": "source:Missing Plugin Source", "kind": "source", "label": "Missing Plugin Source", "state": "degraded", "reason": "missing_plugin", "moduleName": "third_party_camera_fx", "notes": ["Replaced with placeholder source because obs-third-party-fx is not bundled upstream."]},
+            {"id": "source:Unplugged Camera", "kind": "source", "label": "Unplugged Camera", "state": "degraded", "reason": "missing_device", "moduleName": "av_capture_input", "tccClass": "camera", "notes": ["Original device identifier was absent from the fixture."]},
+        ],
+        "unresolved": [
+            {"id": "filter:Station Overlay:LUT", "kind": "filter", "label": "Station Overlay / LUT", "state": "unresolved", "reason": "unsupported_frontend_feature", "moduleName": "color_filter_v2", "notes": ["OBS frontend filter is not imported by the native host scaffold."]},
+        ],
+        "profile": {
+            "mappedEncoder": "x264",
+            "mappedOutput": "rtmp",
+            "downgrades": [
+                {"id": "profile:Fixture Profile:encoder", "kind": "profile", "label": "Fixture Profile", "state": "degraded", "reason": "profile_downgraded", "notes": ["OBS encoder obs_x264 mapped to native x264 fallback."]}
+            ],
+            "serviceKeyAction": service_key_action,
+        },
+    }
+
+
 class StudioHostLifecycleTest(unittest.TestCase):
+    def test_obs_fixture_import_scan_load_report_is_copy_only_and_redacted(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            obs_dir = write_obs_fixture(temp_root)
+            streammate_home = temp_root / "streammate-home"
+            before_hash = hash_tree(obs_dir)
+            fixture_secret = secret_like_fixture_value()
+
+            process, port, _ = start_host(env={"STREAMMATE_OBS_CONFIG_DIR": str(obs_dir), "STREAMMATE_HOME": str(streammate_home)})
+            self.addCleanup(stop_process, process)
+            sock = websocket_connect(port)
+            self.addCleanup(sock.close)
+
+            scan = rpc(sock, 100, "import.scan", {})
+            self.assertEqual(
+                scan["result"],
+                {
+                    "ok": True,
+                    "configDirLabel": "$OBS_CONFIG_DIR",
+                    "collections": [
+                        {
+                            "collectionId": "fixture-main",
+                            "name": "Fixture Main",
+                            "sourceCount": 11,
+                            "profileCount": 1,
+                            "serviceKeyAction": "requires-consent",
+                        }
+                    ],
+                },
+            )
+            self.assertNotIn(fixture_secret, json.dumps(scan))
+            self.assertNotIn(str(obs_dir), json.dumps(scan))
+
+            loaded = rpc(sock, 101, "import.load", {"collectionId": "fixture-main"})
+            self.assertEqual(loaded["result"]["report"], expected_import_report())
+            self.assertEqual(loaded["result"]["destinationLabel"], "$STREAMMATE_HOME/studio/obs-imports/fixture-main")
+            self.assertEqual(hash_tree(obs_dir), before_hash)
+
+            copied_collection = streammate_home / "studio" / "obs-imports" / "fixture-main" / "basic" / "scenes" / "fixture-main.json"
+            self.assertEqual(json.loads(copied_collection.read_text(encoding="utf-8"))["name"], "Fixture Main")
+            placeholder = json.loads(
+                (streammate_home / "studio" / "obs-imports" / "fixture-main" / "streammate-import-map.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                placeholder["placeholderSources"],
+                [{"sourceId": "source:Missing Plugin Source", "label": "Missing Plugin Source", "reason": "missing_plugin"}],
+            )
+            self.assertFalse((streammate_home / "studio" / "obs-imports" / "fixture-main" / "service.json").exists())
+            self.assertNotIn(fixture_secret, json.dumps(placeholder))
+
+            report = rpc(sock, 102, "import.report", {"collectionId": "fixture-main"})
+            self.assertEqual(report["result"], expected_import_report())
+            self.assertNotIn(fixture_secret, json.dumps(report))
+
+    def test_obs_import_failure_leaves_prior_host_state_intact(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            obs_dir = write_obs_fixture(temp_root)
+            streammate_home = temp_root / "streammate-home"
+            process, port, _ = start_host(env={"STREAMMATE_OBS_CONFIG_DIR": str(obs_dir), "STREAMMATE_HOME": str(streammate_home)})
+            self.addCleanup(stop_process, process)
+            sock = websocket_connect(port)
+            self.addCleanup(sock.close)
+
+            ok = rpc(sock, 110, "import.load", {"collectionId": "fixture-main"})
+            self.assertEqual(ok["result"]["report"], expected_import_report())
+            imported_root = streammate_home / "studio" / "obs-imports" / "fixture-main"
+            before = hash_tree(imported_root)
+
+            failed = rpc(sock, 111, "import.load", {"collectionId": "missing-collection"})
+            self.assertEqual(failed["error"]["code"], -32602)
+            self.assertIn("collection not found", failed["error"]["message"])
+            self.assertEqual(hash_tree(imported_root), before)
+
     def test_ready_hello_health_heartbeat_and_shutdown(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             state_file = Path(temp_dir) / "host-state.json"

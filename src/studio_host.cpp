@@ -16,6 +16,7 @@
 #include <map>
 #include <netinet/in.h>
 #include <optional>
+#include <regex>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -727,6 +728,273 @@ private:
   std::string program_scene_id_;
 };
 
+std::string getenv_string(const char *name) {
+  const char *value = std::getenv(name);
+  return value ? std::string(value) : std::string();
+}
+
+std::string read_text_file(const std::filesystem::path &path) {
+  std::ifstream in(path);
+  if (!in) return "";
+  std::ostringstream buffer;
+  buffer << in.rdbuf();
+  return buffer.str();
+}
+
+std::string path_stem_id(const std::filesystem::path &path) {
+  std::string id = path.stem().string();
+  for (char &c : id) {
+    if (!(std::isalnum(static_cast<unsigned char>(c)) || c == '-' || c == '_')) c = '-';
+  }
+  return id;
+}
+
+struct ObsSourceEntry {
+  std::string label;
+  std::string module;
+};
+
+std::vector<ObsSourceEntry> parse_obs_source_entries(const std::string &json) {
+  std::vector<ObsSourceEntry> entries;
+  std::regex pair_re("\\\"name\\\"\\s*:\\s*\\\"([^\\\"]+)\\\"\\s*,\\s*\\\"id\\\"\\s*:\\s*\\\"([^\\\"]+)\\\"");
+  for (std::sregex_iterator it(json.begin(), json.end(), pair_re), end; it != end; ++it) {
+    entries.push_back({(*it)[1].str(), (*it)[2].str()});
+  }
+  return entries;
+}
+
+std::string obs_collection_name(const std::string &json, const std::string &fallback) {
+  std::regex name_re("\\\"name\\\"\\s*:\\s*\\\"([^\\\"]+)\\\"");
+  std::smatch match;
+  if (std::regex_search(json, match, name_re)) return match[1].str();
+  return fallback;
+}
+
+bool has_service_key(const std::filesystem::path &config_dir) {
+  std::string service = read_text_file(config_dir / "service.json");
+  return service.find("\"key\"") != std::string::npos || service.find("\"stream_key\"") != std::string::npos;
+}
+
+int profile_count(const std::filesystem::path &config_dir) {
+  std::filesystem::path profiles = config_dir / "basic" / "profiles";
+  if (!std::filesystem::is_directory(profiles)) return 0;
+  int count = 0;
+  for (const auto &entry : std::filesystem::directory_iterator(profiles)) {
+    if (entry.is_directory() && std::filesystem::exists(entry.path() / "basic.ini")) ++count;
+  }
+  return count;
+}
+
+std::string first_profile_name(const std::filesystem::path &config_dir) {
+  std::filesystem::path profiles = config_dir / "basic" / "profiles";
+  if (!std::filesystem::is_directory(profiles)) return "OBS Profile";
+  for (const auto &entry : std::filesystem::directory_iterator(profiles)) {
+    if (entry.is_directory() && std::filesystem::exists(entry.path() / "basic.ini")) return entry.path().filename().string();
+  }
+  return "OBS Profile";
+}
+
+std::string json_string_array(const std::vector<std::string> &notes) {
+  std::string out = "[";
+  for (size_t i = 0; i < notes.size(); ++i) {
+    if (i) out += ",";
+    out += "\"" + json_escape(notes[i]) + "\"";
+  }
+  out += "]";
+  return out;
+}
+
+std::string report_item(const std::string &id, const std::string &kind, const std::string &label, const std::string &state,
+                        const std::string &reason, const std::string &module = "", const std::string &tcc = "",
+                        const std::vector<std::string> &notes = {}) {
+  std::string out = "{\"id\":\"" + json_escape(id) + "\",\"kind\":\"" + json_escape(kind) + "\",\"label\":\"" +
+                    json_escape(label) + "\",\"state\":\"" + json_escape(state) + "\",\"reason\":\"" + json_escape(reason) + "\"";
+  if (!module.empty()) out += ",\"moduleName\":\"" + json_escape(module) + "\"";
+  if (!tcc.empty()) out += ",\"tccClass\":\"" + json_escape(tcc) + "\"";
+  if (!notes.empty()) out += ",\"notes\":" + json_string_array(notes);
+  out += "}";
+  return out;
+}
+
+std::string json_array_join(const std::vector<std::string> &items) {
+  std::string out = "[";
+  for (size_t i = 0; i < items.size(); ++i) {
+    if (i) out += ",";
+    out += items[i];
+  }
+  out += "]";
+  return out;
+}
+
+class ObsImporter {
+public:
+  std::string scan(const std::string &request) {
+    auto config = resolve_config_dir(request);
+    if (!config) return error(-32602, "OBS config dir is required");
+    auto collection = find_collection(*config, "");
+    if (!collection) return error(-32602, "collection not found");
+    std::string json = read_text_file(*collection);
+    auto entries = parse_obs_source_entries(json);
+    int sources = 0;
+    for (const auto &entry : entries) {
+      if (entry.module.find("filter") == std::string::npos) ++sources;
+    }
+    std::string id = path_stem_id(*collection);
+    std::string result = "{\"ok\":true,\"configDirLabel\":\"$OBS_CONFIG_DIR\",\"collections\":[{";
+    result += "\"collectionId\":\"" + json_escape(id) + "\",\"name\":\"" + json_escape(obs_collection_name(json, id)) +
+              "\",\"sourceCount\":" + std::to_string(sources) + ",\"profileCount\":" + std::to_string(profile_count(*config)) +
+              ",\"serviceKeyAction\":\"" + std::string(has_service_key(*config) ? "requires-consent" : "not-present") + "\"}]}";
+    return result;
+  }
+
+  std::string load(const std::string &request) {
+    auto config = resolve_config_dir(request);
+    if (!config) return error(-32602, "OBS config dir is required");
+    std::string collection_id = extract_json_string(request, "collectionId");
+    if (collection_id.empty()) return error(-32602, "collectionId is required");
+    auto collection = find_collection(*config, collection_id);
+    if (!collection) return error(-32602, "collection not found");
+    std::string home = extract_json_string(request, "streammateHome");
+    if (home.empty()) home = getenv_string("STREAMMATE_HOME");
+    if (home.empty()) return error(-32602, "STREAMMATE_HOME is required");
+
+    std::filesystem::path destination = std::filesystem::path(home) / "studio" / "obs-imports" / collection_id;
+    std::filesystem::path temp = destination;
+    temp += ".tmp";
+    try {
+      std::filesystem::remove_all(temp);
+      copy_config_without_service_json(*config, temp);
+      write_import_map(temp, *collection);
+      std::filesystem::remove_all(destination);
+      std::filesystem::create_directories(destination.parent_path());
+      std::filesystem::rename(temp, destination);
+    } catch (...) {
+      std::filesystem::remove_all(temp);
+      return error(-32603, "OBS fixture import failed");
+    }
+
+    last_report_by_collection_[collection_id] = build_report(*config, *collection, collection_id);
+    return "{\"ok\":true,\"destinationLabel\":\"$STREAMMATE_HOME/studio/obs-imports/" + json_escape(collection_id) +
+           "\",\"report\":" + last_report_by_collection_[collection_id] + "}";
+  }
+
+  std::string report(const std::string &request) {
+    std::string collection_id = extract_json_string(request, "collectionId");
+    if (collection_id.empty()) return error(-32602, "collectionId is required");
+    auto cached = last_report_by_collection_.find(collection_id);
+    if (cached != last_report_by_collection_.end()) return cached->second;
+    auto config = resolve_config_dir(request);
+    if (!config) return error(-32602, "OBS config dir is required");
+    auto collection = find_collection(*config, collection_id);
+    if (!collection) return error(-32602, "collection not found");
+    last_report_by_collection_[collection_id] = build_report(*config, *collection, collection_id);
+    return last_report_by_collection_[collection_id];
+  }
+
+private:
+  std::string error(int code, const std::string &message) const { return "__error__:" + std::to_string(code) + ":" + message; }
+
+  std::optional<std::filesystem::path> resolve_config_dir(const std::string &request) const {
+    std::string config = extract_json_string(request, "configDir");
+    if (config.empty()) config = getenv_string("STREAMMATE_OBS_CONFIG_DIR");
+    if (config.empty()) return std::nullopt;
+    std::filesystem::path path(config);
+    if (!std::filesystem::is_directory(path)) return std::nullopt;
+    return path;
+  }
+
+  std::optional<std::filesystem::path> find_collection(const std::filesystem::path &config, const std::string &collection_id) const {
+    std::filesystem::path scenes = config / "basic" / "scenes";
+    if (!std::filesystem::is_directory(scenes)) return std::nullopt;
+    std::vector<std::filesystem::path> candidates;
+    for (const auto &entry : std::filesystem::directory_iterator(scenes)) {
+      if (entry.is_regular_file() && entry.path().extension() == ".json") candidates.push_back(entry.path());
+    }
+    std::sort(candidates.begin(), candidates.end());
+    for (const auto &candidate : candidates) {
+      if (collection_id.empty() || path_stem_id(candidate) == collection_id) return candidate;
+    }
+    return std::nullopt;
+  }
+
+  void copy_config_without_service_json(const std::filesystem::path &config, const std::filesystem::path &destination) const {
+    for (const auto &entry : std::filesystem::recursive_directory_iterator(config)) {
+      std::filesystem::path relative = std::filesystem::relative(entry.path(), config);
+      if (relative.filename() == "service.json") continue;
+      std::filesystem::path target = destination / relative;
+      if (entry.is_directory()) {
+        std::filesystem::create_directories(target);
+      } else if (entry.is_regular_file()) {
+        std::filesystem::create_directories(target.parent_path());
+        std::filesystem::copy_file(entry.path(), target, std::filesystem::copy_options::overwrite_existing);
+      }
+    }
+  }
+
+  void write_import_map(const std::filesystem::path &destination, const std::filesystem::path &collection) const {
+    std::string json = read_text_file(collection);
+    std::vector<std::string> placeholders;
+    for (const auto &entry : parse_obs_source_entries(json)) {
+      if (entry.module == "third_party_camera_fx") {
+        placeholders.push_back("{\"sourceId\":\"source:" + json_escape(entry.label) + "\",\"label\":\"" + json_escape(entry.label) +
+                               "\",\"reason\":\"missing_plugin\"}");
+      }
+    }
+    std::filesystem::create_directories(destination);
+    std::ofstream out(destination / "streammate-import-map.json");
+    out << "{\"placeholderSources\":" << json_array_join(placeholders) << "}\n";
+  }
+
+  std::string build_report(const std::filesystem::path &config, const std::filesystem::path &collection, const std::string &collection_id) const {
+    std::string json = read_text_file(collection);
+    std::vector<std::string> mapped;
+    std::vector<std::string> degraded;
+    std::vector<std::string> unresolved;
+    for (const auto &entry : parse_obs_source_entries(json)) {
+      const std::string source_id = "source:" + entry.label;
+      if (entry.module == "scene") {
+        mapped.push_back(report_item("scene:" + entry.label, "scene", entry.label, "mapped", "mapped_native"));
+      } else if (entry.module == "color_source" || entry.module == "browser_source" || entry.module == "text_ft2_source" ||
+                 entry.module == "text_gdiplus" || entry.module == "image_source" || entry.module == "ffmpeg_source") {
+        mapped.push_back(report_item(source_id, "source", entry.label, "mapped", "mapped_native", entry.module));
+      } else if (entry.module == "av_capture_input") {
+        if (entry.label.find("Unplugged") != std::string::npos) {
+          degraded.push_back(report_item(source_id, "source", entry.label, "degraded", "missing_device", entry.module, "camera",
+                                         {"Original device identifier was absent from the fixture."}));
+        } else {
+          degraded.push_back(report_item(source_id, "source", entry.label, "degraded", "permission_required", entry.module, "camera",
+                                         {"Native import defers camera permission until explicit operator approval."}));
+        }
+      } else if (entry.module == "coreaudio_input_capture") {
+        degraded.push_back(report_item(source_id, "source", entry.label, "degraded", "permission_required", entry.module, "microphone",
+                                       {"Native import defers microphone permission until explicit operator approval."}));
+      } else if (entry.module == "screen_capture") {
+        degraded.push_back(report_item(source_id, "source", entry.label, "degraded", "permission_required", entry.module, "screen",
+                                       {"Native import defers screen permission until explicit operator approval."}));
+      } else if (entry.module == "third_party_camera_fx") {
+        degraded.push_back(report_item(source_id, "source", entry.label, "degraded", "missing_plugin", entry.module, "",
+                                       {"Replaced with placeholder source because obs-third-party-fx is not bundled upstream."}));
+      } else if (entry.module.find("filter") != std::string::npos) {
+        unresolved.push_back(report_item("filter:Station Overlay:" + entry.label, "filter", "Station Overlay / " + entry.label, "unresolved",
+                                         "unsupported_frontend_feature", entry.module, "",
+                                         {"OBS frontend filter is not imported by the native host scaffold."}));
+      }
+    }
+
+    std::string profile_name = first_profile_name(config);
+    std::string downgrade = report_item("profile:" + profile_name + ":encoder", "profile", profile_name, "degraded", "profile_downgraded", "", "",
+                                        {"OBS encoder obs_x264 mapped to native x264 fallback."});
+    std::string profile = "{\"mappedEncoder\":\"x264\",\"mappedOutput\":\"rtmp\",\"downgrades\":[" + downgrade +
+                          "],\"serviceKeyAction\":\"" + std::string(has_service_key(config) ? "requires-consent" : "not-present") + "\"}";
+    return "{\"reportId\":\"import-" + json_escape(collection_id) + "\",\"collectionId\":\"" + json_escape(collection_id) +
+           "\",\"generatedAt\":\"1970-01-01T00:00:00.000Z\",\"mapped\":" + json_array_join(mapped) +
+           ",\"degraded\":" + json_array_join(degraded) + ",\"unresolved\":" + json_array_join(unresolved) +
+           ",\"profile\":" + profile + "}";
+  }
+
+  std::map<std::string, std::string> last_report_by_collection_;
+};
+
 bool is_renderer_error(const std::string &result) { return result.rfind("__error__:", 0) == 0; }
 
 std::string renderer_error_to_rpc(const std::string &id, const std::string &result) {
@@ -1144,6 +1412,12 @@ private:
       send_renderer_result(fd, id, renderer_.mute_source(payload));
     } else if (method == "scene.captureFrame") {
       send_renderer_result(fd, id, renderer_.capture_frame(payload));
+    } else if (method == "import.scan") {
+      send_renderer_result(fd, id, importer_.scan(payload));
+    } else if (method == "import.load") {
+      send_renderer_result(fd, id, importer_.load(payload));
+    } else if (method == "import.report") {
+      send_renderer_result(fd, id, importer_.report(payload));
     } else if (method == "output.configure") {
       send_output_result(fd, id, output_.configure(payload));
     } else if (method == "output.start") {
@@ -1182,6 +1456,7 @@ private:
   EngineLifecycle &engine_;
   StateFile &state_;
   RendererState renderer_;
+  ObsImporter importer_;
   OutputController output_;
   int port_ = 0;
 };
