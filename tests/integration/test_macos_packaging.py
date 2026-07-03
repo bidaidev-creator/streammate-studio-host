@@ -80,6 +80,8 @@ class MacosPackagingTest(unittest.TestCase):
                 plist = plistlib.load(handle)
             self.assertEqual(plist["CFBundleIdentifier"], "com.streammate.studio-host")
             self.assertEqual(plist["CFBundleExecutable"], "studio-host")
+            self.assertIn("operator enables local capture sources", plist["NSCameraUsageDescription"])
+            self.assertIn("operator enables local audio capture sources", plist["NSMicrophoneUsageDescription"])
 
             scratch = temp_root / "scratch-copy"
             shutil.copytree(app, scratch / app.name, symlinks=True)

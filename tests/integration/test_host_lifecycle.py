@@ -334,6 +334,34 @@ def expected_import_report(service_key_action: str = "requires-consent") -> dict
 
 
 class StudioHostLifecycleTest(unittest.TestCase):
+    def test_tcc_prompt_exercise_scaffold_reports_no_tcc_claims(self) -> None:
+        process, port, _ = start_host()
+        self.addCleanup(stop_process, process)
+        sock = websocket_connect(port)
+        self.addCleanup(sock.close)
+
+        exercised = rpc(sock, 90, "host.exerciseTccPrompts", {"reason": "l4-rehearsal"})
+        self.assertEqual(
+            exercised["result"],
+            {
+                "ok": True,
+                "mode": "scaffold-no-tcc",
+                "promptCapable": False,
+                "cameraAttempted": False,
+                "microphoneAttempted": False,
+                "screenAttempted": False,
+                "cameraActivated": False,
+                "microphoneActivated": False,
+                "screenActivated": False,
+                "instantiatedCount": 0,
+                "failedCount": 0,
+                "sanitizedFailureClasses": [],
+            },
+        )
+        serialized = json.dumps(exercised)
+        for forbidden in ["l4-rehearsal", "/Users/", "device", "display", "fixture-camera", "fixture-mic"]:
+            self.assertNotIn(forbidden, serialized)
+
     def test_obs_fixture_import_scan_load_report_is_copy_only_and_redacted(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_root = Path(temp_dir)

@@ -20,5 +20,9 @@
   <string>0</string>
   <key>LSMinimumSystemVersion</key>
   <string>14.0</string>
+  <key>NSCameraUsageDescription</key>
+  <string>Stream Mate Studio Host uses camera access only when the operator enables local capture sources.</string>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>Stream Mate Studio Host uses microphone access only when the operator enables local audio capture sources.</string>
 </dict>
 </plist>
