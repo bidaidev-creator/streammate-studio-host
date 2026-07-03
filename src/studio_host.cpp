@@ -843,8 +843,44 @@ std::string json_array_join(const std::vector<std::string> &items) {
   return out;
 }
 
+struct PromptSourceSummary {
+  int camera_count = 0;
+  int microphone_count = 0;
+  int screen_count = 0;
+  int instantiated_count = 0;
+  int failed_count = 0;
+};
+
+std::string prompt_source_class(const std::string &module) {
+  if (module == "av_capture_input") return "camera";
+  if (module == "coreaudio_input_capture") return "microphone";
+  if (module == "screen_capture" || module == "display_capture") return "screen";
+  return "";
+}
+
+void count_prompt_source(PromptSourceSummary &summary, const std::string &tcc_class) {
+  if (tcc_class == "camera") ++summary.camera_count;
+  if (tcc_class == "microphone") ++summary.microphone_count;
+  if (tcc_class == "screen") ++summary.screen_count;
+}
+
+std::string prompt_source_summary_json(const PromptSourceSummary &summary, const std::string &mode, bool prompt_capable) {
+  int total = summary.camera_count + summary.microphone_count + summary.screen_count;
+  int deferred = prompt_capable ? 0 : total;
+  return "{\"mode\":\"" + json_escape(mode) + "\",\"promptCapable\":" + std::string(prompt_capable ? "true" : "false") +
+         ",\"cameraCount\":" + std::to_string(summary.camera_count) + ",\"microphoneCount\":" + std::to_string(summary.microphone_count) +
+         ",\"screenCount\":" + std::to_string(summary.screen_count) + ",\"instantiatedCount\":" + std::to_string(summary.instantiated_count) +
+         ",\"deferredCount\":" + std::to_string(deferred) + ",\"failedCount\":" + std::to_string(summary.failed_count) + "}";
+}
+
 class ObsImporter {
 public:
+  ~ObsImporter() {
+#if STREAMMATE_HAS_LIBOBS
+    release_prompt_sources();
+#endif
+  }
+
   std::string scan(const std::string &request) {
     auto config = resolve_config_dir(request);
     if (!config) return error(-32602, "OBS config dir is required");
@@ -891,8 +927,9 @@ public:
     }
 
     last_report_by_collection_[collection_id] = build_report(*config, *collection, collection_id);
+    std::string prompt_summary = instantiate_prompt_sources(*collection);
     return "{\"ok\":true,\"destinationLabel\":\"$STREAMMATE_HOME/studio/obs-imports/" + json_escape(collection_id) +
-           "\",\"report\":" + last_report_by_collection_[collection_id] + "}";
+           "\",\"report\":" + last_report_by_collection_[collection_id] + ",\"promptSources\":" + prompt_summary + "}";
   }
 
   std::string report(const std::string &request) {
@@ -910,6 +947,44 @@ public:
 
 private:
   std::string error(int code, const std::string &message) const { return "__error__:" + std::to_string(code) + ":" + message; }
+
+#if STREAMMATE_HAS_LIBOBS
+  void release_prompt_sources() {
+    for (obs_source_t *source : prompt_sources_) {
+      obs_source_release(source);
+    }
+    prompt_sources_.clear();
+  }
+#endif
+
+  std::string instantiate_prompt_sources(const std::filesystem::path &collection) {
+    std::string json = read_text_file(collection);
+    PromptSourceSummary summary;
+#if STREAMMATE_HAS_LIBOBS
+    release_prompt_sources();
+#endif
+    int prompt_index = 0;
+    for (const auto &entry : parse_obs_source_entries(json)) {
+      std::string tcc_class = prompt_source_class(entry.module);
+      if (tcc_class.empty()) continue;
+      count_prompt_source(summary, tcc_class);
+#if STREAMMATE_HAS_LIBOBS
+      std::string safe_name = "streammate-" + tcc_class + "-" + std::to_string(++prompt_index);
+      obs_source_t *source = obs_source_create_private(entry.module.c_str(), safe_name.c_str(), nullptr);
+      if (source) {
+        prompt_sources_.push_back(source);
+        ++summary.instantiated_count;
+      } else {
+        ++summary.failed_count;
+      }
+#endif
+    }
+#if STREAMMATE_HAS_LIBOBS
+    return prompt_source_summary_json(summary, "libobs-prompt-capable", true);
+#else
+    return prompt_source_summary_json(summary, "scaffold-no-tcc", false);
+#endif
+  }
 
   std::optional<std::filesystem::path> resolve_config_dir(const std::string &request) const {
     std::string config = extract_json_string(request, "configDir");
@@ -1010,6 +1085,9 @@ private:
   }
 
   std::map<std::string, std::string> last_report_by_collection_;
+#if STREAMMATE_HAS_LIBOBS
+  std::vector<obs_source_t *> prompt_sources_;
+#endif
 };
 
 bool is_renderer_error(const std::string &result) { return result.rfind("__error__:", 0) == 0; }

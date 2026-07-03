@@ -59,6 +59,14 @@ if(BUILD_TESTING)
     NAME studio-host-lifecycle
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_host_lifecycle.py $<TARGET_FILE:studio-host>
   )
+  add_test(
+    NAME macos-packaging
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_macos_packaging.py
+  )
+  add_test(
+    NAME macos-ci-workflow
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_macos_ci_workflow.py
+  )
 endif()
 
 install(TARGETS studio-host studio-host-smoke RUNTIME DESTINATION bin)

@@ -31,7 +31,7 @@ jobs:
 
       - name: Verify upstream pin and fork guard
         run: |
-          chmod +x scripts/*.sh
+          chmod +x scripts/*.sh packaging/macos/package-app.sh
           ./scripts/fork-guard.sh
 
       - name: Configure scaffold smoke without libobs
@@ -53,6 +53,11 @@ jobs:
         run: |
           cmake -S external/obs-studio -B build/obs -G Xcode \
             -DCMAKE_PROJECT_INCLUDE="$PWD/cmake/obs-enable-swift.cmake" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
+            -DCMAKE_OBJC_FLAGS="-Wno-error=deprecated-declarations" \
+            -DCMAKE_OBJCXX_FLAGS="-Wno-error=deprecated-declarations" \
+            -DCMAKE_C_FLAGS="-Wno-error=deprecated-declarations" \
+            -DCMAKE_CXX_FLAGS="-Wno-error=deprecated-declarations" \
             -DENABLE_UI=OFF \
             -DENABLE_SCRIPTING=OFF \
             -DENABLE_WEBRTC=OFF \
@@ -63,8 +68,12 @@ jobs:
       - name: Build libobs and required upstream modules
         run: |
           cmake --build build/obs --config RelWithDebInfo --target libobs
-          cmake --build build/obs --config RelWithDebInfo --target obs-outputs || true
-          cmake --build build/obs --config RelWithDebInfo --target obs-x264 || true
+          cmake --build build/obs --config RelWithDebInfo --target mac-avcapture
+          cmake --build build/obs --config RelWithDebInfo --target mac-capture
+          cmake --build build/obs --config RelWithDebInfo --target obs-outputs
+          cmake --build build/obs --config RelWithDebInfo --target obs-x264
+          cmake --build build/obs --config RelWithDebInfo --target coreaudio-encoder || true
+          cmake --build build/obs --config RelWithDebInfo --target mac-videotoolbox || true
           cmake --build build/obs --config RelWithDebInfo --target obs-browser || true
 
       - name: Locate built libobs
@@ -91,8 +100,21 @@ jobs:
             find build/obs -maxdepth 6 -name '*obsconfig*' -print >&2
             exit 1
           fi
+          module_stage="$PWD/build/obs/streammate-plugin-stage"
+          rm -rf "$module_stage"
+          mkdir -p "$module_stage"
+          for module in mac-avcapture mac-capture obs-outputs obs-x264; do
+            module_bundle="$(find build/obs/plugins -path "*/$module.plugin" -type d ! -path '*/EagerLinkingTBDs/*' | head -n 1)"
+            if [[ -z "$module_bundle" ]]; then
+              echo "required OBS plugin bundle not found: $module" >&2
+              find build/obs/plugins -maxdepth 8 -name '*.plugin' -print >&2
+              exit 1
+            fi
+            cp -R "$module_bundle" "$module_stage/"
+          done
           echo "library=$lib" >> "$GITHUB_OUTPUT"
           echo "generated_include=$(dirname "$obs_config")" >> "$GITHUB_OUTPUT"
+          echo "modules_dir=$module_stage" >> "$GITHUB_OUTPUT"
 
       - name: Configure obs_startup smoke against built libobs
         run: |
@@ -112,15 +134,26 @@ jobs:
 
       - name: Package ad-hoc-signed bundle and checksum manifest
         run: |
-          mkdir -p dist/StreamMateStudioHost.app/Contents/MacOS
-          cp packaging/macos/Info.plist dist/StreamMateStudioHost.app/Contents/Info.plist
-          cp build/host/studio-host dist/StreamMateStudioHost.app/Contents/MacOS/studio-host
-          cp build/host/studio-host-smoke dist/StreamMateStudioHost.app/Contents/MacOS/studio-host-smoke
-          /usr/bin/codesign --force --sign - --identifier com.streammate.studio-host dist/StreamMateStudioHost.app
-          ./scripts/write-sha256-manifest.sh dist
+          packaging/macos/package-app.sh \
+            --host-bin build/host/studio-host \
+            --smoke-bin build/host/studio-host-smoke \
+            --info-plist packaging/macos/Info.plist \
+            --libobs-framework "${{ steps.libobs.outputs.library }}" \
+            --obs-modules-dir "${{ steps.libobs.outputs.modules_dir }}" \
+            --obs-deps-lib-dir "$PWD/external/obs-studio/.deps/obs-deps-2025-08-23-universal/lib" \
+            --output-dir dist
+
+      - name: Verify relocatable app artifact from scratch copy
+        run: |
+          scratch="$RUNNER_TEMP/streammate-studio-host-artifact-smoke"
+          rm -rf "$scratch"
+          mkdir -p "$scratch"
+          cp -R dist/StreamMateStudioHost.app "$scratch/"
+          "$scratch/StreamMateStudioHost.app/Contents/MacOS/studio-host-smoke" --version
+          (cd dist && shasum -a 256 -c sha256-manifest.txt)
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: streammate-studio-host-macos-scaffold
+          name: streammate-studio-host-macos-libobs
           path: dist/

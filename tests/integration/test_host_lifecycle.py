@@ -1,4 +1,6 @@
 #!/usr/bin/env python3
+from __future__ import annotations
+
 import base64
 import hashlib
 import json
@@ -216,13 +218,14 @@ class FakeRtmpIngest:
 
     def kill_ingest(self) -> None:
         self._stop.set()
-        if self._client is not None:
+        client = self._client
+        if client is not None:
             try:
-                self._client.shutdown(socket.SHUT_RDWR)
+                client.shutdown(socket.SHUT_RDWR)
             except OSError:
                 pass
             try:
-                self._client.close()
+                client.close()
             except OSError:
                 pass
         try:
@@ -366,8 +369,24 @@ class StudioHostLifecycleTest(unittest.TestCase):
 
             loaded = rpc(sock, 101, "import.load", {"collectionId": "fixture-main"})
             self.assertEqual(loaded["result"]["report"], expected_import_report())
+            self.assertEqual(
+                loaded["result"]["promptSources"],
+                {
+                    "mode": "scaffold-no-tcc",
+                    "promptCapable": False,
+                    "cameraCount": 2,
+                    "microphoneCount": 1,
+                    "screenCount": 1,
+                    "instantiatedCount": 0,
+                    "deferredCount": 4,
+                    "failedCount": 0,
+                },
+            )
             self.assertEqual(loaded["result"]["destinationLabel"], "$STREAMMATE_HOME/studio/obs-imports/fixture-main")
             self.assertEqual(hash_tree(obs_dir), before_hash)
+            serialized_loaded = json.dumps(loaded)
+            for forbidden in [fixture_secret, "fixture-camera", "fixture-mic", "fixture-display", str(obs_dir)]:
+                self.assertNotIn(forbidden, serialized_loaded)
 
             copied_collection = streammate_home / "studio" / "obs-imports" / "fixture-main" / "basic" / "scenes" / "fixture-main.json"
             self.assertEqual(json.loads(copied_collection.read_text(encoding="utf-8"))["name"], "Fixture Main")
