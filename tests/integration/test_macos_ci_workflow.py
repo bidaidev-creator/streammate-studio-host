@@ -16,6 +16,7 @@ class MacosCiWorkflowTest(unittest.TestCase):
             with self.subTest(flag_name=flag_name):
                 self.assertIn(f"-D{flag_name}=", body)
         self.assertIn("-Wno-error=deprecated-declarations", body)
+        self.assertIn("-DCMAKE_OSX_DEPLOYMENT_TARGET=14.0", body)
 
 
 if __name__ == "__main__":

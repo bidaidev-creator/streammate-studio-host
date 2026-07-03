@@ -53,6 +53,7 @@ jobs:
         run: |
           cmake -S external/obs-studio -B build/obs -G Xcode \
             -DCMAKE_PROJECT_INCLUDE="$PWD/cmake/obs-enable-swift.cmake" \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET=14.0 \
             -DCMAKE_OBJC_FLAGS="-Wno-error=deprecated-declarations" \
             -DCMAKE_OBJCXX_FLAGS="-Wno-error=deprecated-declarations" \
             -DCMAKE_C_FLAGS="-Wno-error=deprecated-declarations" \
