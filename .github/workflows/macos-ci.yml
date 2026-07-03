@@ -100,15 +100,21 @@ jobs:
             find build/obs -maxdepth 6 -name '*obsconfig*' -print >&2
             exit 1
           fi
-          module_bundle="$(find build/obs -path '*/mac-capture.plugin' -type d ! -path '*/EagerLinkingTBDs/*' | head -n 1)"
-          if [[ -z "$module_bundle" ]]; then
-            echo "mac capture plugin bundle not found" >&2
-            find build/obs -maxdepth 7 -name '*.plugin' -print >&2
-            exit 1
-          fi
+          module_stage="$PWD/build/obs/streammate-plugin-stage"
+          rm -rf "$module_stage"
+          mkdir -p "$module_stage"
+          for module in mac-avcapture mac-capture obs-outputs obs-x264; do
+            module_bundle="$(find build/obs/plugins -path "*/$module.plugin" -type d ! -path '*/EagerLinkingTBDs/*' | head -n 1)"
+            if [[ -z "$module_bundle" ]]; then
+              echo "required OBS plugin bundle not found: $module" >&2
+              find build/obs/plugins -maxdepth 8 -name '*.plugin' -print >&2
+              exit 1
+            fi
+            cp -R "$module_bundle" "$module_stage/"
+          done
           echo "library=$lib" >> "$GITHUB_OUTPUT"
           echo "generated_include=$(dirname "$obs_config")" >> "$GITHUB_OUTPUT"
-          echo "modules_dir=$(dirname "$module_bundle")" >> "$GITHUB_OUTPUT"
+          echo "modules_dir=$module_stage" >> "$GITHUB_OUTPUT"
 
       - name: Configure obs_startup smoke against built libobs
         run: |

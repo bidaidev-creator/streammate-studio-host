@@ -18,6 +18,14 @@ class MacosCiWorkflowTest(unittest.TestCase):
         self.assertIn("-Wno-error=deprecated-declarations", body)
         self.assertIn("-DCMAKE_OSX_DEPLOYMENT_TARGET=14.0", body)
 
+    def test_ci_stages_all_required_plugin_bundles_for_packaging(self) -> None:
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn("streammate-plugin-stage", workflow)
+        self.assertIn('-path "*/$module.plugin"', workflow)
+        for module in ["mac-avcapture", "mac-capture", "obs-outputs", "obs-x264"]:
+            with self.subTest(module=module):
+                self.assertIn(module, workflow)
+
 
 if __name__ == "__main__":
     unittest.main()
