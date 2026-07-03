@@ -13,35 +13,52 @@ set(STREAMMATE_OBS_DEPS_INCLUDE_DIR "" CACHE PATH "Path to OBS dependency header
 set(STREAMMATE_OBS_DEPS_LIBRARY_DIR "" CACHE PATH "Path to OBS dependency libraries")
 set(STREAMMATE_OBS_GENERATED_INCLUDE_DIR "" CACHE PATH "Path to generated OBS headers, such as obsconfig.h")
 
+add_executable(studio-host src/studio_host.cpp)
 add_executable(studio-host-smoke src/studio_host_smoke.cpp)
-target_compile_definitions(studio-host-smoke PRIVATE
-  STREAMMATE_STUDIO_HOST_VERSION="${PROJECT_VERSION}"
-)
+
+foreach(target studio-host studio-host-smoke)
+  target_compile_definitions(${target} PRIVATE
+    STREAMMATE_STUDIO_HOST_VERSION="${PROJECT_VERSION}"
+  )
+endforeach()
 
 if(STREAMMATE_REQUIRE_LIBOBS)
   if(NOT STREAMMATE_OBS_INCLUDE_DIR OR NOT STREAMMATE_OBS_LIBRARY)
     message(FATAL_ERROR "STREAMMATE_REQUIRE_LIBOBS=ON requires STREAMMATE_OBS_INCLUDE_DIR and STREAMMATE_OBS_LIBRARY")
   endif()
 
-  target_compile_definitions(studio-host-smoke PRIVATE STREAMMATE_HAS_LIBOBS=1)
-  target_include_directories(studio-host-smoke PRIVATE "${STREAMMATE_OBS_INCLUDE_DIR}")
-  if(STREAMMATE_OBS_DEPS_INCLUDE_DIR)
-    target_include_directories(studio-host-smoke PRIVATE "${STREAMMATE_OBS_DEPS_INCLUDE_DIR}")
-  endif()
-  if(STREAMMATE_OBS_GENERATED_INCLUDE_DIR)
-    target_include_directories(studio-host-smoke PRIVATE "${STREAMMATE_OBS_GENERATED_INCLUDE_DIR}")
-  endif()
-  target_link_libraries(studio-host-smoke PRIVATE "${STREAMMATE_OBS_LIBRARY}")
-  if(APPLE AND IS_DIRECTORY "${STREAMMATE_OBS_LIBRARY}" AND STREAMMATE_OBS_LIBRARY MATCHES "\\.framework$")
-    get_filename_component(STREAMMATE_OBS_FRAMEWORK_DIR "${STREAMMATE_OBS_LIBRARY}" DIRECTORY)
-    set(STREAMMATE_STUDIO_HOST_RPATHS "${STREAMMATE_OBS_FRAMEWORK_DIR}")
-    if(STREAMMATE_OBS_DEPS_LIBRARY_DIR)
-      list(APPEND STREAMMATE_STUDIO_HOST_RPATHS "${STREAMMATE_OBS_DEPS_LIBRARY_DIR}")
+  foreach(target studio-host studio-host-smoke)
+    target_compile_definitions(${target} PRIVATE STREAMMATE_HAS_LIBOBS=1)
+    target_include_directories(${target} PRIVATE "${STREAMMATE_OBS_INCLUDE_DIR}")
+    if(STREAMMATE_OBS_DEPS_INCLUDE_DIR)
+      target_include_directories(${target} PRIVATE "${STREAMMATE_OBS_DEPS_INCLUDE_DIR}")
     endif()
-    set_target_properties(studio-host-smoke PROPERTIES BUILD_RPATH "${STREAMMATE_STUDIO_HOST_RPATHS}")
-  endif()
+    if(STREAMMATE_OBS_GENERATED_INCLUDE_DIR)
+      target_include_directories(${target} PRIVATE "${STREAMMATE_OBS_GENERATED_INCLUDE_DIR}")
+    endif()
+    target_link_libraries(${target} PRIVATE "${STREAMMATE_OBS_LIBRARY}")
+    if(APPLE AND IS_DIRECTORY "${STREAMMATE_OBS_LIBRARY}" AND STREAMMATE_OBS_LIBRARY MATCHES "\\.framework$")
+      get_filename_component(STREAMMATE_OBS_FRAMEWORK_DIR "${STREAMMATE_OBS_LIBRARY}" DIRECTORY)
+      set(STREAMMATE_STUDIO_HOST_RPATHS "${STREAMMATE_OBS_FRAMEWORK_DIR}")
+      if(STREAMMATE_OBS_DEPS_LIBRARY_DIR)
+        list(APPEND STREAMMATE_STUDIO_HOST_RPATHS "${STREAMMATE_OBS_DEPS_LIBRARY_DIR}")
+      endif()
+      set_target_properties(${target} PROPERTIES BUILD_RPATH "${STREAMMATE_STUDIO_HOST_RPATHS}")
+    endif()
+  endforeach()
 else()
-  target_compile_definitions(studio-host-smoke PRIVATE STREAMMATE_HAS_LIBOBS=0)
+  foreach(target studio-host studio-host-smoke)
+    target_compile_definitions(${target} PRIVATE STREAMMATE_HAS_LIBOBS=0)
+  endforeach()
 endif()
 
-install(TARGETS studio-host-smoke RUNTIME DESTINATION bin)
+include(CTest)
+if(BUILD_TESTING)
+  find_package(Python3 COMPONENTS Interpreter REQUIRED)
+  add_test(
+    NAME studio-host-lifecycle
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_host_lifecycle.py $<TARGET_FILE:studio-host>
+  )
+endif()
+
+install(TARGETS studio-host studio-host-smoke RUNTIME DESTINATION bin)

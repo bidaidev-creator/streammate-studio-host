@@ -37,11 +37,14 @@ jobs:
       - name: Configure scaffold smoke without libobs
         run: cmake -S . -B build/scaffold -G Ninja -DSTREAMMATE_REQUIRE_LIBOBS=OFF
 
-      - name: Build scaffold smoke
-        run: cmake --build build/scaffold --target studio-host-smoke
+      - name: Build scaffold host and smoke
+        run: cmake --build build/scaffold --target studio-host studio-host-smoke
 
       - name: Run scaffold smoke
         run: ./build/scaffold/studio-host-smoke
+
+      - name: Run lifecycle integration tests
+        run: ctest --test-dir build/scaffold --output-on-failure
 
       - name: Fetch OBS version tag metadata for upstream CMake
         run: git -C external/obs-studio fetch --tags --force --depth 1 origin tag 32.1.2
@@ -101,8 +104,8 @@ jobs:
             -DSTREAMMATE_OBS_GENERATED_INCLUDE_DIR="$PWD/${{ steps.libobs.outputs.generated_include }}" \
             -DSTREAMMATE_OBS_LIBRARY="$PWD/${{ steps.libobs.outputs.library }}"
 
-      - name: Build obs_startup smoke
-        run: cmake --build build/host --target studio-host-smoke
+      - name: Build obs_startup smoke and studio-host
+        run: cmake --build build/host --target studio-host-smoke studio-host
 
       - name: Run obs_startup smoke headlessly
         run: ./build/host/studio-host-smoke
@@ -111,6 +114,7 @@ jobs:
         run: |
           mkdir -p dist/StreamMateStudioHost.app/Contents/MacOS
           cp packaging/macos/Info.plist dist/StreamMateStudioHost.app/Contents/Info.plist
+          cp build/host/studio-host dist/StreamMateStudioHost.app/Contents/MacOS/studio-host
           cp build/host/studio-host-smoke dist/StreamMateStudioHost.app/Contents/MacOS/studio-host-smoke
           /usr/bin/codesign --force --sign - --identifier com.streammate.studio-host dist/StreamMateStudioHost.app
           ./scripts/write-sha256-manifest.sh dist

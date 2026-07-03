@@ -6,15 +6,17 @@ This repository is the GPL boundary described by Stream Mate ADR-0005. The propr
 
 ## Current scope
 
-Chunk 2 scaffold only:
+Current prototype scope:
 
 - GPL-2.0 repository.
 - `external/obs-studio` submodule pinned by commit to upstream OBS Studio `32.1.2`.
-- CMake scaffold for a minimal headless `obs_startup` / `obs_shutdown` smoke target.
+- CMake scaffold for the `studio-host` binary plus a minimal headless `obs_startup` / `obs_shutdown` smoke target.
+- Loopback-only WebSocket JSON-RPC control skeleton with `host.hello`, `host.health`, and `host.shutdown`.
+- Token-authenticated control connections, 5,000 ms heartbeat events, sanitized structured logs, and atomic state-file writes for supervisor probes.
 - macOS CI scaffold for building the pinned upstream OBS sources without the Qt frontend, producing an ad-hoc-signed bundle artifact and sha256 manifest.
 - Fork guard scripts that fail if the OBS submodule has local modifications or drifts from the recorded pin.
 
-No control server, scene commands, import, output, live egress, real TCC rehearsal, or product logic exists in this chunk.
+Scene commands, import, output, live egress, real TCC rehearsal, and product logic remain out of scope.
 
 ## Pin-not-fork rule
 
@@ -35,11 +37,22 @@ git submodule update --init --recursive
 ./scripts/verify-obs-pin.sh
 ./scripts/fork-guard.sh
 cmake -S . -B build/local -DSTREAMMATE_REQUIRE_LIBOBS=OFF
-cmake --build build/local --target studio-host-smoke
+cmake --build build/local --target studio-host studio-host-smoke
 ./build/local/studio-host-smoke --version
+ctest --test-dir build/local --output-on-failure
 ```
 
 `STREAMMATE_REQUIRE_LIBOBS=OFF` is a scaffold-only fallback for machines without built libobs. CI is expected to configure the target with libobs enabled once the upstream OBS build dependencies are available.
+
+## Control skeleton
+
+The current `studio-host` binary accepts:
+
+```sh
+./build/local/studio-host --token <station-minted-token> --host 127.0.0.1 --port 0 --state-file /tmp/studio-host-state.json
+```
+
+It refuses non-loopback bind hosts, upgrades authorized WebSocket clients on `/control`, emits `host.started` / `host.ready` / periodic `host.health` events, and handles `host.hello`, `host.health`, and `host.shutdown` JSON-RPC requests. The host has no Station journal authority; Station will translate host lifecycle observations into `studio.*` journal events in the monorepo adapter chunk.
 
 ## Artifact/checksum posture
 
