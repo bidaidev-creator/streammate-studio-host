@@ -10,6 +10,7 @@
 #include <cstring>
 #include <fcntl.h>
 #include <filesystem>
+#include <cerrno>
 #include <fstream>
 #include <iostream>
 #include <map>
@@ -736,6 +737,296 @@ std::string renderer_error_to_rpc(const std::string &id, const std::string &resu
   return rpc_error(id, code, result.substr(message_start + 1));
 }
 
+struct EndpointPreview {
+  std::string host;
+  int port = 1935;
+  bool valid = false;
+  bool loopback = false;
+};
+
+EndpointPreview parse_rtmp_endpoint(const std::string &endpoint) {
+  EndpointPreview parsed;
+  const std::string prefix = "rtmp://";
+  if (endpoint.rfind(prefix, 0) != 0) return parsed;
+  std::string rest = endpoint.substr(prefix.size());
+  auto slash = rest.find('/');
+  std::string authority = slash == std::string::npos ? rest : rest.substr(0, slash);
+  auto at = authority.rfind('@');
+  if (at != std::string::npos) authority = authority.substr(at + 1);
+  if (authority.empty()) return parsed;
+  std::string host = authority;
+  int port = 1935;
+  auto colon = authority.rfind(':');
+  if (colon != std::string::npos) {
+    host = authority.substr(0, colon);
+    try {
+      port = std::stoi(authority.substr(colon + 1));
+    } catch (...) {
+      return parsed;
+    }
+  }
+  if (host == "localhost") host = "127.0.0.1";
+  parsed.host = host;
+  parsed.port = port;
+  parsed.valid = !host.empty() && port > 0 && port <= 65535;
+  parsed.loopback = host == "127.0.0.1" || host == "::1" || host == "[::1]";
+  return parsed;
+}
+
+std::string endpoint_preview_json(const EndpointPreview &endpoint) {
+  if (!endpoint.valid) return "null";
+  return "{\"scheme\":\"rtmp\",\"host\":\"" + json_escape(endpoint.host) + "\",\"port\":" + std::to_string(endpoint.port) +
+         ",\"path\":\"<redacted>\"}";
+}
+
+struct OutputStats {
+  uint64_t rendered_frames = 0;
+  uint64_t encoded_frames = 0;
+  uint64_t dropped_frames = 0;
+  uint64_t severe_frames = 0;
+  int congestion_percent = 0;
+};
+
+class OutputController {
+public:
+  std::string configure(const std::string &request) {
+    std::string output_id = extract_json_string(request, "outputId");
+    if (output_id.empty()) return rpc_error_result(-32602, "outputId is required");
+    std::string endpoint = extract_json_string(request, "endpoint");
+    if (!endpoint.empty()) {
+      EndpointPreview parsed = parse_rtmp_endpoint(endpoint);
+      if (!parsed.valid) return rpc_error_result(-32602, "endpoint must be an rtmp URL");
+      endpoint_ = endpoint;
+      endpoint_preview_ = parsed;
+    }
+    output_id_ = output_id;
+    configured_ = true;
+    requested_video_encoder_ = extract_json_string(request, "videoEncoder");
+    if (requested_video_encoder_.empty()) requested_video_encoder_ = "videotoolbox_h264";
+    requested_audio_encoder_ = extract_json_string(request, "audioEncoder");
+    if (requested_audio_encoder_.empty()) requested_audio_encoder_ = "aac";
+    return "{\"ok\":true,\"outputId\":\"" + json_escape(output_id_) + "\",\"configured\":true," +
+           "\"encoder\":{\"requested\":\"" + json_escape(requested_video_encoder_) + "\",\"actual\":\"" + json_escape(actual_video_encoder()) +
+           "\",\"fallback\":" + std::string(actual_video_encoder() == requested_video_encoder_ ? "false" : "true") + "}," +
+           "\"audio\":{\"requested\":\"" + json_escape(requested_audio_encoder_) + "\",\"actual\":\"aac-scaffold\"}," +
+           "\"endpoint\":" + endpoint_preview_json(endpoint_preview_) + ",\"streamKeyStatus\":\"not-stored\"}";
+  }
+
+  std::string start(const std::string &request) {
+    std::string output_id = extract_json_string(request, "outputId");
+    if (output_id.empty()) return rpc_error_result(-32602, "outputId is required");
+    std::string endpoint = extract_json_string(request, "endpoint");
+    if (!endpoint.empty()) {
+      EndpointPreview parsed = parse_rtmp_endpoint(endpoint);
+      if (!parsed.valid) return rpc_error_result(-32602, "endpoint must be an rtmp URL");
+      endpoint_ = endpoint;
+      endpoint_preview_ = parsed;
+    }
+    if (!configured_) {
+      output_id_ = output_id;
+      configured_ = true;
+    }
+    if (output_id != output_id_) return rpc_error_result(-32602, "output is not configured");
+    if (!endpoint_preview_.valid || !endpoint_preview_.loopback) return rpc_error_result(-32602, "output.start only permits a local fake RTMP ingest endpoint in this scaffold");
+    std::string stream_key = extract_json_string(request, "streamKey");
+    if (stream_key.empty()) return rpc_error_result(-32602, "streamKey is required");
+
+    close_ingest();
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return rpc_error_result(-32603, "fake ingest socket create failed");
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(static_cast<uint16_t>(endpoint_preview_.port));
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (connect(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0) {
+      close(fd);
+      clear_stream_key();
+      return rpc_error_result(-32603, "fake ingest connect failed");
+    }
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    ingest_fd_ = fd;
+    stream_key_ = stream_key;
+    running_ = true;
+    error_pending_ = false;
+    stopped_pending_ = false;
+    started_pending_ = true;
+    stats_ = {};
+    started_at_ = std::chrono::steady_clock::now();
+    last_frame_at_ = std::chrono::steady_clock::now();
+    last_stats_at_ = std::chrono::steady_clock::now();
+    panic_audio_hard_muted_ = true;
+    send_ingest_chunk();
+    return status_json("memory-only-redacted", true);
+  }
+
+  std::string stop(const std::string &request) {
+    std::string output_id = extract_json_string(request, "outputId");
+    if (!output_id.empty() && !output_id_.empty() && output_id != output_id_) return rpc_error_result(-32602, "output is not configured");
+    bool was_running = running_;
+    running_ = false;
+    close_ingest();
+    clear_stream_key();
+    panic_audio_hard_muted_ = false;
+    if (was_running) stopped_pending_ = true;
+    return status_json("cleared", true);
+  }
+
+  std::string status(const std::string &) const {
+    return status_json(stream_key_.empty() ? "cleared" : "memory-only-redacted", false);
+  }
+
+  std::string subscribe(const std::string &request) {
+    int interval = extract_json_int(request, "intervalMs").value_or(1000);
+    if (interval <= 0) interval = 1000;
+    stats_interval_ms_ = std::clamp(interval, 50, 10000);
+    stats_subscribed_ = true;
+    last_stats_at_ = std::chrono::steady_clock::now();
+    return "{\"ok\":true,\"sampleShape\":\"spec18-item8\",\"intervalMs\":" + std::to_string(stats_interval_ms_) + "}";
+  }
+
+  void tick(int control_fd) {
+    if (!running_) return;
+    auto now = std::chrono::steady_clock::now();
+    if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_frame_at_).count() >= 33) {
+      stats_.rendered_frames += 1;
+      stats_.encoded_frames += 1;
+      last_frame_at_ = now;
+      if (!send_ingest_chunk()) {
+        fail_output(control_fd, "fake ingest disconnected");
+        return;
+      }
+    }
+    if (ingest_disconnected()) {
+      fail_output(control_fd, "fake ingest disconnected");
+      return;
+    }
+    if (stats_subscribed_ && std::chrono::duration_cast<std::chrono::milliseconds>(now - last_stats_at_).count() >= stats_interval_ms_) {
+      send_text_frame(control_fd, stats_event());
+      last_stats_at_ = now;
+    }
+    if (started_pending_) {
+      send_text_frame(control_fd, output_event("output.started", "running"));
+      started_pending_ = false;
+    }
+    if (stopped_pending_) {
+      send_text_frame(control_fd, output_event("output.stopped", "stopped"));
+      stopped_pending_ = false;
+    }
+  }
+
+private:
+  std::string rpc_error_result(int code, const std::string &message) const {
+    return "__error__:" + std::to_string(code) + ":" + message;
+  }
+
+  std::string actual_video_encoder() const {
+#if STREAMMATE_HAS_LIBOBS
+    return "videotoolbox_h264";
+#else
+    return "x264-scaffold";
+#endif
+  }
+
+  std::string status_json(const std::string &stream_key_status, bool include_ok) const {
+    double severe_percent = stats_.rendered_frames == 0 ? 0.0 : (static_cast<double>(stats_.severe_frames) * 100.0 / static_cast<double>(stats_.rendered_frames));
+    return std::string("{") + (include_ok ? "\"ok\":true," : "") +
+           "\"outputId\":\"" + json_escape(output_id_.empty() ? "rtmp-main" : output_id_) + "\",\"configured\":" + (configured_ ? "true" : "false") +
+           ",\"running\":" + (running_ ? "true" : "false") + ",\"endpoint\":" + endpoint_preview_json(endpoint_preview_) +
+           ",\"encoder\":{\"requested\":\"" + json_escape(requested_video_encoder_) + "\",\"actual\":\"" + json_escape(actual_video_encoder()) +
+           "\",\"fallback\":" + std::string(actual_video_encoder() == requested_video_encoder_ ? "false" : "true") + "}," +
+           "\"audio\":{\"requested\":\"" + json_escape(requested_audio_encoder_) + "\",\"actual\":\"aac-scaffold\"}," +
+           "\"streamKeyStatus\":\"" + json_escape(stream_key_status) + "\",\"panicMute\":{\"hostAudioHardMuted\":" +
+           (panic_audio_hard_muted_ ? "true" : "false") + "},\"stats\":" + stats_json(severe_percent) + "}";
+  }
+
+  std::string stats_json(double severe_percent) const {
+    return "{\"shape\":\"spec18-item8\",\"renderedFrames\":" + std::to_string(stats_.rendered_frames) +
+           ",\"encodedFrames\":" + std::to_string(stats_.encoded_frames) + ",\"droppedFrames\":" + std::to_string(stats_.dropped_frames) +
+           ",\"severeFrameLossPercent\":" + std::to_string(severe_percent) + ",\"congestion\":{\"level\":\"none\",\"percent\":" +
+           std::to_string(stats_.congestion_percent) + "}}";
+  }
+
+  std::string output_event(const std::string &type, const std::string &status) const {
+    return "{\"type\":\"" + type + "\",\"sessionId\":\"local\",\"payload\":{\"outputId\":\"" +
+           json_escape(output_id_) + "\",\"status\":\"" + status + "\",\"endpoint\":" + endpoint_preview_json(endpoint_preview_) +
+           ",\"encoder\":\"" + json_escape(actual_video_encoder()) + "\"}}";
+  }
+
+  std::string stats_event() const {
+    double severe_percent = stats_.rendered_frames == 0 ? 0.0 : (static_cast<double>(stats_.severe_frames) * 100.0 / static_cast<double>(stats_.rendered_frames));
+    return "{\"type\":\"stats.sample\",\"sessionId\":\"local\",\"payload\":{\"outputId\":\"" + json_escape(output_id_) +
+           "\",\"sample\":" + stats_json(severe_percent) + "}}";
+  }
+
+  bool send_ingest_chunk() {
+    if (ingest_fd_ < 0) return false;
+    const char chunk[] = "STREAMMATE_FAKE_RTMP_CHUNK\n";
+    ssize_t sent = send(ingest_fd_, chunk, sizeof(chunk) - 1, 0);
+    return sent == static_cast<ssize_t>(sizeof(chunk) - 1) || (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
+  }
+
+  bool ingest_disconnected() const {
+    if (ingest_fd_ < 0) return true;
+    fd_set readfds;
+    FD_ZERO(&readfds);
+    FD_SET(ingest_fd_, &readfds);
+    timeval timeout{0, 0};
+    int ready = select(ingest_fd_ + 1, &readfds, nullptr, nullptr, &timeout);
+    if (ready <= 0 || !FD_ISSET(ingest_fd_, &readfds)) return false;
+    char byte = 0;
+    ssize_t n = recv(ingest_fd_, &byte, 1, MSG_PEEK);
+    return n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK);
+  }
+
+  void fail_output(int control_fd, const std::string &reason) {
+    running_ = false;
+    close_ingest();
+    clear_stream_key();
+    panic_audio_hard_muted_ = false;
+    send_text_frame(control_fd, "{\"type\":\"output.error\",\"sessionId\":\"local\",\"payload\":{\"outputId\":\"" + json_escape(output_id_) +
+                                "\",\"status\":\"stopped\",\"sanitizedReason\":\"" + json_escape(reason) + "\"}}");
+  }
+
+  void close_ingest() {
+    if (ingest_fd_ >= 0) {
+      close(ingest_fd_);
+      ingest_fd_ = -1;
+    }
+  }
+
+  void clear_stream_key() {
+    std::fill(stream_key_.begin(), stream_key_.end(), '\0');
+    stream_key_.clear();
+  }
+
+  bool configured_ = false;
+  bool running_ = false;
+  bool stats_subscribed_ = false;
+  bool panic_audio_hard_muted_ = false;
+  bool started_pending_ = false;
+  bool stopped_pending_ = false;
+  bool error_pending_ = false;
+  int stats_interval_ms_ = 1000;
+  int ingest_fd_ = -1;
+  std::string output_id_;
+  std::string endpoint_;
+  EndpointPreview endpoint_preview_;
+  std::string requested_video_encoder_ = "videotoolbox_h264";
+  std::string requested_audio_encoder_ = "aac";
+  std::string stream_key_;
+  OutputStats stats_;
+  std::chrono::steady_clock::time_point started_at_;
+  std::chrono::steady_clock::time_point last_frame_at_;
+  std::chrono::steady_clock::time_point last_stats_at_;
+};
+
+bool is_output_error(const std::string &result) { return result.rfind("__error__:", 0) == 0; }
+
+std::string output_error_to_rpc(const std::string &id, const std::string &result) {
+  return renderer_error_to_rpc(id, result);
+}
+
 class ControlServer {
 public:
   ControlServer(Options options, EngineLifecycle &engine, StateFile &state) : options_(std::move(options)), engine_(engine), state_(state) {}
@@ -824,6 +1115,7 @@ private:
         if (!payload) return;
         handle_message(fd, *payload);
       }
+      output_.tick(fd);
       if (std::chrono::steady_clock::now() >= next_heartbeat) {
         if (!send_text_frame(fd, heartbeat_event())) return;
         next_heartbeat = std::chrono::steady_clock::now() + std::chrono::milliseconds(kHeartbeatMs);
@@ -852,6 +1144,16 @@ private:
       send_renderer_result(fd, id, renderer_.mute_source(payload));
     } else if (method == "scene.captureFrame") {
       send_renderer_result(fd, id, renderer_.capture_frame(payload));
+    } else if (method == "output.configure") {
+      send_output_result(fd, id, output_.configure(payload));
+    } else if (method == "output.start") {
+      send_output_result(fd, id, output_.start(payload));
+    } else if (method == "output.stop") {
+      send_output_result(fd, id, output_.stop(payload));
+    } else if (method == "output.status") {
+      send_output_result(fd, id, output_.status(payload));
+    } else if (method == "stats.subscribe") {
+      send_output_result(fd, id, output_.subscribe(payload));
     } else if (method == "host.shutdown") {
       send_text_frame(fd, rpc_result(id, "{\"ok\":true}"));
       g_stop = 1;
@@ -868,10 +1170,19 @@ private:
     }
   }
 
+  void send_output_result(int fd, const std::string &id, const std::string &result) {
+    if (is_output_error(result)) {
+      send_text_frame(fd, output_error_to_rpc(id, result));
+    } else {
+      send_text_frame(fd, rpc_result(id, result));
+    }
+  }
+
   Options options_;
   EngineLifecycle &engine_;
   StateFile &state_;
   RendererState renderer_;
+  OutputController output_;
   int port_ = 0;
 };
 
@@ -880,6 +1191,7 @@ private:
 int main(int argc, char **argv) {
   std::signal(SIGTERM, handle_signal);
   std::signal(SIGINT, handle_signal);
+  std::signal(SIGPIPE, SIG_IGN);
 
   try {
     Options options = parse_args(argc, argv);
