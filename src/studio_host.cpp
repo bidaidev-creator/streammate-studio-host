@@ -30,6 +30,8 @@
 #include <vector>
 
 #if defined(__APPLE__)
+#include <CoreFoundation/CoreFoundation.h>
+#include <CoreGraphics/CoreGraphics.h>
 #include <mach-o/dyld.h>
 #endif
 
@@ -1130,6 +1132,41 @@ private:
     return selected;
   }
 
+  std::optional<std::string> main_display_uuid() const {
+#if defined(__APPLE__)
+    CFUUIDRef uuid = CGDisplayCreateUUIDFromDisplayID(CGMainDisplayID());
+    if (!uuid) {
+      return std::nullopt;
+    }
+    CFStringRef uuid_string = CFUUIDCreateString(kCFAllocatorDefault, uuid);
+    CFRelease(uuid);
+    if (!uuid_string) {
+      return std::nullopt;
+    }
+    char buffer[128] = {};
+    bool ok = CFStringGetCString(uuid_string, buffer, sizeof(buffer), kCFStringEncodingUTF8);
+    CFRelease(uuid_string);
+    if (!ok || buffer[0] == '\0') {
+      return std::nullopt;
+    }
+    return std::string(buffer);
+#else
+    return std::nullopt;
+#endif
+  }
+
+  bool configure_initial_prompt_settings(obs_data_t *settings, const std::string &tcc_class) const {
+    if (tcc_class == "screen") {
+      obs_data_set_int(settings, "type", 0);
+      auto display_uuid = main_display_uuid();
+      if (!display_uuid) {
+        return false;
+      }
+      obs_data_set_string(settings, "display_uuid", display_uuid->c_str());
+    }
+    return true;
+  }
+
   bool configure_prompt_source(obs_source_t *source, obs_data_t *settings, const std::string &tcc_class) {
     if (tcc_class == "camera") {
       obs_data_set_bool(settings, "use_preset", true);
@@ -1142,13 +1179,18 @@ private:
     }
     if (tcc_class == "screen") {
       obs_data_set_int(settings, "type", 0);
-      return apply_first_string_property(source, settings, "display_uuid");
+      return apply_first_string_property(source, settings, "display_uuid") ||
+             std::string(obs_data_get_string(settings, "display_uuid")).size() > 0;
     }
     return false;
   }
 
   bool create_prompt_source(const std::string &source_id, const std::string &safe_name, const std::string &tcc_class, bool activate) {
     obs_data_t *settings = obs_data_create();
+    if (!configure_initial_prompt_settings(settings, tcc_class)) {
+      obs_data_release(settings);
+      return false;
+    }
     obs_source_t *source = obs_source_create_private(source_id.c_str(), safe_name.c_str(), settings);
     if (!source) {
       obs_data_release(settings);
