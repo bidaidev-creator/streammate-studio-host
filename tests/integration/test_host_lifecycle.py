@@ -362,6 +362,12 @@ class StudioHostLifecycleTest(unittest.TestCase):
         for forbidden in ["l4-rehearsal", "/Users/", "device", "display", "fixture-camera", "fixture-mic"]:
             self.assertNotIn(forbidden, serialized)
 
+    def test_tcc_screen_exercise_has_display_capture_fallback(self) -> None:
+        source = Path(__file__).resolve().parents[2] / "src" / "studio_host.cpp"
+        contents = source.read_text(encoding="utf-8")
+
+        self.assertIn('return {"screen_capture", "display_capture"};', contents)
+
     def test_obs_fixture_import_scan_load_report_is_copy_only_and_redacted(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_root = Path(temp_dir)

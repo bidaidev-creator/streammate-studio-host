@@ -907,11 +907,11 @@ std::string prompt_source_class(const std::string &module) {
   return "";
 }
 
-std::string exercise_source_id(const std::string &tcc_class) {
-  if (tcc_class == "camera") return "macos-avcapture";
-  if (tcc_class == "microphone") return "coreaudio_input_capture";
-  if (tcc_class == "screen") return "screen_capture";
-  return "";
+std::vector<std::string> exercise_source_ids(const std::string &tcc_class) {
+  if (tcc_class == "camera") return {"macos-avcapture"};
+  if (tcc_class == "microphone") return {"coreaudio_input_capture"};
+  if (tcc_class == "screen") return {"screen_capture", "display_capture"};
+  return {};
 }
 
 void count_prompt_source(PromptSourceSummary &summary, const std::string &tcc_class) {
@@ -1031,9 +1031,15 @@ public:
     const std::vector<std::string> tcc_classes = {"camera", "microphone", "screen"};
     for (const auto &tcc_class : tcc_classes) {
       mark_attempted(summary, tcc_class);
-      std::string source_id = exercise_source_id(tcc_class);
       std::string safe_name = "streammate-l4-" + tcc_class;
-      if (create_prompt_source(source_id, safe_name, tcc_class, true)) {
+      bool created = false;
+      for (const std::string &source_id : exercise_source_ids(tcc_class)) {
+        if (create_prompt_source(source_id, safe_name, tcc_class, true)) {
+          created = true;
+          break;
+        }
+      }
+      if (created) {
         ++summary.instantiated_count;
         mark_activated(summary, tcc_class);
       } else {
@@ -1155,9 +1161,15 @@ private:
       if (tcc_class.empty()) continue;
       count_prompt_source(summary, tcc_class);
 #if STREAMMATE_HAS_LIBOBS
-      std::string source_id = exercise_source_id(tcc_class);
       std::string safe_name = "streammate-" + tcc_class + "-" + std::to_string(++prompt_index);
-      if (create_prompt_source(source_id, safe_name, tcc_class, false)) {
+      bool created = false;
+      for (const std::string &source_id : exercise_source_ids(tcc_class)) {
+        if (create_prompt_source(source_id, safe_name, tcc_class, false)) {
+          created = true;
+          break;
+        }
+      }
+      if (created) {
         ++summary.instantiated_count;
       } else {
         ++summary.failed_count;
