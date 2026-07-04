@@ -129,6 +129,9 @@ public:
       return false;
     }
     add_bundle_module_path();
+    if (!reset_offscreen_video()) {
+      return false;
+    }
     obs_load_all_modules();
     obs_post_load_modules();
 #endif
@@ -181,6 +184,24 @@ private:
     std::string binary_pattern = (plugins / "%module%.plugin" / "Contents" / "MacOS").string();
     std::string data_pattern = (plugins / "%module%.plugin" / "Contents" / "Resources").string();
     obs_add_module_path(binary_pattern.c_str(), data_pattern.c_str());
+  }
+
+  static bool reset_offscreen_video() {
+    obs_video_info video = {};
+    video.graphics_module = "@executable_path/../Frameworks/libobs-opengl.dylib";
+    video.fps_num = 30;
+    video.fps_den = 1;
+    video.base_width = 640;
+    video.base_height = 360;
+    video.output_width = 640;
+    video.output_height = 360;
+    video.output_format = VIDEO_FORMAT_NV12;
+    video.adapter = 0;
+    video.gpu_conversion = true;
+    video.colorspace = VIDEO_CS_DEFAULT;
+    video.range = VIDEO_RANGE_DEFAULT;
+    video.scale_type = OBS_SCALE_BICUBIC;
+    return obs_reset_video(&video) == OBS_VIDEO_SUCCESS;
   }
 #endif
 

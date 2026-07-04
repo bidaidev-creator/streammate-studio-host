@@ -7,6 +7,7 @@ info_plist=""
 libobs_framework=""
 obs_modules_dir=""
 obs_deps_lib_dir=""
+obs_graphics_module=""
 output_dir="dist"
 skip_codesign=0
 skip_install_name_tool=0
@@ -15,6 +16,7 @@ usage() {
   cat >&2 <<'USAGE'
 usage: package-app.sh --host-bin PATH --smoke-bin PATH --info-plist PATH \
   --libobs-framework PATH --obs-modules-dir PATH --obs-deps-lib-dir PATH \
+  --obs-graphics-module PATH \
   [--output-dir PATH] [--skip-codesign] [--skip-install-name-tool]
 USAGE
 }
@@ -27,6 +29,7 @@ while [[ $# -gt 0 ]]; do
     --libobs-framework) libobs_framework="${2:-}"; shift 2 ;;
     --obs-modules-dir) obs_modules_dir="${2:-}"; shift 2 ;;
     --obs-deps-lib-dir) obs_deps_lib_dir="${2:-}"; shift 2 ;;
+    --obs-graphics-module) obs_graphics_module="${2:-}"; shift 2 ;;
     --output-dir) output_dir="${2:-}"; shift 2 ;;
     --skip-codesign) skip_codesign=1; shift ;;
     --skip-install-name-tool) skip_install_name_tool=1; shift ;;
@@ -59,6 +62,7 @@ require_file "Info.plist" "$info_plist"
 require_dir "libobs framework" "$libobs_framework"
 require_dir "OBS modules directory" "$obs_modules_dir"
 require_dir "OBS deps library directory" "$obs_deps_lib_dir"
+require_file "OBS graphics module" "$obs_graphics_module"
 
 app="$output_dir/StreamMateStudioHost.app"
 contents="$app/Contents"
@@ -90,6 +94,7 @@ with path.open('wb') as handle:
 PY
 
 cp -R "$libobs_framework" "$frameworks/"
+cp "$obs_graphics_module" "$frameworks/libobs-opengl.dylib"
 
 shopt -s nullglob
 for dylib in "$obs_deps_lib_dir"/*.dylib; do
@@ -109,6 +114,11 @@ for module in "${required_modules[@]}"; do
 done
 if [[ ${#missing_modules[@]} -gt 0 ]]; then
   echo "required OBS modules missing from app bundle: ${missing_modules[*]}" >&2
+  exit 1
+fi
+
+if [[ ! -f "$frameworks/libobs-opengl.dylib" ]]; then
+  echo "required OBS graphics module missing from app bundle" >&2
   exit 1
 fi
 
