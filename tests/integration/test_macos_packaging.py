@@ -45,6 +45,9 @@ class MacosPackagingTest(unittest.TestCase):
         deps_dir = temp_root / "obs-deps"
         deps_dir.mkdir()
         (deps_dir / "libdependency.dylib").write_text("fake dependency\n", encoding="utf-8")
+        graphics_module = temp_root / "graphics" / "libobs-opengl.dylib"
+        graphics_module.parent.mkdir()
+        graphics_module.write_text("fake graphics module\n", encoding="utf-8")
         output_dir = temp_root / "dist"
         args = [
             str(PACKAGE_SCRIPT),
@@ -54,6 +57,7 @@ class MacosPackagingTest(unittest.TestCase):
             "--libobs-framework", str(framework),
             "--obs-modules-dir", str(modules_dir),
             "--obs-deps-lib-dir", str(deps_dir),
+            "--obs-graphics-module", str(graphics_module),
             "--output-dir", str(output_dir),
             "--skip-codesign",
             "--skip-install-name-tool",
@@ -73,6 +77,7 @@ class MacosPackagingTest(unittest.TestCase):
             self.assertTrue((app / "Contents" / "MacOS" / "studio-host-smoke").exists())
             self.assertTrue((app / "Contents" / "Frameworks" / "libobs.framework" / "Versions" / "A" / "libobs").exists())
             self.assertTrue((app / "Contents" / "Frameworks" / "libdependency.dylib").exists())
+            self.assertTrue((app / "Contents" / "Frameworks" / "libobs-opengl.dylib").exists())
             for name in ["mac-avcapture", "mac-capture", "obs-outputs", "obs-x264"]:
                 self.assertTrue((app / "Contents" / "PlugIns" / "obs-plugins" / f"{name}.plugin").exists())
 
@@ -80,6 +85,8 @@ class MacosPackagingTest(unittest.TestCase):
                 plist = plistlib.load(handle)
             self.assertEqual(plist["CFBundleIdentifier"], "com.streammate.studio-host")
             self.assertEqual(plist["CFBundleExecutable"], "studio-host")
+            self.assertIn("operator enables local capture sources", plist["NSCameraUsageDescription"])
+            self.assertIn("operator enables local audio capture sources", plist["NSMicrophoneUsageDescription"])
 
             scratch = temp_root / "scratch-copy"
             shutil.copytree(app, scratch / app.name, symlinks=True)
@@ -97,6 +104,7 @@ class MacosPackagingTest(unittest.TestCase):
             self.assertTrue(manifest.exists())
             manifest_text = manifest.read_text(encoding="utf-8")
             self.assertIn("./StreamMateStudioHost.app/Contents/Frameworks/libobs.framework/Versions/A/libobs", manifest_text)
+            self.assertIn("./StreamMateStudioHost.app/Contents/Frameworks/libobs-opengl.dylib", manifest_text)
             self.assertNotIn(str(temp_root), manifest_text)
             verify = subprocess.run(
                 ["shasum", "-a", "256", "-c", "sha256-manifest.txt"],

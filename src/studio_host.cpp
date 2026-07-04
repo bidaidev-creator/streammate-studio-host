@@ -13,6 +13,7 @@
 #include <cerrno>
 #include <fstream>
 #include <iostream>
+#include <limits.h>
 #include <map>
 #include <netinet/in.h>
 #include <optional>
@@ -24,8 +25,14 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <thread>
 #include <unistd.h>
 #include <vector>
+
+#if defined(__APPLE__)
+#include <CoreGraphics/CoreGraphics.h>
+#include <mach-o/dyld.h>
+#endif
 
 #if STREAMMATE_HAS_LIBOBS
 #include <obs.h>
@@ -122,6 +129,10 @@ public:
     if (!obs_startup("en-US", nullptr, nullptr)) {
       return false;
     }
+    add_bundle_module_path();
+    if (!reset_offscreen_video()) {
+      return false;
+    }
     obs_load_all_modules();
     obs_post_load_modules();
 #endif
@@ -142,6 +153,59 @@ public:
   bool started() const { return started_; }
 
 private:
+#if STREAMMATE_HAS_LIBOBS
+  static std::optional<std::filesystem::path> executable_path() {
+#if defined(__APPLE__)
+    uint32_t size = PATH_MAX;
+    std::vector<char> buffer(size + 1);
+    int result = _NSGetExecutablePath(buffer.data(), &size);
+    if (result == -1) {
+      buffer.assign(size + 1, '\0');
+      result = _NSGetExecutablePath(buffer.data(), &size);
+    }
+    if (result != 0) {
+      return std::nullopt;
+    }
+    return std::filesystem::weakly_canonical(buffer.data());
+#else
+    return std::nullopt;
+#endif
+  }
+
+  static void add_bundle_module_path() {
+    auto executable = executable_path();
+    if (!executable) {
+      return;
+    }
+    std::filesystem::path contents = executable->parent_path().parent_path();
+    std::filesystem::path plugins = contents / "PlugIns" / "obs-plugins";
+    if (!std::filesystem::is_directory(plugins)) {
+      return;
+    }
+    std::string binary_pattern = (plugins / "%module%.plugin" / "Contents" / "MacOS").string();
+    std::string data_pattern = (plugins / "%module%.plugin" / "Contents" / "Resources").string();
+    obs_add_module_path(binary_pattern.c_str(), data_pattern.c_str());
+  }
+
+  static bool reset_offscreen_video() {
+    obs_video_info video = {};
+    video.graphics_module = "@executable_path/../Frameworks/libobs-opengl.dylib";
+    video.fps_num = 30;
+    video.fps_den = 1;
+    video.base_width = 640;
+    video.base_height = 360;
+    video.output_width = 640;
+    video.output_height = 360;
+    video.output_format = VIDEO_FORMAT_NV12;
+    video.adapter = 0;
+    video.gpu_conversion = true;
+    video.colorspace = VIDEO_CS_DEFAULT;
+    video.range = VIDEO_RANGE_DEFAULT;
+    video.scale_type = OBS_SCALE_BICUBIC;
+    return obs_reset_video(&video) == OBS_VIDEO_SUCCESS;
+  }
+#endif
+
   bool started_ = false;
 };
 
@@ -849,19 +913,55 @@ struct PromptSourceSummary {
   int screen_count = 0;
   int instantiated_count = 0;
   int failed_count = 0;
+  bool camera_attempted = false;
+  bool microphone_attempted = false;
+  bool screen_attempted = false;
+  bool camera_activated = false;
+  bool microphone_activated = false;
+  bool screen_activated = false;
+  std::vector<std::string> sanitized_failure_classes;
 };
 
 std::string prompt_source_class(const std::string &module) {
-  if (module == "av_capture_input") return "camera";
+  if (module == "macos-avcapture" || module == "macos-avcapture-fast" || module == "av_capture_input") return "camera";
   if (module == "coreaudio_input_capture") return "microphone";
   if (module == "screen_capture" || module == "display_capture") return "screen";
   return "";
+}
+
+std::vector<std::string> exercise_source_ids(const std::string &tcc_class) {
+  if (tcc_class == "camera") return {"macos-avcapture"};
+  if (tcc_class == "microphone") return {"coreaudio_input_capture"};
+  if (tcc_class == "screen") return {"screen_capture", "display_capture"};
+  return {};
 }
 
 void count_prompt_source(PromptSourceSummary &summary, const std::string &tcc_class) {
   if (tcc_class == "camera") ++summary.camera_count;
   if (tcc_class == "microphone") ++summary.microphone_count;
   if (tcc_class == "screen") ++summary.screen_count;
+}
+
+void mark_attempted(PromptSourceSummary &summary, const std::string &tcc_class) {
+  if (tcc_class == "camera") summary.camera_attempted = true;
+  if (tcc_class == "microphone") summary.microphone_attempted = true;
+  if (tcc_class == "screen") summary.screen_attempted = true;
+}
+
+void mark_activated(PromptSourceSummary &summary, const std::string &tcc_class) {
+  if (tcc_class == "camera") summary.camera_activated = true;
+  if (tcc_class == "microphone") summary.microphone_activated = true;
+  if (tcc_class == "screen") summary.screen_activated = true;
+}
+
+std::string json_string_array_from_values(const std::vector<std::string> &values) {
+  std::string out = "[";
+  for (size_t i = 0; i < values.size(); ++i) {
+    if (i) out += ",";
+    out += "\"" + json_escape(values[i]) + "\"";
+  }
+  out += "]";
+  return out;
 }
 
 std::string prompt_source_summary_json(const PromptSourceSummary &summary, const std::string &mode, bool prompt_capable) {
@@ -871,6 +971,20 @@ std::string prompt_source_summary_json(const PromptSourceSummary &summary, const
          ",\"cameraCount\":" + std::to_string(summary.camera_count) + ",\"microphoneCount\":" + std::to_string(summary.microphone_count) +
          ",\"screenCount\":" + std::to_string(summary.screen_count) + ",\"instantiatedCount\":" + std::to_string(summary.instantiated_count) +
          ",\"deferredCount\":" + std::to_string(deferred) + ",\"failedCount\":" + std::to_string(summary.failed_count) + "}";
+}
+
+std::string tcc_exercise_summary_json(const PromptSourceSummary &summary, const std::string &mode, bool prompt_capable) {
+  return "{\"ok\":true,\"mode\":\"" + json_escape(mode) + "\",\"promptCapable\":" +
+         std::string(prompt_capable ? "true" : "false") +
+         ",\"cameraAttempted\":" + std::string(summary.camera_attempted ? "true" : "false") +
+         ",\"microphoneAttempted\":" + std::string(summary.microphone_attempted ? "true" : "false") +
+         ",\"screenAttempted\":" + std::string(summary.screen_attempted ? "true" : "false") +
+         ",\"cameraActivated\":" + std::string(summary.camera_activated ? "true" : "false") +
+         ",\"microphoneActivated\":" + std::string(summary.microphone_activated ? "true" : "false") +
+         ",\"screenActivated\":" + std::string(summary.screen_activated ? "true" : "false") +
+         ",\"instantiatedCount\":" + std::to_string(summary.instantiated_count) +
+         ",\"failedCount\":" + std::to_string(summary.failed_count) +
+         ",\"sanitizedFailureClasses\":" + json_string_array_from_values(summary.sanitized_failure_classes) + "}";
 }
 
 class ObsImporter {
@@ -932,6 +1046,35 @@ public:
            "\",\"report\":" + last_report_by_collection_[collection_id] + ",\"promptSources\":" + prompt_summary + "}";
   }
 
+  std::string exercise_tcc_prompts(const std::string &) {
+    PromptSourceSummary summary;
+#if STREAMMATE_HAS_LIBOBS
+    release_prompt_sources();
+    const std::vector<std::string> tcc_classes = {"camera", "microphone", "screen"};
+    for (const auto &tcc_class : tcc_classes) {
+      mark_attempted(summary, tcc_class);
+      std::string safe_name = "streammate-l4-" + tcc_class;
+      bool created = false;
+      for (const std::string &source_id : exercise_source_ids(tcc_class)) {
+        if (create_prompt_source(source_id, safe_name, tcc_class, true)) {
+          created = true;
+          break;
+        }
+      }
+      if (created) {
+        ++summary.instantiated_count;
+        mark_activated(summary, tcc_class);
+      } else {
+        ++summary.failed_count;
+        summary.sanitized_failure_classes.push_back(tcc_class + "_source_create_failed");
+      }
+    }
+    return tcc_exercise_summary_json(summary, "libobs-prompt-capable", true);
+#else
+    return tcc_exercise_summary_json(summary, "scaffold-no-tcc", false);
+#endif
+  }
+
   std::string report(const std::string &request) {
     std::string collection_id = extract_json_string(request, "collectionId");
     if (collection_id.empty()) return error(-32602, "collectionId is required");
@@ -949,11 +1092,112 @@ private:
   std::string error(int code, const std::string &message) const { return "__error__:" + std::to_string(code) + ":" + message; }
 
 #if STREAMMATE_HAS_LIBOBS
+  struct PromptSourceHandle {
+    obs_source_t *source = nullptr;
+    bool active = false;
+  };
+
   void release_prompt_sources() {
-    for (obs_source_t *source : prompt_sources_) {
-      obs_source_release(source);
+    for (PromptSourceHandle &handle : prompt_sources_) {
+      if (handle.source && handle.active) {
+        obs_source_dec_active(handle.source);
+      }
+      if (handle.source) {
+        obs_source_release(handle.source);
+      }
     }
     prompt_sources_.clear();
+  }
+
+  bool apply_first_string_property(obs_source_t *source, obs_data_t *settings, const char *property_name) {
+    obs_properties_t *properties = obs_source_properties(source);
+    if (!properties) {
+      return false;
+    }
+    obs_property_t *property = obs_properties_get(properties, property_name);
+    bool selected = false;
+    if (property && obs_property_list_format(property) == OBS_COMBO_FORMAT_STRING) {
+      size_t count = obs_property_list_item_count(property);
+      for (size_t index = 0; index < count; ++index) {
+        const char *value = obs_property_list_item_string(property, index);
+        if (value && value[0] != '\0' && !obs_property_list_item_disabled(property, index)) {
+          obs_data_set_string(settings, property_name, value);
+          selected = true;
+          break;
+        }
+      }
+    }
+    obs_properties_destroy(properties);
+    return selected;
+  }
+
+  std::optional<uint32_t> main_display_id() const {
+#if defined(__APPLE__)
+    CGDirectDisplayID display = CGMainDisplayID();
+    if (display == 0) {
+      return std::nullopt;
+    }
+    return static_cast<uint32_t>(display);
+#else
+    return std::nullopt;
+#endif
+  }
+
+  bool configure_initial_prompt_settings(obs_data_t *settings, const std::string &tcc_class) const {
+    if (tcc_class == "screen") {
+      obs_data_set_int(settings, "type", 0);
+      auto display = main_display_id();
+      if (!display) {
+        return false;
+      }
+      obs_data_set_int(settings, "display", *display);
+    }
+    return true;
+  }
+
+  bool configure_prompt_source(obs_source_t *source, obs_data_t *settings, const std::string &tcc_class) {
+    if (tcc_class == "camera") {
+      obs_data_set_bool(settings, "use_preset", true);
+      obs_data_set_bool(settings, "enable_audio", false);
+      return apply_first_string_property(source, settings, "device");
+    }
+    if (tcc_class == "microphone") {
+      obs_data_set_string(settings, "device_id", "default");
+      return true;
+    }
+    if (tcc_class == "screen") {
+      obs_data_set_int(settings, "type", 0);
+      const char *display_uuid = obs_data_get_string(settings, "display_uuid");
+      return apply_first_string_property(source, settings, "display_uuid") ||
+             (display_uuid && display_uuid[0] != '\0') || obs_data_get_int(settings, "display") > 0;
+    }
+    return false;
+  }
+
+  bool create_prompt_source(const std::string &source_id, const std::string &safe_name, const std::string &tcc_class, bool activate) {
+    obs_data_t *settings = obs_data_create();
+    if (!configure_initial_prompt_settings(settings, tcc_class)) {
+      obs_data_release(settings);
+      return false;
+    }
+    obs_source_t *source = obs_source_create_private(source_id.c_str(), safe_name.c_str(), settings);
+    if (!source) {
+      obs_data_release(settings);
+      return false;
+    }
+    if (!configure_prompt_source(source, settings, tcc_class)) {
+      obs_source_release(source);
+      obs_data_release(settings);
+      return false;
+    }
+    obs_source_update(source, settings);
+    obs_data_release(settings);
+    if (activate) {
+      obs_source_inc_active(source);
+      std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+    }
+    prompt_sources_.push_back({source, activate});
+    return !activate || obs_source_active(source);
   }
 #endif
 
@@ -970,9 +1214,14 @@ private:
       count_prompt_source(summary, tcc_class);
 #if STREAMMATE_HAS_LIBOBS
       std::string safe_name = "streammate-" + tcc_class + "-" + std::to_string(++prompt_index);
-      obs_source_t *source = obs_source_create_private(entry.module.c_str(), safe_name.c_str(), nullptr);
-      if (source) {
-        prompt_sources_.push_back(source);
+      bool created = false;
+      for (const std::string &source_id : exercise_source_ids(tcc_class)) {
+        if (create_prompt_source(source_id, safe_name, tcc_class, false)) {
+          created = true;
+          break;
+        }
+      }
+      if (created) {
         ++summary.instantiated_count;
       } else {
         ++summary.failed_count;
@@ -1086,7 +1335,7 @@ private:
 
   std::map<std::string, std::string> last_report_by_collection_;
 #if STREAMMATE_HAS_LIBOBS
-  std::vector<obs_source_t *> prompt_sources_;
+  std::vector<PromptSourceHandle> prompt_sources_;
 #endif
 };
 
@@ -1495,6 +1744,8 @@ private:
     } else if (method == "host.health") {
       send_text_frame(fd, rpc_result(id, "{\"status\":\"ready\",\"engineStarted\":" + std::string(engine_.started() ? "true" : "false") +
                                       ",\"heartbeatMs\":" + std::to_string(kHeartbeatMs) + "}"));
+    } else if (method == "host.exerciseTccPrompts") {
+      send_renderer_result(fd, id, importer_.exercise_tcc_prompts(payload));
     } else if (method == "scene.load") {
       send_renderer_result(fd, id, renderer_.load_scene(payload));
     } else if (method == "scene.setProgram") {
