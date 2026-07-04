@@ -30,7 +30,6 @@
 #include <vector>
 
 #if defined(__APPLE__)
-#include <CoreFoundation/CoreFoundation.h>
 #include <CoreGraphics/CoreGraphics.h>
 #include <mach-o/dyld.h>
 #endif
@@ -1132,24 +1131,13 @@ private:
     return selected;
   }
 
-  std::optional<std::string> main_display_uuid() const {
+  std::optional<uint32_t> main_display_id() const {
 #if defined(__APPLE__)
-    CFUUIDRef uuid = CGDisplayCreateUUIDFromDisplayID(CGMainDisplayID());
-    if (!uuid) {
+    CGDirectDisplayID display = CGMainDisplayID();
+    if (display == 0) {
       return std::nullopt;
     }
-    CFStringRef uuid_string = CFUUIDCreateString(kCFAllocatorDefault, uuid);
-    CFRelease(uuid);
-    if (!uuid_string) {
-      return std::nullopt;
-    }
-    char buffer[128] = {};
-    bool ok = CFStringGetCString(uuid_string, buffer, sizeof(buffer), kCFStringEncodingUTF8);
-    CFRelease(uuid_string);
-    if (!ok || buffer[0] == '\0') {
-      return std::nullopt;
-    }
-    return std::string(buffer);
+    return static_cast<uint32_t>(display);
 #else
     return std::nullopt;
 #endif
@@ -1158,11 +1146,11 @@ private:
   bool configure_initial_prompt_settings(obs_data_t *settings, const std::string &tcc_class) const {
     if (tcc_class == "screen") {
       obs_data_set_int(settings, "type", 0);
-      auto display_uuid = main_display_uuid();
-      if (!display_uuid) {
+      auto display = main_display_id();
+      if (!display) {
         return false;
       }
-      obs_data_set_string(settings, "display_uuid", display_uuid->c_str());
+      obs_data_set_int(settings, "display", *display);
     }
     return true;
   }
@@ -1179,8 +1167,9 @@ private:
     }
     if (tcc_class == "screen") {
       obs_data_set_int(settings, "type", 0);
+      const char *display_uuid = obs_data_get_string(settings, "display_uuid");
       return apply_first_string_property(source, settings, "display_uuid") ||
-             std::string(obs_data_get_string(settings, "display_uuid")).size() > 0;
+             (display_uuid && display_uuid[0] != '\0') || obs_data_get_int(settings, "display") > 0;
     }
     return false;
   }
