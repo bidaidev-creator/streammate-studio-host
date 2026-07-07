@@ -73,8 +73,10 @@ jobs:
           cmake --build build/obs --config RelWithDebInfo --target mac-capture
           cmake --build build/obs --config RelWithDebInfo --target obs-outputs
           cmake --build build/obs --config RelWithDebInfo --target obs-x264
+          cmake --build build/obs --config RelWithDebInfo --target rtmp-services
           cmake --build build/obs --config RelWithDebInfo --target coreaudio-encoder || true
           cmake --build build/obs --config RelWithDebInfo --target mac-videotoolbox || true
+          cmake --build build/obs --config RelWithDebInfo --target obs-ffmpeg || true
           cmake --build build/obs --config RelWithDebInfo --target obs-browser || true
 
       - name: Locate built libobs
@@ -110,7 +112,7 @@ jobs:
           module_stage="$PWD/build/obs/streammate-plugin-stage"
           rm -rf "$module_stage"
           mkdir -p "$module_stage"
-          for module in mac-avcapture mac-capture obs-outputs obs-x264; do
+          for module in mac-avcapture mac-capture obs-outputs obs-x264 rtmp-services; do
             module_bundle="$(find build/obs/plugins -path "*/$module.plugin" -type d ! -path '*/EagerLinkingTBDs/*' | head -n 1)"
             if [[ -z "$module_bundle" ]]; then
               echo "required OBS plugin bundle not found: $module" >&2
@@ -118,6 +120,12 @@ jobs:
               exit 1
             fi
             cp -R "$module_bundle" "$module_stage/"
+          done
+          for module in coreaudio-encoder mac-videotoolbox obs-ffmpeg; do
+            module_bundle="$(find build/obs/plugins -path "*/$module.plugin" -type d ! -path '*/EagerLinkingTBDs/*' | head -n 1)"
+            if [[ -n "$module_bundle" ]]; then
+              cp -R "$module_bundle" "$module_stage/"
+            fi
           done
           echo "library=$lib" >> "$GITHUB_OUTPUT"
           echo "graphics_module=$graphics_module" >> "$GITHUB_OUTPUT"
