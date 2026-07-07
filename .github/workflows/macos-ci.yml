@@ -68,12 +68,15 @@ jobs:
       - name: Build libobs and required upstream modules
         run: |
           cmake --build build/obs --config RelWithDebInfo --target libobs
+          cmake --build build/obs --config RelWithDebInfo --target libobs-opengl
           cmake --build build/obs --config RelWithDebInfo --target mac-avcapture
           cmake --build build/obs --config RelWithDebInfo --target mac-capture
           cmake --build build/obs --config RelWithDebInfo --target obs-outputs
           cmake --build build/obs --config RelWithDebInfo --target obs-x264
+          cmake --build build/obs --config RelWithDebInfo --target rtmp-services
           cmake --build build/obs --config RelWithDebInfo --target coreaudio-encoder || true
           cmake --build build/obs --config RelWithDebInfo --target mac-videotoolbox || true
+          cmake --build build/obs --config RelWithDebInfo --target obs-ffmpeg || true
           cmake --build build/obs --config RelWithDebInfo --target obs-browser || true
 
       - name: Locate built libobs
@@ -94,6 +97,12 @@ jobs:
             find build/obs -maxdepth 5 \( -name '*libobs*' -o -name '*.framework' \) -print >&2
             exit 1
           fi
+          graphics_module="$(find build/obs \( -name 'libobs-opengl*.dylib' -o -name 'libobs-opengl*.so' \) -type f | head -n 1)"
+          if [[ -z "$graphics_module" ]]; then
+            echo "libobs-opengl build artifact not found" >&2
+            find build/obs -maxdepth 8 -name '*opengl*' -print >&2
+            exit 1
+          fi
           obs_config="$(find build/obs -name obsconfig.h | head -n 1)"
           if [[ -z "$obs_config" ]]; then
             echo "generated obsconfig.h not found" >&2
@@ -103,7 +112,7 @@ jobs:
           module_stage="$PWD/build/obs/streammate-plugin-stage"
           rm -rf "$module_stage"
           mkdir -p "$module_stage"
-          for module in mac-avcapture mac-capture obs-outputs obs-x264; do
+          for module in mac-avcapture mac-capture obs-outputs obs-x264 rtmp-services; do
             module_bundle="$(find build/obs/plugins -path "*/$module.plugin" -type d ! -path '*/EagerLinkingTBDs/*' | head -n 1)"
             if [[ -z "$module_bundle" ]]; then
               echo "required OBS plugin bundle not found: $module" >&2
@@ -112,7 +121,14 @@ jobs:
             fi
             cp -R "$module_bundle" "$module_stage/"
           done
+          for module in coreaudio-encoder mac-videotoolbox obs-ffmpeg; do
+            module_bundle="$(find build/obs/plugins -path "*/$module.plugin" -type d ! -path '*/EagerLinkingTBDs/*' | head -n 1)"
+            if [[ -n "$module_bundle" ]]; then
+              cp -R "$module_bundle" "$module_stage/"
+            fi
+          done
           echo "library=$lib" >> "$GITHUB_OUTPUT"
+          echo "graphics_module=$graphics_module" >> "$GITHUB_OUTPUT"
           echo "generated_include=$(dirname "$obs_config")" >> "$GITHUB_OUTPUT"
           echo "modules_dir=$module_stage" >> "$GITHUB_OUTPUT"
 
@@ -141,6 +157,7 @@ jobs:
             --libobs-framework "${{ steps.libobs.outputs.library }}" \
             --obs-modules-dir "${{ steps.libobs.outputs.modules_dir }}" \
             --obs-deps-lib-dir "$PWD/external/obs-studio/.deps/obs-deps-2025-08-23-universal/lib" \
+            --obs-graphics-module "${{ steps.libobs.outputs.graphics_module }}" \
             --output-dir dist
 
       - name: Verify relocatable app artifact from scratch copy

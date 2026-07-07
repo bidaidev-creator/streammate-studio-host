@@ -2,6 +2,7 @@
 #include <arpa/inet.h>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cctype>
 #include <csignal>
@@ -13,6 +14,7 @@
 #include <cerrno>
 #include <fstream>
 #include <iostream>
+#include <limits.h>
 #include <map>
 #include <netinet/in.h>
 #include <optional>
@@ -24,8 +26,14 @@
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <thread>
 #include <unistd.h>
 #include <vector>
+
+#if defined(__APPLE__)
+#include <CoreGraphics/CoreGraphics.h>
+#include <mach-o/dyld.h>
+#endif
 
 #if STREAMMATE_HAS_LIBOBS
 #include <obs.h>
@@ -122,6 +130,13 @@ public:
     if (!obs_startup("en-US", nullptr, nullptr)) {
       return false;
     }
+    add_bundle_module_path();
+    if (!reset_offscreen_video()) {
+      return false;
+    }
+    if (!reset_offscreen_audio()) {
+      return false;
+    }
     obs_load_all_modules();
     obs_post_load_modules();
 #endif
@@ -142,6 +157,66 @@ public:
   bool started() const { return started_; }
 
 private:
+#if STREAMMATE_HAS_LIBOBS
+  static std::optional<std::filesystem::path> executable_path() {
+#if defined(__APPLE__)
+    uint32_t size = PATH_MAX;
+    std::vector<char> buffer(size + 1);
+    int result = _NSGetExecutablePath(buffer.data(), &size);
+    if (result == -1) {
+      buffer.assign(size + 1, '\0');
+      result = _NSGetExecutablePath(buffer.data(), &size);
+    }
+    if (result != 0) {
+      return std::nullopt;
+    }
+    return std::filesystem::weakly_canonical(buffer.data());
+#else
+    return std::nullopt;
+#endif
+  }
+
+  static void add_bundle_module_path() {
+    auto executable = executable_path();
+    if (!executable) {
+      return;
+    }
+    std::filesystem::path contents = executable->parent_path().parent_path();
+    std::filesystem::path plugins = contents / "PlugIns" / "obs-plugins";
+    if (!std::filesystem::is_directory(plugins)) {
+      return;
+    }
+    std::string binary_pattern = (plugins / "%module%.plugin" / "Contents" / "MacOS").string();
+    std::string data_pattern = (plugins / "%module%.plugin" / "Contents" / "Resources").string();
+    obs_add_module_path(binary_pattern.c_str(), data_pattern.c_str());
+  }
+
+  static bool reset_offscreen_video() {
+    obs_video_info video = {};
+    video.graphics_module = "@executable_path/../Frameworks/libobs-opengl.dylib";
+    video.fps_num = 30;
+    video.fps_den = 1;
+    video.base_width = 1280;
+    video.base_height = 720;
+    video.output_width = 1280;
+    video.output_height = 720;
+    video.output_format = VIDEO_FORMAT_NV12;
+    video.adapter = 0;
+    video.gpu_conversion = true;
+    video.colorspace = VIDEO_CS_DEFAULT;
+    video.range = VIDEO_RANGE_DEFAULT;
+    video.scale_type = OBS_SCALE_BICUBIC;
+    return obs_reset_video(&video) == OBS_VIDEO_SUCCESS;
+  }
+
+  static bool reset_offscreen_audio() {
+    obs_audio_info audio = {};
+    audio.samples_per_sec = 48000;
+    audio.speakers = SPEAKERS_STEREO;
+    return obs_reset_audio(&audio);
+  }
+#endif
+
   bool started_ = false;
 };
 
@@ -849,19 +924,55 @@ struct PromptSourceSummary {
   int screen_count = 0;
   int instantiated_count = 0;
   int failed_count = 0;
+  bool camera_attempted = false;
+  bool microphone_attempted = false;
+  bool screen_attempted = false;
+  bool camera_activated = false;
+  bool microphone_activated = false;
+  bool screen_activated = false;
+  std::vector<std::string> sanitized_failure_classes;
 };
 
 std::string prompt_source_class(const std::string &module) {
-  if (module == "av_capture_input") return "camera";
+  if (module == "macos-avcapture" || module == "macos-avcapture-fast" || module == "av_capture_input") return "camera";
   if (module == "coreaudio_input_capture") return "microphone";
   if (module == "screen_capture" || module == "display_capture") return "screen";
   return "";
+}
+
+std::vector<std::string> exercise_source_ids(const std::string &tcc_class) {
+  if (tcc_class == "camera") return {"macos-avcapture"};
+  if (tcc_class == "microphone") return {"coreaudio_input_capture"};
+  if (tcc_class == "screen") return {"screen_capture", "display_capture"};
+  return {};
 }
 
 void count_prompt_source(PromptSourceSummary &summary, const std::string &tcc_class) {
   if (tcc_class == "camera") ++summary.camera_count;
   if (tcc_class == "microphone") ++summary.microphone_count;
   if (tcc_class == "screen") ++summary.screen_count;
+}
+
+void mark_attempted(PromptSourceSummary &summary, const std::string &tcc_class) {
+  if (tcc_class == "camera") summary.camera_attempted = true;
+  if (tcc_class == "microphone") summary.microphone_attempted = true;
+  if (tcc_class == "screen") summary.screen_attempted = true;
+}
+
+void mark_activated(PromptSourceSummary &summary, const std::string &tcc_class) {
+  if (tcc_class == "camera") summary.camera_activated = true;
+  if (tcc_class == "microphone") summary.microphone_activated = true;
+  if (tcc_class == "screen") summary.screen_activated = true;
+}
+
+std::string json_string_array_from_values(const std::vector<std::string> &values) {
+  std::string out = "[";
+  for (size_t i = 0; i < values.size(); ++i) {
+    if (i) out += ",";
+    out += "\"" + json_escape(values[i]) + "\"";
+  }
+  out += "]";
+  return out;
 }
 
 std::string prompt_source_summary_json(const PromptSourceSummary &summary, const std::string &mode, bool prompt_capable) {
@@ -871,6 +982,20 @@ std::string prompt_source_summary_json(const PromptSourceSummary &summary, const
          ",\"cameraCount\":" + std::to_string(summary.camera_count) + ",\"microphoneCount\":" + std::to_string(summary.microphone_count) +
          ",\"screenCount\":" + std::to_string(summary.screen_count) + ",\"instantiatedCount\":" + std::to_string(summary.instantiated_count) +
          ",\"deferredCount\":" + std::to_string(deferred) + ",\"failedCount\":" + std::to_string(summary.failed_count) + "}";
+}
+
+std::string tcc_exercise_summary_json(const PromptSourceSummary &summary, const std::string &mode, bool prompt_capable) {
+  return "{\"ok\":true,\"mode\":\"" + json_escape(mode) + "\",\"promptCapable\":" +
+         std::string(prompt_capable ? "true" : "false") +
+         ",\"cameraAttempted\":" + std::string(summary.camera_attempted ? "true" : "false") +
+         ",\"microphoneAttempted\":" + std::string(summary.microphone_attempted ? "true" : "false") +
+         ",\"screenAttempted\":" + std::string(summary.screen_attempted ? "true" : "false") +
+         ",\"cameraActivated\":" + std::string(summary.camera_activated ? "true" : "false") +
+         ",\"microphoneActivated\":" + std::string(summary.microphone_activated ? "true" : "false") +
+         ",\"screenActivated\":" + std::string(summary.screen_activated ? "true" : "false") +
+         ",\"instantiatedCount\":" + std::to_string(summary.instantiated_count) +
+         ",\"failedCount\":" + std::to_string(summary.failed_count) +
+         ",\"sanitizedFailureClasses\":" + json_string_array_from_values(summary.sanitized_failure_classes) + "}";
 }
 
 class ObsImporter {
@@ -932,6 +1057,35 @@ public:
            "\",\"report\":" + last_report_by_collection_[collection_id] + ",\"promptSources\":" + prompt_summary + "}";
   }
 
+  std::string exercise_tcc_prompts(const std::string &) {
+    PromptSourceSummary summary;
+#if STREAMMATE_HAS_LIBOBS
+    release_prompt_sources();
+    const std::vector<std::string> tcc_classes = {"camera", "microphone", "screen"};
+    for (const auto &tcc_class : tcc_classes) {
+      mark_attempted(summary, tcc_class);
+      std::string safe_name = "streammate-l4-" + tcc_class;
+      bool created = false;
+      for (const std::string &source_id : exercise_source_ids(tcc_class)) {
+        if (create_prompt_source(source_id, safe_name, tcc_class, true)) {
+          created = true;
+          break;
+        }
+      }
+      if (created) {
+        ++summary.instantiated_count;
+        mark_activated(summary, tcc_class);
+      } else {
+        ++summary.failed_count;
+        summary.sanitized_failure_classes.push_back(tcc_class + "_source_create_failed");
+      }
+    }
+    return tcc_exercise_summary_json(summary, "libobs-prompt-capable", true);
+#else
+    return tcc_exercise_summary_json(summary, "scaffold-no-tcc", false);
+#endif
+  }
+
   std::string report(const std::string &request) {
     std::string collection_id = extract_json_string(request, "collectionId");
     if (collection_id.empty()) return error(-32602, "collectionId is required");
@@ -949,11 +1103,112 @@ private:
   std::string error(int code, const std::string &message) const { return "__error__:" + std::to_string(code) + ":" + message; }
 
 #if STREAMMATE_HAS_LIBOBS
+  struct PromptSourceHandle {
+    obs_source_t *source = nullptr;
+    bool active = false;
+  };
+
   void release_prompt_sources() {
-    for (obs_source_t *source : prompt_sources_) {
-      obs_source_release(source);
+    for (PromptSourceHandle &handle : prompt_sources_) {
+      if (handle.source && handle.active) {
+        obs_source_dec_active(handle.source);
+      }
+      if (handle.source) {
+        obs_source_release(handle.source);
+      }
     }
     prompt_sources_.clear();
+  }
+
+  bool apply_first_string_property(obs_source_t *source, obs_data_t *settings, const char *property_name) {
+    obs_properties_t *properties = obs_source_properties(source);
+    if (!properties) {
+      return false;
+    }
+    obs_property_t *property = obs_properties_get(properties, property_name);
+    bool selected = false;
+    if (property && obs_property_list_format(property) == OBS_COMBO_FORMAT_STRING) {
+      size_t count = obs_property_list_item_count(property);
+      for (size_t index = 0; index < count; ++index) {
+        const char *value = obs_property_list_item_string(property, index);
+        if (value && value[0] != '\0' && !obs_property_list_item_disabled(property, index)) {
+          obs_data_set_string(settings, property_name, value);
+          selected = true;
+          break;
+        }
+      }
+    }
+    obs_properties_destroy(properties);
+    return selected;
+  }
+
+  std::optional<uint32_t> main_display_id() const {
+#if defined(__APPLE__)
+    CGDirectDisplayID display = CGMainDisplayID();
+    if (display == 0) {
+      return std::nullopt;
+    }
+    return static_cast<uint32_t>(display);
+#else
+    return std::nullopt;
+#endif
+  }
+
+  bool configure_initial_prompt_settings(obs_data_t *settings, const std::string &tcc_class) const {
+    if (tcc_class == "screen") {
+      obs_data_set_int(settings, "type", 0);
+      auto display = main_display_id();
+      if (!display) {
+        return false;
+      }
+      obs_data_set_int(settings, "display", *display);
+    }
+    return true;
+  }
+
+  bool configure_prompt_source(obs_source_t *source, obs_data_t *settings, const std::string &tcc_class) {
+    if (tcc_class == "camera") {
+      obs_data_set_bool(settings, "use_preset", true);
+      obs_data_set_bool(settings, "enable_audio", false);
+      return apply_first_string_property(source, settings, "device");
+    }
+    if (tcc_class == "microphone") {
+      obs_data_set_string(settings, "device_id", "default");
+      return true;
+    }
+    if (tcc_class == "screen") {
+      obs_data_set_int(settings, "type", 0);
+      const char *display_uuid = obs_data_get_string(settings, "display_uuid");
+      return apply_first_string_property(source, settings, "display_uuid") ||
+             (display_uuid && display_uuid[0] != '\0') || obs_data_get_int(settings, "display") > 0;
+    }
+    return false;
+  }
+
+  bool create_prompt_source(const std::string &source_id, const std::string &safe_name, const std::string &tcc_class, bool activate) {
+    obs_data_t *settings = obs_data_create();
+    if (!configure_initial_prompt_settings(settings, tcc_class)) {
+      obs_data_release(settings);
+      return false;
+    }
+    obs_source_t *source = obs_source_create_private(source_id.c_str(), safe_name.c_str(), settings);
+    if (!source) {
+      obs_data_release(settings);
+      return false;
+    }
+    if (!configure_prompt_source(source, settings, tcc_class)) {
+      obs_source_release(source);
+      obs_data_release(settings);
+      return false;
+    }
+    obs_source_update(source, settings);
+    obs_data_release(settings);
+    if (activate) {
+      obs_source_inc_active(source);
+      std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+    }
+    prompt_sources_.push_back({source, activate});
+    return !activate || obs_source_active(source);
   }
 #endif
 
@@ -970,9 +1225,14 @@ private:
       count_prompt_source(summary, tcc_class);
 #if STREAMMATE_HAS_LIBOBS
       std::string safe_name = "streammate-" + tcc_class + "-" + std::to_string(++prompt_index);
-      obs_source_t *source = obs_source_create_private(entry.module.c_str(), safe_name.c_str(), nullptr);
-      if (source) {
-        prompt_sources_.push_back(source);
+      bool created = false;
+      for (const std::string &source_id : exercise_source_ids(tcc_class)) {
+        if (create_prompt_source(source_id, safe_name, tcc_class, false)) {
+          created = true;
+          break;
+        }
+      }
+      if (created) {
         ++summary.instantiated_count;
       } else {
         ++summary.failed_count;
@@ -1086,7 +1346,7 @@ private:
 
   std::map<std::string, std::string> last_report_by_collection_;
 #if STREAMMATE_HAS_LIBOBS
-  std::vector<obs_source_t *> prompt_sources_;
+  std::vector<PromptSourceHandle> prompt_sources_;
 #endif
 };
 
@@ -1164,15 +1424,17 @@ public:
     }
     output_id_ = output_id;
     configured_ = true;
+    allow_live_egress_ = extract_json_bool(request, "allowLiveEgress").value_or(false);
     requested_video_encoder_ = extract_json_string(request, "videoEncoder");
     if (requested_video_encoder_.empty()) requested_video_encoder_ = "videotoolbox_h264";
     requested_audio_encoder_ = extract_json_string(request, "audioEncoder");
     if (requested_audio_encoder_.empty()) requested_audio_encoder_ = "aac";
+    std::string live_fields = allow_live_egress_ ? ",\"allowLiveEgress\":true" : "";
     return "{\"ok\":true,\"outputId\":\"" + json_escape(output_id_) + "\",\"configured\":true," +
            "\"encoder\":{\"requested\":\"" + json_escape(requested_video_encoder_) + "\",\"actual\":\"" + json_escape(actual_video_encoder()) +
            "\",\"fallback\":" + std::string(actual_video_encoder() == requested_video_encoder_ ? "false" : "true") + "}," +
-           "\"audio\":{\"requested\":\"" + json_escape(requested_audio_encoder_) + "\",\"actual\":\"aac-scaffold\"}," +
-           "\"endpoint\":" + endpoint_preview_json(endpoint_preview_) + ",\"streamKeyStatus\":\"not-stored\"}";
+           "\"audio\":{\"requested\":\"" + json_escape(requested_audio_encoder_) + "\",\"actual\":\"" + json_escape(actual_audio_encoder()) + "\"}," +
+           "\"endpoint\":" + endpoint_preview_json(endpoint_preview_) + live_fields + ",\"streamKeyStatus\":\"not-stored\"}";
   }
 
   std::string start(const std::string &request) {
@@ -1190,11 +1452,22 @@ public:
       configured_ = true;
     }
     if (output_id != output_id_) return rpc_error_result(-32602, "output is not configured");
+    if (allow_live_egress_) {
+#if STREAMMATE_HAS_LIBOBS
+      return start_live(stream_key_from_request(request));
+#else
+      if (stream_key_from_request(request).empty()) return rpc_error_result(-32602, "streamKey is required");
+      return rpc_error_result(-32602, "live egress requires a libobs build");
+#endif
+    }
     if (!endpoint_preview_.valid || !endpoint_preview_.loopback) return rpc_error_result(-32602, "output.start only permits a local fake RTMP ingest endpoint in this scaffold");
     std::string stream_key = extract_json_string(request, "streamKey");
     if (stream_key.empty()) return rpc_error_result(-32602, "streamKey is required");
 
     close_ingest();
+#if STREAMMATE_HAS_LIBOBS
+    stop_live_output();
+#endif
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return rpc_error_result(-32603, "fake ingest socket create failed");
     sockaddr_in addr{};
@@ -1229,6 +1502,9 @@ public:
     bool was_running = running_;
     running_ = false;
     close_ingest();
+#if STREAMMATE_HAS_LIBOBS
+    stop_live_output();
+#endif
     clear_stream_key();
     panic_audio_hard_muted_ = false;
     if (was_running) stopped_pending_ = true;
@@ -1251,6 +1527,29 @@ public:
   void tick(int control_fd) {
     if (!running_) return;
     auto now = std::chrono::steady_clock::now();
+#if STREAMMATE_HAS_LIBOBS
+    if (live_active_) {
+      if (live_reconnect_pending_.exchange(false)) {
+        fail_output(control_fd, "live egress reconnect refused");
+        return;
+      }
+      if (live_stop_pending_.exchange(false)) {
+        int code = live_stop_code_.exchange(OBS_OUTPUT_SUCCESS);
+        if (code != OBS_OUTPUT_SUCCESS) {
+          fail_output(control_fd, "live egress disconnected");
+          return;
+        }
+        running_ = false;
+        stop_live_output();
+        clear_stream_key();
+        panic_audio_hard_muted_ = false;
+        stopped_pending_ = true;
+      } else {
+        update_live_stats();
+      }
+    } else
+#endif
+    {
     if (std::chrono::duration_cast<std::chrono::milliseconds>(now - last_frame_at_).count() >= 33) {
       stats_.rendered_frames += 1;
       stats_.encoded_frames += 1;
@@ -1263,6 +1562,7 @@ public:
     if (ingest_disconnected()) {
       fail_output(control_fd, "fake ingest disconnected");
       return;
+    }
     }
     if (stats_subscribed_ && std::chrono::duration_cast<std::chrono::milliseconds>(now - last_stats_at_).count() >= stats_interval_ms_) {
       send_text_frame(control_fd, stats_event());
@@ -1285,9 +1585,17 @@ private:
 
   std::string actual_video_encoder() const {
 #if STREAMMATE_HAS_LIBOBS
-    return "videotoolbox_h264";
+    return actual_video_encoder_id_.empty() ? "videotoolbox_h264" : actual_video_encoder_id_;
 #else
     return "x264-scaffold";
+#endif
+  }
+
+  std::string actual_audio_encoder() const {
+#if STREAMMATE_HAS_LIBOBS
+    return actual_audio_encoder_id_.empty() ? "aac-scaffold" : actual_audio_encoder_id_;
+#else
+    return "aac-scaffold";
 #endif
   }
 
@@ -1298,7 +1606,7 @@ private:
            ",\"running\":" + (running_ ? "true" : "false") + ",\"endpoint\":" + endpoint_preview_json(endpoint_preview_) +
            ",\"encoder\":{\"requested\":\"" + json_escape(requested_video_encoder_) + "\",\"actual\":\"" + json_escape(actual_video_encoder()) +
            "\",\"fallback\":" + std::string(actual_video_encoder() == requested_video_encoder_ ? "false" : "true") + "}," +
-           "\"audio\":{\"requested\":\"" + json_escape(requested_audio_encoder_) + "\",\"actual\":\"aac-scaffold\"}," +
+           "\"audio\":{\"requested\":\"" + json_escape(requested_audio_encoder_) + "\",\"actual\":\"" + json_escape(actual_audio_encoder()) + "\"}," +
            "\"streamKeyStatus\":\"" + json_escape(stream_key_status) + "\",\"panicMute\":{\"hostAudioHardMuted\":" +
            (panic_audio_hard_muted_ ? "true" : "false") + "},\"stats\":" + stats_json(severe_percent) + "}";
   }
@@ -1345,6 +1653,9 @@ private:
   void fail_output(int control_fd, const std::string &reason) {
     running_ = false;
     close_ingest();
+#if STREAMMATE_HAS_LIBOBS
+    stop_live_output();
+#endif
     clear_stream_key();
     panic_audio_hard_muted_ = false;
     send_text_frame(control_fd, "{\"type\":\"output.error\",\"sessionId\":\"local\",\"payload\":{\"outputId\":\"" + json_escape(output_id_) +
@@ -1361,11 +1672,228 @@ private:
   void clear_stream_key() {
     std::fill(stream_key_.begin(), stream_key_.end(), '\0');
     stream_key_.clear();
+#if STREAMMATE_HAS_LIBOBS
+    if (obs_service_) {
+      obs_service_release(obs_service_);
+      obs_service_ = nullptr;
+    }
+#endif
   }
+
+  std::string stream_key_from_request(const std::string &request) const {
+    return extract_json_string(request, "streamKey");
+  }
+
+#if STREAMMATE_HAS_LIBOBS
+  static void output_stop_signal(void *data, calldata_t *params) {
+    auto *controller = static_cast<OutputController *>(data);
+    controller->live_stop_code_.store(static_cast<int>(calldata_int(params, "code")));
+    controller->live_stop_pending_.store(true);
+  }
+
+  static void output_reconnect_signal(void *data, calldata_t *) {
+    auto *controller = static_cast<OutputController *>(data);
+    controller->live_reconnect_pending_.store(true);
+  }
+
+  static bool refuse_reconnect(void *, obs_output_t *, int) {
+    return false;
+  }
+
+  std::string start_live(const std::string &stream_key) {
+    if (stream_key.empty()) return rpc_error_result(-32602, "streamKey is required");
+    if (!endpoint_preview_.valid) return rpc_error_result(-32602, "endpoint must be an rtmp URL");
+
+    close_ingest();
+    stop_live_output();
+    clear_stream_key();
+    stats_ = {};
+    live_stop_pending_.store(false);
+    live_reconnect_pending_.store(false);
+    live_stop_code_.store(OBS_OUTPUT_SUCCESS);
+
+    obs_data_t *output_settings = obs_data_create();
+    if (!output_settings) return rpc_error_result(-32603, "live egress output unavailable");
+    obs_output_ = obs_output_create("rtmp_output", "streammate-live-rtmp", output_settings, nullptr);
+    obs_data_release(output_settings);
+    if (!obs_output_) return rpc_error_result(-32603, "live egress output unavailable");
+    obs_output_set_reconnect_settings(obs_output_, 0, 0);
+    obs_output_set_reconnect_callback(obs_output_, refuse_reconnect, this);
+    signal_handler_t *signals = obs_output_get_signal_handler(obs_output_);
+    signal_handler_connect(signals, "stop", output_stop_signal, this);
+    signal_handler_connect(signals, "reconnect", output_reconnect_signal, this);
+
+    obs_data_t *service_settings = obs_data_create();
+    if (!service_settings) {
+      stop_live_output();
+      return rpc_error_result(-32603, "live egress service unavailable");
+    }
+    obs_data_set_string(service_settings, "server", endpoint_.c_str());
+    obs_data_set_string(service_settings, "key", stream_key.c_str());
+    obs_service_ = obs_service_create("rtmp_custom", "streammate-live-service", service_settings, nullptr);
+    obs_data_release(service_settings);
+    if (!obs_service_) {
+      stop_live_output();
+      return rpc_error_result(-32603, "live egress service unavailable");
+    }
+
+    obs_video_encoder_ = create_video_encoder(actual_video_encoder_id_);
+    obs_audio_encoder_ = create_audio_encoder(actual_audio_encoder_id_);
+    if (!obs_video_encoder_ || !obs_audio_encoder_) {
+      stop_live_output();
+      clear_stream_key();
+      return rpc_error_result(-32603, "live egress encoder unavailable");
+    }
+
+    if (!ensure_live_source()) {
+      stop_live_output();
+      clear_stream_key();
+      return rpc_error_result(-32603, "live egress source unavailable");
+    }
+
+    obs_encoder_set_video(obs_video_encoder_, obs_get_video());
+    obs_encoder_set_audio(obs_audio_encoder_, obs_get_audio());
+    obs_output_set_service(obs_output_, obs_service_);
+    obs_output_set_video_encoder(obs_output_, obs_video_encoder_);
+    obs_output_set_audio_encoder(obs_output_, obs_audio_encoder_, 0);
+    if (!obs_output_start(obs_output_)) {
+      stop_live_output();
+      clear_stream_key();
+      return rpc_error_result(-32603, "live egress start failed");
+    }
+
+    stream_key_ = stream_key;
+    running_ = true;
+    live_active_ = true;
+    error_pending_ = false;
+    stopped_pending_ = false;
+    started_pending_ = true;
+    started_at_ = std::chrono::steady_clock::now();
+    last_frame_at_ = std::chrono::steady_clock::now();
+    last_stats_at_ = std::chrono::steady_clock::now();
+    panic_audio_hard_muted_ = true;
+    update_live_stats();
+    return status_json("memory-only-redacted", true);
+  }
+
+  obs_encoder_t *create_video_encoder(std::string &actual_id) {
+    std::vector<std::string> candidates;
+    const char *id = nullptr;
+    for (size_t index = 0; obs_enum_encoder_types(index, &id); ++index) {
+      if (!id || obs_get_encoder_type(id) != OBS_ENCODER_VIDEO) continue;
+      const char *codec = obs_get_encoder_codec(id);
+      if (!codec || std::string(codec) != "h264") continue;
+      std::string encoder_id(id);
+      if (encoder_id.find("videotoolbox") != std::string::npos || encoder_id.find("com.apple") != std::string::npos) {
+        candidates.push_back(encoder_id);
+      }
+    }
+    candidates.push_back("obs_x264");
+
+    for (const std::string &candidate : candidates) {
+      obs_data_t *settings = obs_data_create();
+      if (!settings) continue;
+      obs_data_set_int(settings, "bitrate", 4500);
+      obs_data_set_int(settings, "keyint_sec", 2);
+      obs_data_set_string(settings, "profile", "high");
+      obs_encoder_t *encoder = obs_video_encoder_create(candidate.c_str(), "streammate-live-video", settings, nullptr);
+      obs_data_release(settings);
+      if (encoder) {
+        actual_id = candidate;
+        return encoder;
+      }
+    }
+    actual_id.clear();
+    return nullptr;
+  }
+
+  obs_encoder_t *create_audio_encoder(std::string &actual_id) {
+    const std::array<const char *, 2> candidates = {"CoreAudio_AAC", "ffmpeg_aac"};
+    for (const char *candidate : candidates) {
+      obs_data_t *settings = obs_data_create();
+      if (!settings) continue;
+      obs_data_set_int(settings, "bitrate", 160);
+      obs_encoder_t *encoder = obs_audio_encoder_create(candidate, "streammate-live-audio", settings, 0, nullptr);
+      obs_data_release(settings);
+      if (encoder) {
+        actual_id = candidate;
+        return encoder;
+      }
+    }
+    actual_id.clear();
+    return nullptr;
+  }
+
+  bool ensure_live_source() {
+    obs_source_t *current = obs_get_output_source(0);
+    if (current) {
+      obs_source_release(current);
+      return true;
+    }
+    fallback_scene_ = obs_scene_create_private("streammate-live-fallback-scene");
+    if (!fallback_scene_) return false;
+
+    obs_data_t *color_settings = obs_data_create();
+    obs_source_t *color = nullptr;
+    if (color_settings) {
+      obs_data_set_int(color_settings, "color", 0xFF203040);
+      obs_data_set_int(color_settings, "width", 1280);
+      obs_data_set_int(color_settings, "height", 720);
+      color = obs_source_create_private("color_source", "streammate-live-fallback-color", color_settings);
+      obs_data_release(color_settings);
+    }
+    if (color) {
+      obs_scene_add(fallback_scene_, color);
+      obs_source_release(color);
+    }
+
+    obs_set_output_source(0, obs_scene_get_source(fallback_scene_));
+    fallback_scene_bound_ = true;
+    return true;
+  }
+
+  void update_live_stats() {
+    if (!obs_output_) return;
+    int total = obs_output_get_total_frames(obs_output_);
+    int dropped = obs_output_get_frames_dropped(obs_output_);
+    float congestion = obs_output_get_congestion(obs_output_);
+    stats_.rendered_frames = total < 0 ? 0 : static_cast<uint64_t>(total);
+    stats_.encoded_frames = stats_.rendered_frames;
+    stats_.dropped_frames = dropped < 0 ? 0 : static_cast<uint64_t>(dropped);
+    stats_.severe_frames = stats_.dropped_frames;
+    stats_.congestion_percent = std::clamp(static_cast<int>(congestion * 100.0f + 0.5f), 0, 100);
+  }
+
+  void stop_live_output() {
+    live_active_ = false;
+    if (obs_output_) {
+      obs_output_stop(obs_output_);
+      obs_output_release(obs_output_);
+      obs_output_ = nullptr;
+    }
+    if (obs_video_encoder_) {
+      obs_encoder_release(obs_video_encoder_);
+      obs_video_encoder_ = nullptr;
+    }
+    if (obs_audio_encoder_) {
+      obs_encoder_release(obs_audio_encoder_);
+      obs_audio_encoder_ = nullptr;
+    }
+    if (fallback_scene_bound_) {
+      obs_set_output_source(0, nullptr);
+      fallback_scene_bound_ = false;
+    }
+    if (fallback_scene_) {
+      obs_scene_release(fallback_scene_);
+      fallback_scene_ = nullptr;
+    }
+  }
+#endif
 
   bool configured_ = false;
   bool running_ = false;
   bool stats_subscribed_ = false;
+  bool allow_live_egress_ = false;
   bool panic_audio_hard_muted_ = false;
   bool started_pending_ = false;
   bool stopped_pending_ = false;
@@ -1377,11 +1905,25 @@ private:
   EndpointPreview endpoint_preview_;
   std::string requested_video_encoder_ = "videotoolbox_h264";
   std::string requested_audio_encoder_ = "aac";
+  std::string actual_video_encoder_id_;
+  std::string actual_audio_encoder_id_;
   std::string stream_key_;
   OutputStats stats_;
   std::chrono::steady_clock::time_point started_at_;
   std::chrono::steady_clock::time_point last_frame_at_;
   std::chrono::steady_clock::time_point last_stats_at_;
+#if STREAMMATE_HAS_LIBOBS
+  bool live_active_ = false;
+  bool fallback_scene_bound_ = false;
+  obs_output_t *obs_output_ = nullptr;
+  obs_service_t *obs_service_ = nullptr;
+  obs_encoder_t *obs_video_encoder_ = nullptr;
+  obs_encoder_t *obs_audio_encoder_ = nullptr;
+  obs_scene_t *fallback_scene_ = nullptr;
+  std::atomic_bool live_stop_pending_{false};
+  std::atomic_bool live_reconnect_pending_{false};
+  std::atomic_int live_stop_code_{OBS_OUTPUT_SUCCESS};
+#endif
 };
 
 bool is_output_error(const std::string &result) { return result.rfind("__error__:", 0) == 0; }
@@ -1495,6 +2037,8 @@ private:
     } else if (method == "host.health") {
       send_text_frame(fd, rpc_result(id, "{\"status\":\"ready\",\"engineStarted\":" + std::string(engine_.started() ? "true" : "false") +
                                       ",\"heartbeatMs\":" + std::to_string(kHeartbeatMs) + "}"));
+    } else if (method == "host.exerciseTccPrompts") {
+      send_renderer_result(fd, id, importer_.exercise_tcc_prompts(payload));
     } else if (method == "scene.load") {
       send_renderer_result(fd, id, renderer_.load_scene(payload));
     } else if (method == "scene.setProgram") {
