@@ -44,6 +44,7 @@ constexpr const char *kVersion = STREAMMATE_STUDIO_HOST_VERSION;
 constexpr int kUsageExit = 64;
 constexpr int kRuntimeExit = 70;
 constexpr int kHeartbeatMs = 5000;
+constexpr std::uintmax_t kMaxSceneCollectionBytes = 8 * 1024 * 1024;
 constexpr const char *kWebSocketGuid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 volatile std::sig_atomic_t g_stop = 0;
 
@@ -816,6 +817,31 @@ std::string read_text_file(const std::filesystem::path &path) {
   return buffer.str();
 }
 
+std::string read_scene_collection_file(const std::filesystem::path &path) {
+  std::error_code ec;
+  const auto size = std::filesystem::file_size(path, ec);
+  if (!ec && size > kMaxSceneCollectionBytes) {
+    throw std::runtime_error("scene collection exceeds import size limit");
+  }
+  std::ifstream in(path, std::ios::binary);
+  if (!in) return "";
+  std::string contents;
+  contents.reserve(!ec ? static_cast<size_t>(size) : 0);
+  char buffer[4096];
+  std::uintmax_t total = 0;
+  while (in) {
+    in.read(buffer, sizeof(buffer));
+    const std::streamsize count = in.gcount();
+    if (count <= 0) break;
+    total += static_cast<std::uintmax_t>(count);
+    if (total > kMaxSceneCollectionBytes) {
+      throw std::runtime_error("scene collection exceeds import size limit");
+    }
+    contents.append(buffer, static_cast<size_t>(count));
+  }
+  return contents;
+}
+
 std::string path_stem_id(const std::filesystem::path &path) {
   std::string id = path.stem().string();
   for (char &c : id) {
@@ -829,27 +855,98 @@ struct ObsSourceEntry {
   std::string module;
 };
 
+std::optional<std::string> parse_json_string_token(const std::string &json, size_t &pos) {
+  if (pos >= json.size() || json[pos] != '"') return std::nullopt;
+  ++pos;
+  std::string value;
+  while (pos < json.size()) {
+    char c = json[pos++];
+    if (c == '"') return value;
+    if (c == '\\' && pos < json.size()) {
+      char escaped = json[pos++];
+      switch (escaped) {
+      case '"':
+      case '\\':
+      case '/':
+        value.push_back(escaped);
+        break;
+      case 'b':
+        value.push_back('\b');
+        break;
+      case 'f':
+        value.push_back('\f');
+        break;
+      case 'n':
+        value.push_back('\n');
+        break;
+      case 'r':
+        value.push_back('\r');
+        break;
+      case 't':
+        value.push_back('\t');
+        break;
+      default:
+        value.push_back(escaped);
+        break;
+      }
+    } else {
+      value.push_back(c);
+    }
+  }
+  return std::nullopt;
+}
+
+void skip_json_whitespace(const std::string &json, size_t &pos) {
+  while (pos < json.size() && std::isspace(static_cast<unsigned char>(json[pos]))) ++pos;
+}
+
 std::vector<ObsSourceEntry> parse_obs_source_entries(const std::string &json) {
-  struct PositionedEntry {
-    size_t position;
-    ObsSourceEntry entry;
+  struct ObjectFields {
+    std::string name;
+    std::string id;
+    bool emitted = false;
   };
-  std::vector<PositionedEntry> positioned;
-  std::regex name_then_id("\\\"name\\\"\\s*:\\s*\\\"([^\\\"]+)\\\"[^{}]*?\\\"id\\\"\\s*:\\s*\\\"([^\\\"]+)\\\"");
-  std::regex id_then_name("\\\"id\\\"\\s*:\\s*\\\"([^\\\"]+)\\\"[^{}]*?\\\"name\\\"\\s*:\\s*\\\"([^\\\"]+)\\\"");
-  for (std::sregex_iterator it(json.begin(), json.end(), name_then_id), end; it != end; ++it) {
-    positioned.push_back({static_cast<size_t>(it->position()), {(*it)[1].str(), (*it)[2].str()}});
-  }
-  for (std::sregex_iterator it(json.begin(), json.end(), id_then_name), end; it != end; ++it) {
-    positioned.push_back({static_cast<size_t>(it->position()), {(*it)[2].str(), (*it)[1].str()}});
-  }
-  std::sort(positioned.begin(), positioned.end(), [](const PositionedEntry &left, const PositionedEntry &right) {
-    return left.position < right.position;
-  });
+  std::vector<ObjectFields> stack;
   std::vector<ObsSourceEntry> entries;
-  for (const auto &item : positioned) {
-    if (entries.empty() || entries.back().label != item.entry.label || entries.back().module != item.entry.module) {
-      entries.push_back(item.entry);
+  for (size_t pos = 0; pos < json.size();) {
+    const char c = json[pos];
+    if (c == '{') {
+      stack.push_back({"", "", false});
+      ++pos;
+      continue;
+    }
+    if (c == '}') {
+      if (!stack.empty()) stack.pop_back();
+      ++pos;
+      continue;
+    }
+    if (c != '"') {
+      ++pos;
+      continue;
+    }
+
+    auto key = parse_json_string_token(json, pos);
+    if (!key) continue;
+    skip_json_whitespace(json, pos);
+    if (pos >= json.size() || json[pos] != ':') continue;
+    ++pos;
+    skip_json_whitespace(json, pos);
+    if (pos >= json.size() || json[pos] != '"') continue;
+    auto value = parse_json_string_token(json, pos);
+    if (!value || stack.empty()) continue;
+
+    ObjectFields &current = stack.back();
+    if (*key == "name") {
+      current.name = *value;
+    } else if (*key == "id") {
+      current.id = *value;
+    }
+    if (!current.emitted && !current.name.empty() && !current.id.empty()) {
+      ObsSourceEntry entry{current.name, current.id};
+      if (entries.empty() || entries.back().label != entry.label || entries.back().module != entry.module) {
+        entries.push_back(entry);
+      }
+      current.emitted = true;
     }
   }
   return entries;
@@ -1011,7 +1108,12 @@ public:
     if (!config) return error(-32602, "OBS config dir is required");
     auto collection = find_collection(*config, "");
     if (!collection) return error(-32602, "collection not found");
-    std::string json = read_text_file(*collection);
+    std::string json;
+    try {
+      json = read_scene_collection_file(*collection);
+    } catch (const std::runtime_error &) {
+      return error(-32602, "scene collection exceeds import size limit");
+    }
     auto entries = parse_obs_source_entries(json);
     int sources = 0;
     for (const auto &entry : entries) {
@@ -1039,10 +1141,16 @@ public:
     std::filesystem::path destination = std::filesystem::path(home) / "studio" / "obs-imports" / collection_id;
     std::filesystem::path temp = destination;
     temp += ".tmp";
+    std::string json;
+    try {
+      json = read_scene_collection_file(*collection);
+    } catch (const std::runtime_error &) {
+      return error(-32602, "scene collection exceeds import size limit");
+    }
     try {
       std::filesystem::remove_all(temp);
       copy_config_without_service_json(*config, temp);
-      write_import_map(temp, *collection);
+      write_import_map(temp, json);
       std::filesystem::remove_all(destination);
       std::filesystem::create_directories(destination.parent_path());
       std::filesystem::rename(temp, destination);
@@ -1051,8 +1159,8 @@ public:
       return error(-32603, "OBS fixture import failed");
     }
 
-    last_report_by_collection_[collection_id] = build_report(*config, *collection, collection_id);
-    std::string prompt_summary = instantiate_prompt_sources(*collection);
+    last_report_by_collection_[collection_id] = build_report(*config, json, collection_id);
+    std::string prompt_summary = instantiate_prompt_sources(json);
     return "{\"ok\":true,\"destinationLabel\":\"$STREAMMATE_HOME/studio/obs-imports/" + json_escape(collection_id) +
            "\",\"report\":" + last_report_by_collection_[collection_id] + ",\"promptSources\":" + prompt_summary + "}";
   }
@@ -1095,7 +1203,13 @@ public:
     if (!config) return error(-32602, "OBS config dir is required");
     auto collection = find_collection(*config, collection_id);
     if (!collection) return error(-32602, "collection not found");
-    last_report_by_collection_[collection_id] = build_report(*config, *collection, collection_id);
+    std::string json;
+    try {
+      json = read_scene_collection_file(*collection);
+    } catch (const std::runtime_error &) {
+      return error(-32602, "scene collection exceeds import size limit");
+    }
+    last_report_by_collection_[collection_id] = build_report(*config, json, collection_id);
     return last_report_by_collection_[collection_id];
   }
 
@@ -1212,8 +1326,7 @@ private:
   }
 #endif
 
-  std::string instantiate_prompt_sources(const std::filesystem::path &collection) {
-    std::string json = read_text_file(collection);
+  std::string instantiate_prompt_sources(const std::string &json) {
     PromptSourceSummary summary;
 #if STREAMMATE_HAS_LIBOBS
     release_prompt_sources();
@@ -1260,6 +1373,7 @@ private:
     if (!std::filesystem::is_directory(scenes)) return std::nullopt;
     std::vector<std::filesystem::path> candidates;
     for (const auto &entry : std::filesystem::directory_iterator(scenes)) {
+      if (std::filesystem::is_symlink(entry.symlink_status())) continue;
       if (entry.is_regular_file() && entry.path().extension() == ".json") candidates.push_back(entry.path());
     }
     std::sort(candidates.begin(), candidates.end());
@@ -1270,7 +1384,13 @@ private:
   }
 
   void copy_config_without_service_json(const std::filesystem::path &config, const std::filesystem::path &destination) const {
-    for (const auto &entry : std::filesystem::recursive_directory_iterator(config)) {
+    std::filesystem::recursive_directory_iterator end;
+    for (std::filesystem::recursive_directory_iterator it(config); it != end; ++it) {
+      const auto &entry = *it;
+      if (std::filesystem::is_symlink(entry.symlink_status())) {
+        it.disable_recursion_pending();
+        continue;
+      }
       std::filesystem::path relative = std::filesystem::relative(entry.path(), config);
       if (relative.filename() == "service.json") continue;
       std::filesystem::path target = destination / relative;
@@ -1283,8 +1403,7 @@ private:
     }
   }
 
-  void write_import_map(const std::filesystem::path &destination, const std::filesystem::path &collection) const {
-    std::string json = read_text_file(collection);
+  void write_import_map(const std::filesystem::path &destination, const std::string &json) const {
     std::vector<std::string> placeholders;
     for (const auto &entry : parse_obs_source_entries(json)) {
       if (entry.module == "third_party_camera_fx") {
@@ -1297,8 +1416,7 @@ private:
     out << "{\"placeholderSources\":" << json_array_join(placeholders) << "}\n";
   }
 
-  std::string build_report(const std::filesystem::path &config, const std::filesystem::path &collection, const std::string &collection_id) const {
-    std::string json = read_text_file(collection);
+  std::string build_report(const std::filesystem::path &config, const std::string &json, const std::string &collection_id) const {
     std::vector<std::string> mapped;
     std::vector<std::string> degraded;
     std::vector<std::string> unresolved;
