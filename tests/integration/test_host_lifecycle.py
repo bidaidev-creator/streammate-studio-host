@@ -438,6 +438,102 @@ class StudioHostLifecycleTest(unittest.TestCase):
             self.assertEqual(report["result"], expected_import_report())
             self.assertNotIn(fixture_secret, json.dumps(report))
 
+    @unittest.skipUnless(hasattr(os, "symlink"), "symlink support is required")
+    def test_obs_import_skips_symlinked_config_entries(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            obs_dir = write_obs_fixture(temp_root)
+            streammate_home = temp_root / "streammate-home"
+            outside = temp_root / "outside"
+            outside.mkdir()
+            secret_file = outside / "secret.txt"
+            secret = "outside-secret-material"
+            secret_file.write_text(secret, encoding="utf-8")
+            outside_dir = outside / "secret-dir"
+            outside_dir.mkdir()
+            (outside_dir / "nested.txt").write_text(secret, encoding="utf-8")
+            regular_file = obs_dir / "global.ini"
+            regular_file.write_text("[General]\nName=Fixture\n", encoding="utf-8")
+            try:
+                os.symlink(secret_file, obs_dir / "scene.json")
+                os.symlink(secret_file, obs_dir / "basic" / "scenes" / "secret-scene.json")
+                os.symlink(outside_dir, obs_dir / "linked-dir")
+            except OSError as exc:
+                self.skipTest(f"symlink creation unavailable: {exc}")
+
+            process, port, _ = start_host(env={"STREAMMATE_OBS_CONFIG_DIR": str(obs_dir), "STREAMMATE_HOME": str(streammate_home)})
+            self.addCleanup(stop_process, process)
+            sock = websocket_connect(port)
+            self.addCleanup(sock.close)
+
+            loaded = rpc(sock, 103, "import.load", {"collectionId": "fixture-main"})
+            self.assertIn("result", loaded)
+            imported_root = streammate_home / "studio" / "obs-imports" / "fixture-main"
+            self.assertEqual((imported_root / "global.ini").read_text(encoding="utf-8"), "[General]\nName=Fixture\n")
+            self.assertFalse((imported_root / "service.json").exists())
+            self.assertFalse((imported_root / "scene.json").exists())
+            self.assertFalse((imported_root / "basic" / "scenes" / "secret-scene.json").exists())
+            self.assertFalse((imported_root / "linked-dir").exists())
+            for path in imported_root.rglob("*"):
+                if path.is_file():
+                    self.assertNotIn(secret, path.read_text(encoding="utf-8"))
+
+    def test_obs_import_pathological_braceless_collection_scan_is_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            obs_dir = temp_root / "obs-config"
+            scenes_dir = obs_dir / "basic" / "scenes"
+            scenes_dir.mkdir(parents=True)
+            collection = scenes_dir / "fixture-main.json"
+            collection.write_text('"name":"Brace Free",' + ('"padding":"xxxxxxxxxx",' * 10000), encoding="utf-8")
+
+            process, port, _ = start_host()
+            self.addCleanup(stop_process, process)
+            sock = websocket_connect(port)
+            self.addCleanup(sock.close)
+
+            started = time.monotonic()
+            scan = rpc(sock, 104, "import.scan", {"configDir": str(obs_dir)})
+            elapsed = time.monotonic() - started
+            self.assertLess(elapsed, 1.0)
+            self.assertEqual(
+                scan["result"],
+                {
+                    "ok": True,
+                    "configDirLabel": "$OBS_CONFIG_DIR",
+                    "collections": [
+                        {
+                            "collectionId": "fixture-main",
+                            "name": "Brace Free",
+                            "sourceCount": 0,
+                            "profileCount": 0,
+                            "serviceKeyAction": "not-present",
+                        }
+                    ],
+                },
+            )
+
+            collection.write_text(
+                json.dumps(
+                    {
+                        "name": "Small",
+                        "sources": [
+                            {"name": "Cam", "id": "av_capture_input"},
+                            {"id": "color_source", "name": "Backdrop"},
+                        ],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            loaded = rpc(
+                sock,
+                105,
+                "import.load",
+                {"configDir": str(obs_dir), "streammateHome": str(temp_root / "streammate-home"), "collectionId": "fixture-main"},
+            )
+            self.assertEqual(loaded["result"]["report"]["mapped"][0]["label"], "Backdrop")
+            self.assertEqual(loaded["result"]["report"]["degraded"][0]["label"], "Cam")
+
     def test_obs_import_failure_leaves_prior_host_state_intact(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_root = Path(temp_dir)
