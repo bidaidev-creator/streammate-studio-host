@@ -169,6 +169,45 @@ jobs:
           "$scratch/StreamMateStudioHost.app/Contents/MacOS/studio-host-smoke" --version
           (cd dist && shasum -a 256 -c sha256-manifest.txt)
 
+      - name: Verify inside-out ad-hoc signature before upload
+        run: |
+          app="dist/StreamMateStudioHost.app"
+          # Strict + recursive verification must run here: actions/upload-artifact
+          # does not preserve the framework's Versions/Current symlinks, so a
+          # post-download verify would be meaningless.
+          codesign --verify --strict --deep --verbose=2 "$app"
+          outer="$(codesign -dvvv "$app" 2>&1 | awk -F= '/^Identifier=/{print $2; exit}')"
+          test "$outer" = "com.streammate.studio-host"
+          # Every nested component gets its own distinct per-component identifier,
+          # namespaced under com.streammate.studio-host.vendored.* (never the
+          # outer one). The framework's is exactly the vendored libobs id.
+          fw="$(codesign -dvvv "$app/Contents/Frameworks/libobs.framework" 2>&1 | awk -F= '/^Identifier=/{print $2; exit}')"
+          test "$fw" = "com.streammate.studio-host.vendored.libobs"
+          for plugin in "$app"/Contents/PlugIns/obs-plugins/*.plugin; do
+            pid="$(codesign -dvvv "$plugin" 2>&1 | awk -F= '/^Identifier=/{print $2; exit}')"
+            case "$pid" in
+              com.streammate.studio-host.vendored.*) ;;
+              *) echo "nested plugin identifier not namespaced: $pid" >&2; exit 1 ;;
+            esac
+            test "$pid" != "com.streammate.studio-host"
+          done
+
+      - name: Verify repack determinism before upload
+        run: |
+          packaging/macos/package-app.sh \
+            --host-bin build/host/studio-host \
+            --smoke-bin build/host/studio-host-smoke \
+            --info-plist packaging/macos/Info.plist \
+            --libobs-framework "${{ steps.libobs.outputs.library }}" \
+            --obs-modules-dir "${{ steps.libobs.outputs.modules_dir }}" \
+            --obs-deps-lib-dir "$PWD/external/obs-studio/.deps/obs-deps-2025-08-23-universal/lib" \
+            --obs-graphics-module "${{ steps.libobs.outputs.graphics_module }}" \
+            --output-dir dist-repack
+          # Ad-hoc signatures are content-derived, so a second packaging of the
+          # same build tree must produce byte-identical manifests.
+          diff dist/sha256-manifest.txt dist-repack/sha256-manifest.txt
+          rm -rf dist-repack
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
