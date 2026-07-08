@@ -2296,14 +2296,16 @@ private:
 class RecordReplayController {
 public:
   std::string start_record(const std::string &request) {
-    auto home = resolve_home(request);
+    auto home = resolve_home();
     if (!home) return err(-32602, "STREAMMATE_HOME is required");
     std::string record_id = extract_json_string(request, "recordId");
     if (record_id.empty()) record_id = "recording";
-    auto relative = resolve_destination(*home, request, "recordings", record_id + ".mkv");
+    auto relative = sanitized_relative(request, "recordings", record_id + ".mkv");
     if (!relative) return err(-32602, "record destination must be a relative path under the state directory");
+    auto full_opt = confined_path(*home, *relative);
+    if (!full_opt) return err(-32602, "record destination must be a relative path under the state directory");
 
-    std::filesystem::path full = *home / "studio" / *relative;
+    std::filesystem::path full = *full_opt;
     std::error_code ec;
     std::filesystem::create_directories(full.parent_path(), ec);
     if (ec) return err(-32603, "record output could not be created");
@@ -2364,13 +2366,14 @@ public:
   }
 
   std::string start_replay(const std::string &request) {
-    auto home = resolve_home(request);
+    auto home = resolve_home();
     if (!home) return err(-32602, "STREAMMATE_HOME is required");
     std::string replay_id = extract_json_string(request, "replayId");
     if (replay_id.empty()) replay_id = "replay";
-    // Validate any caller-supplied destination up front (same containment rule
-    // as recordings); saved segments are named replays/<id>-<seq>.mkv.
-    auto relative = resolve_destination(*home, request, "replays", replay_id + ".mkv");
+    // Validate any caller-supplied destination up front (same shape rule as
+    // recordings); saved segments are named replays/<id>-<seq>.mkv and are
+    // re-checked for containment at save time.
+    auto relative = sanitized_relative(request, "replays", replay_id + ".mkv");
     if (!relative) return err(-32602, "replay destination must be a relative path under the state directory");
 
     ReplaySession session;
@@ -2400,7 +2403,11 @@ public:
     ++session.save_seq;
     std::filesystem::path relative =
         std::filesystem::path("replays") / (replay_id + "-" + std::to_string(session.save_seq) + ".mkv");
-    std::filesystem::path full = session.home / "studio" / relative;
+    // Re-validate containment at write time: a "replays" symlink planted after
+    // replay.start cannot redirect the save outside $STREAMMATE_HOME/studio.
+    auto full_opt = confined_path(session.home, relative);
+    if (!full_opt) return err(-32602, "replay destination must be a relative path under the state directory");
+    std::filesystem::path full = *full_opt;
     std::error_code ec;
     std::filesystem::create_directories(full.parent_path(), ec);
     if (ec) return err(-32603, "replay could not be materialized");
@@ -2482,38 +2489,53 @@ private:
     return "__error__:" + std::to_string(code) + ":" + message;
   }
 
-  std::optional<std::filesystem::path> resolve_home(const std::string &request) const {
-    std::string home = extract_json_string(request, "streammateHome");
-    if (home.empty()) home = getenv_string("STREAMMATE_HOME");
+  // Home is the host's own state root, taken only from the process environment.
+  // A request never overrides it: the "$STREAMMATE_HOME/..." labels we return
+  // must describe the configured home, and a caller-supplied home would let a
+  // write land outside it while the label still claimed containment.
+  std::optional<std::filesystem::path> resolve_home() const {
+    std::string home = getenv_string("STREAMMATE_HOME");
     if (home.empty()) return std::nullopt;
     return std::filesystem::path(home);
   }
 
-  // Returns the state-directory-relative path (e.g. "recordings/session.mkv")
-  // when the destination is contained, or nullopt for absolute / URL-shaped /
-  // parent-escaping destinations.
-  std::optional<std::filesystem::path> resolve_destination(
-      const std::filesystem::path &home, const std::string &request,
-      const std::string &subdir, const std::string &default_name) const {
+  // Rejects absolute / URL-shaped / parent-escaping destinations up front and
+  // returns the state-directory-relative path (e.g. "recordings/session.mkv").
+  // Containment against the on-disk state directory is enforced separately at
+  // write time by confined_path().
+  std::optional<std::filesystem::path> sanitized_relative(
+      const std::string &request, const std::string &subdir, const std::string &default_name) const {
     std::string destination = extract_json_string(request, "destination");
-    std::filesystem::path relative;
-    if (destination.empty()) {
-      relative = std::filesystem::path(subdir) / default_name;
-    } else {
-      if (destination.find("://") != std::string::npos) return std::nullopt;
-      std::filesystem::path candidate(destination);
-      if (candidate.is_absolute()) return std::nullopt;
-      for (const auto &part : candidate) {
-        if (part == "..") return std::nullopt;
-      }
-      relative = std::filesystem::path(subdir) / candidate;
+    if (destination.empty()) return std::filesystem::path(subdir) / default_name;
+    if (destination.find("://") != std::string::npos) return std::nullopt;
+    std::filesystem::path candidate(destination);
+    if (candidate.is_absolute()) return std::nullopt;
+    for (const auto &part : candidate) {
+      if (part == "..") return std::nullopt;
     }
-    std::filesystem::path state_dir = home / "studio";
-    std::filesystem::path resolved = std::filesystem::weakly_canonical(state_dir / relative);
-    std::filesystem::path canonical_state = std::filesystem::weakly_canonical(state_dir);
-    auto mismatch = std::mismatch(canonical_state.begin(), canonical_state.end(), resolved.begin());
-    if (mismatch.first != canonical_state.end()) return std::nullopt;
-    return relative;
+    return std::filesystem::path(subdir) / candidate;
+  }
+
+  // Resolves the on-disk write path and confirms it is confined under
+  // $STREAMMATE_HOME/studio AFTER resolving symlinks. The trusted prefix is
+  // anchored to canonical(home)/"studio" (not to a canonicalized state dir), so
+  // a "studio" symlink pointing outside the home is rejected rather than trusted.
+  // Re-run immediately before every write so a symlink planted after start cannot
+  // redirect the write. Bounds-safe: never walks the resolved iterator past end.
+  std::optional<std::filesystem::path> confined_path(
+      const std::filesystem::path &home, const std::filesystem::path &relative) const {
+    try {
+      std::filesystem::path trusted = std::filesystem::weakly_canonical(home) / "studio";
+      std::filesystem::path full = std::filesystem::weakly_canonical(home / "studio" / relative);
+      auto tit = trusted.begin();
+      auto fit = full.begin();
+      for (; tit != trusted.end(); ++tit, ++fit) {
+        if (fit == full.end() || *fit != *tit) return std::nullopt;
+      }
+      return full;
+    } catch (const std::filesystem::filesystem_error &) {
+      return std::nullopt;
+    }
   }
 
   std::string record_json(const RecordSession &session, bool include_ok, bool include_stop_fields) const {

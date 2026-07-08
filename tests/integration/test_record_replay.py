@@ -190,6 +190,60 @@ class RecordReplayScaffoldTest(unittest.TestCase):
             self.assertFalse(Path("/etc/passwd.mkv").exists())
             self.assertFalse(Path("/tmp/evil.mkv").exists())
 
+    def test_request_cannot_override_env_streammate_home(self) -> None:
+        # A caller-supplied streammateHome must not redirect the write: home comes
+        # only from the process environment, so the "$STREAMMATE_HOME" label is honest.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            env_home = Path(temp_dir) / "env-home"
+            other_home = Path(temp_dir) / "attacker-home"
+            other_home.mkdir(parents=True)
+            _, sock = self._connect(env_home)
+
+            started = host.rpc(sock, 360, "record.start", {"recordId": "s", "streammateHome": str(other_home)})["result"]
+            self.assertTrue(started["ok"])
+            self.assertEqual(started["path"], "$STREAMMATE_HOME/studio/recordings/s.mkv")
+            host.rpc(sock, 361, "record.stop", {"recordId": "s"})
+
+            self.assertTrue((env_home / "studio" / "recordings" / "s.mkv").exists())
+            self.assertFalse((other_home / "studio").exists())
+
+    @unittest.skipUnless(hasattr(__import__("os"), "symlink"), "symlink support is required")
+    def test_symlinked_state_dir_is_refused_for_record(self) -> None:
+        import os
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            home = Path(temp_dir) / "home"
+            outside = Path(temp_dir) / "outside"
+            (home).mkdir(parents=True)
+            outside.mkdir(parents=True)
+            os.symlink(outside, home / "studio")  # studio -> outside (escape)
+            _, sock = self._connect(home)
+
+            refused = host.rpc(sock, 370, "record.start", {"recordId": "esc"})
+            self.assertEqual(refused["error"]["code"], -32602)
+            self.assertIn("relative path under the state directory", refused["error"]["message"])
+            self.assertFalse((outside / "recordings" / "esc.mkv").exists())
+
+    @unittest.skipUnless(hasattr(__import__("os"), "symlink"), "symlink support is required")
+    def test_replay_save_revalidates_containment_at_write_time(self) -> None:
+        import os
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            home = Path(temp_dir) / "home"
+            outside = Path(temp_dir) / "outside"
+            outside.mkdir(parents=True)
+            _, sock = self._connect(home)
+
+            host.rpc(sock, 380, "replay.start", {"replayId": "clip"})
+            # Plant a replays -> outside symlink AFTER start; save must still refuse.
+            (home / "studio").mkdir(parents=True, exist_ok=True)
+            os.symlink(outside, home / "studio" / "replays")
+
+            refused = host.rpc(sock, 381, "replay.save", {"replayId": "clip"})
+            self.assertEqual(refused["error"]["code"], -32602)
+            self.assertIn("relative path under the state directory", refused["error"]["message"])
+            self.assertFalse((outside / "clip-1.mkv").exists())
+
     def test_record_requires_streammate_home(self) -> None:
         process, port, _ = host.start_host()  # no STREAMMATE_HOME in env
         self.addCleanup(host.stop_process, process)
