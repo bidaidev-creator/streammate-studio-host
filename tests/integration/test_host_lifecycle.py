@@ -881,6 +881,24 @@ class StudioHostLifecycleTest(unittest.TestCase):
         self.assertEqual(no_scene["error"]["code"], -32602)
         self.assertIn("scene not loaded", no_scene["error"]["message"])
 
+        # A rejected transform (invalid dimension) must not partially apply x/y.
+        rejected = rpc(
+            sock,
+            217,
+            "scene.itemTransform",
+            {"sceneId": "xf-scene", "sourceId": "item", "x": 50, "height": 0},
+        )
+        self.assertEqual(rejected["error"]["code"], -32602)
+        self.assertIn("height must be positive", rejected["error"]["message"])
+        # The prior valid transform (x=4) is still in effect — x=50 was not applied.
+        reread = rpc(
+            sock,
+            218,
+            "scene.itemTransform",
+            {"sceneId": "xf-scene", "sourceId": "item"},
+        )["result"]
+        self.assertEqual(reread["transform"], {"x": 4, "y": 6, "width": 10, "height": 8})
+
     def test_source_remove_deletes_source_and_stale_update_fails_named(self) -> None:
         process, port, _ = start_host()
         self.addCleanup(stop_process, process)
@@ -966,6 +984,45 @@ class StudioHostLifecycleTest(unittest.TestCase):
         )["result"]
         self.assertTrue(configured["ok"])
         self.assertTrue(configured["allowLiveEgress"])
+
+    def test_rejected_live_start_does_not_arm_live_egress_for_later_call(self) -> None:
+        # Regression: a rejected output.start carrying allowLiveEgress:true must not
+        # leave the live-egress flag armed for a subsequent start that omits it.
+        ingest = FakeRtmpIngest()
+        self.addCleanup(ingest.kill_ingest)
+        process, port, _ = start_host("--allow-live-egress")
+        self.addCleanup(stop_process, process)
+        sock = websocket_connect(port)
+        self.addCleanup(sock.close)
+        stream_key = synthetic_stream_key()
+
+        # Configure the fake-ingest output WITHOUT requesting live egress.
+        rpc(sock, 260, "output.configure", {"outputId": "rtmp-main", "endpoint": ingest.endpoint})
+
+        # A start for the wrong output id carrying allowLiveEgress:true is rejected.
+        rejected = rpc(
+            sock,
+            261,
+            "output.start",
+            {"outputId": "wrong-id", "endpoint": "rtmp://live.example.invalid/app", "allowLiveEgress": True, "streamKey": stream_key},
+        )
+        self.assertEqual(rejected["error"]["code"], -32602)
+        self.assertIn("output is not configured", rejected["error"]["message"])
+        self.assertNotIn(stream_key, json.dumps(rejected))
+
+        # A plain start for the configured output (no allowLiveEgress) still takes
+        # the fake-ingest path — the rejected call did not arm live egress.
+        started = rpc(
+            sock,
+            262,
+            "output.start",
+            {"outputId": "rtmp-main", "endpoint": ingest.endpoint, "streamKey": stream_key},
+        )["result"]
+        self.assertTrue(started["ok"])
+        self.assertTrue(started["running"])
+        self.assertEqual(started["streamKeyStatus"], "memory-only-redacted")
+        ingest.wait_for_bytes()
+        rpc(sock, 263, "output.stop", {"outputId": "rtmp-main"})
 
     def test_launch_flag_present_keeps_fake_ingest_path_byte_compatible(self) -> None:
         ingest = FakeRtmpIngest()

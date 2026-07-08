@@ -774,17 +774,19 @@ public:
     if (source_id.empty() || it == sources_.end() || it->second.scene_id != scene_id) {
       return rpc_error_result(-32602, "source not found");
     }
+    // Validate every field before mutating so a rejected transform leaves the
+    // scene item untouched (no partial application observable in state/capture).
+    auto x = extract_json_int(request, "x");
+    auto y = extract_json_int(request, "y");
+    auto width = extract_json_int(request, "width");
+    auto height = extract_json_int(request, "height");
+    if (width && *width <= 0) return rpc_error_result(-32602, "transform width must be positive");
+    if (height && *height <= 0) return rpc_error_result(-32602, "transform height must be positive");
     SourceModel &source = it->second;
-    if (auto value = extract_json_int(request, "x")) source.x = *value;
-    if (auto value = extract_json_int(request, "y")) source.y = *value;
-    if (auto value = extract_json_int(request, "width")) {
-      if (*value <= 0) return rpc_error_result(-32602, "transform width must be positive");
-      source.width = *value;
-    }
-    if (auto value = extract_json_int(request, "height")) {
-      if (*value <= 0) return rpc_error_result(-32602, "transform height must be positive");
-      source.height = *value;
-    }
+    if (x) source.x = *x;
+    if (y) source.y = *y;
+    if (width) source.width = *width;
+    if (height) source.height = *height;
     return "{\"ok\":true,\"sceneId\":\"" + json_escape(scene_id) + "\",\"sourceId\":\"" + json_escape(source_id) +
            "\",\"transform\":{\"x\":" + std::to_string(source.x) + ",\"y\":" + std::to_string(source.y) +
            ",\"width\":" + std::to_string(source.width) + ",\"height\":" + std::to_string(source.height) + "}}";
@@ -1615,9 +1617,11 @@ public:
     std::string output_id = extract_json_string(request, "outputId");
     if (output_id.empty()) return rpc_error_result(-32602, "outputId is required");
     // Assert the launch-flag gate before any endpoint is parsed or contacted.
+    // A caller-supplied allowLiveEgress:true here is refused unless the host was
+    // launched with --allow-live-egress. The live path itself is armed only by
+    // output.configure (the recorded L5 contract); start never mutates that
+    // stored flag, so a rejected start cannot arm live egress for a later call.
     if (auto refusal = live_egress_launch_gate(request)) return *refusal;
-    // With both gates open, a start request may itself request the live path.
-    if (extract_json_bool(request, "allowLiveEgress").value_or(false)) allow_live_egress_ = true;
     std::string endpoint = extract_json_string(request, "endpoint");
     if (!endpoint.empty()) {
       EndpointPreview parsed = parse_rtmp_endpoint(endpoint);
@@ -1630,7 +1634,9 @@ public:
       configured_ = true;
     }
     if (output_id != output_id_) return rpc_error_result(-32602, "output is not configured");
-    if (allow_live_egress_) {
+    // Both gates must assert: the JSON flag (recorded in allow_live_egress_ by
+    // output.configure) and the launch flag. Neither alone reaches live egress.
+    if (allow_live_egress_ && launch_allow_live_egress_) {
 #if STREAMMATE_HAS_LIBOBS
       return start_live(stream_key_from_request(request));
 #else
