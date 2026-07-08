@@ -1,10 +1,9 @@
 # native overlay golden hashes (FNV-1a-64 over RGBA surface) — captured from verified impl
-# TEST-FIRST placeholder values (RED); regenerated in the implementation commit.
-toast 0000000000000000
-lower-third 0000000000000000
-vote-callout 0000000000000000
-vote-result 0000000000000000
-celebration-burst 0000000000000000
-generated-image 0000000000000000
-sound-cue 0000000000000000
-clear 0000000000000000
+toast c298f99a0646a20b
+lower-third e2a86915ffe94c6f
+vote-callout 311769174edc89eb
+vote-result addade245481ebc3
+celebration-burst 42e6c7085d400edf
+generated-image 2d03ccc0188d748e
+sound-cue 07a6e57acc9477e3
+clear a58e4c7456800383

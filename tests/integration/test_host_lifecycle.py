@@ -150,7 +150,11 @@ def recv_text(sock: socket.socket, timeout: float = 7.0) -> dict:
     if length == 126:
         length = struct.unpack("!H", sock.recv(2))[0]
     elif length == 127:
-        raise AssertionError("unexpected 64-bit frame")
+        # 64-bit extended length carries the native overlay raster PNG at 1280x720.
+        ext = b""
+        while len(ext) < 8:
+            ext += sock.recv(8 - len(ext))
+        length = struct.unpack("!Q", ext)[0]
     payload = b""
     while len(payload) < length:
         payload += sock.recv(length - len(payload))
