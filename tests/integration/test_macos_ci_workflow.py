@@ -26,6 +26,31 @@ class MacosCiWorkflowTest(unittest.TestCase):
             with self.subTest(module=module):
                 self.assertIn(module, workflow)
 
+    def test_ci_strict_verifies_signature_before_upload(self) -> None:
+        # The inside-out signature must be verified on the real bundle before
+        # actions/upload-artifact runs (upload strips framework symlinks, so a
+        # post-upload strict verify would be meaningless).
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        verify_index = workflow.index("codesign --verify --strict --deep")
+        upload_index = workflow.index("- name: Upload artifact")
+        self.assertLess(
+            verify_index,
+            upload_index,
+            "strict codesign verification must run before the artifact upload",
+        )
+        # The outer identifier is asserted stable in CI too.
+        self.assertIn("com.streammate.studio-host", workflow[verify_index:upload_index])
+
+    def test_ci_checks_repack_determinism(self) -> None:
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        self.assertRegex(workflow, r"(?i)repack")
+        upload_index = workflow.index("- name: Upload artifact")
+        self.assertLess(
+            workflow.lower().index("repack"),
+            upload_index,
+            "repack-determinism check must run before the artifact upload",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
