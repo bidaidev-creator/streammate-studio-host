@@ -13,8 +13,21 @@ set(STREAMMATE_OBS_DEPS_INCLUDE_DIR "" CACHE PATH "Path to OBS dependency header
 set(STREAMMATE_OBS_DEPS_LIBRARY_DIR "" CACHE PATH "Path to OBS dependency libraries")
 set(STREAMMATE_OBS_GENERATED_INCLUDE_DIR "" CACHE PATH "Path to generated OBS headers, such as obsconfig.h")
 
+# Phase B native OverlayAction renderer core (Spec 34 Capability 2 / chunk 34.H2).
+# A plain host-repo library, separable from the host dispatch and from the future
+# 34.H3 in-tree OBS plugin module (keeps either Q-121 packaging answer cheap).
+# It runs fully in scaffold mode (no libobs); on Apple it is backed by a
+# CoreGraphics CGBitmapContext surface.
+add_library(native-overlay-renderer STATIC src/native_overlay_renderer.cpp)
+target_include_directories(native-overlay-renderer PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
+if(APPLE)
+  target_link_libraries(native-overlay-renderer PUBLIC "-framework CoreGraphics" "-framework CoreFoundation")
+endif()
+
 add_executable(studio-host src/studio_host.cpp)
 add_executable(studio-host-smoke src/studio_host_smoke.cpp)
+
+target_link_libraries(studio-host PRIVATE native-overlay-renderer)
 
 foreach(target studio-host studio-host-smoke)
   target_compile_definitions(${target} PRIVATE
@@ -58,6 +71,14 @@ endif()
 include(CTest)
 if(BUILD_TESTING)
   find_package(Python3 COMPONENTS Interpreter REQUIRED)
+
+  add_executable(native-overlay-renderer-test tests/unit/test_native_overlay_renderer.cpp)
+  target_link_libraries(native-overlay-renderer-test PRIVATE native-overlay-renderer)
+  add_test(
+    NAME native-overlay-renderer
+    COMMAND native-overlay-renderer-test ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/native_overlay_golden.txt
+  )
+
   add_test(
     NAME studio-host-lifecycle
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_host_lifecycle.py $<TARGET_FILE:studio-host>
