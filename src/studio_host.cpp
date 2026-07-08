@@ -2286,6 +2286,319 @@ private:
   std::map<std::string, std::unique_ptr<Entry>> sources_;
 };
 
+// Spec 34 Capability 7 (chunk 34.H4): replay-buffer + local recording outputs.
+// Scaffold mode (always) writes synthetic files under the host state directory
+// ($STREAMMATE_HOME/studio), loopback-only, with honest status transitions and
+// no socket of any kind. The real ffmpeg_muxer/replay_buffer wiring is compiled
+// under STREAMMATE_HAS_LIBOBS (compile-proof) and never starts egress. Every
+// response path is $STREAMMATE_HOME-relative; a destination outside the state
+// directory or a URL-shaped destination is refused with a named error.
+class RecordReplayController {
+public:
+  std::string start_record(const std::string &request) {
+    auto home = resolve_home();
+    if (!home) return err(-32602, "STREAMMATE_HOME is required");
+    std::string record_id = extract_json_string(request, "recordId");
+    if (record_id.empty()) record_id = "recording";
+    auto relative = sanitized_relative(request, "recordings", record_id + ".mkv");
+    if (!relative) return err(-32602, "record destination must be a relative path under the state directory");
+    auto full_opt = confined_path(*home, *relative);
+    if (!full_opt) return err(-32602, "record destination must be a relative path under the state directory");
+
+    std::filesystem::path full = *full_opt;
+    std::error_code ec;
+    std::filesystem::create_directories(full.parent_path(), ec);
+    if (ec) return err(-32603, "record output could not be created");
+    std::ofstream out(full, std::ios::binary | std::ios::trunc);
+    if (!out) return err(-32603, "record output could not be created");
+    out << "STMREC1\n"
+        << "recordId=" << record_id << "\n"
+        << "status=recording\n"
+        << "frame:000001\n";
+    out.close();
+
+    RecordSession session;
+    session.record_id = record_id;
+    session.full_path = full;
+    session.label = "$STREAMMATE_HOME/studio/" + relative->generic_string();
+    session.running = true;
+    session.status = "recording";
+    session.frame_count = 1;
+    records_[record_id] = session;
+
+    pending_event_ = record_event("record.started", session);
+    return record_json(session, true, false);
+  }
+
+  std::string stop_record(const std::string &request) {
+    std::string record_id = extract_json_string(request, "recordId");
+    if (record_id.empty()) record_id = "recording";
+    auto it = records_.find(record_id);
+    if (it == records_.end()) return err(-32602, "recording is not running");
+    RecordSession &session = it->second;
+    if (session.running) {
+      std::ofstream out(session.full_path, std::ios::binary | std::ios::app);
+      if (!out) return err(-32603, "record output could not be finalized");
+      out << "frame:000002\n"
+          << "frame:000003\n"
+          << "STMREC-END frames=3\n";
+      out.close();
+      session.frame_count = 3;
+      session.running = false;
+      session.status = "stopped";
+      std::error_code ec;
+      session.bytes = static_cast<long long>(std::filesystem::file_size(session.full_path, ec));
+      if (ec) session.bytes = 0;
+      pending_event_ = record_event("record.stopped", session);
+    }
+    return record_json(session, true, true);
+  }
+
+  std::string record_status(const std::string &request) const {
+    std::string record_id = extract_json_string(request, "recordId");
+    if (record_id.empty()) record_id = "recording";
+    auto it = records_.find(record_id);
+    if (it == records_.end()) {
+      return "{\"ok\":true,\"recordId\":\"" + json_escape(record_id) +
+             "\",\"running\":false,\"status\":\"idle\",\"path\":\"\"}";
+    }
+    return record_json(it->second, true, !it->second.running);
+  }
+
+  std::string start_replay(const std::string &request) {
+    auto home = resolve_home();
+    if (!home) return err(-32602, "STREAMMATE_HOME is required");
+    std::string replay_id = extract_json_string(request, "replayId");
+    if (replay_id.empty()) replay_id = "replay";
+    // Validate any caller-supplied destination up front (same shape rule as
+    // recordings); saved segments are named replays/<id>-<seq>.mkv and are
+    // re-checked for containment at save time.
+    auto relative = sanitized_relative(request, "replays", replay_id + ".mkv");
+    if (!relative) return err(-32602, "replay destination must be a relative path under the state directory");
+
+    ReplaySession session;
+    session.replay_id = replay_id;
+    session.home = *home;
+    session.running = true;
+    session.status = "buffering";
+    session.save_seq = 0;
+    session.chunks.clear();
+    for (int index = 0; index < kReplayChunks; ++index) {
+      session.chunks.push_back("STMREPLAY-CHUNK-" + std::to_string(index) + "\n");
+    }
+    replays_[replay_id] = session;
+    return "{\"ok\":true,\"replayId\":\"" + json_escape(replay_id) +
+           "\",\"running\":true,\"status\":\"buffering\",\"bufferedChunks\":" +
+           std::to_string(session.chunks.size()) + "}";
+  }
+
+  std::string save_replay(const std::string &request) {
+    std::string replay_id = extract_json_string(request, "replayId");
+    if (replay_id.empty()) replay_id = "replay";
+    auto it = replays_.find(replay_id);
+    if (it == replays_.end() || !it->second.running) {
+      return err(-32602, "replay buffer is not running");
+    }
+    ReplaySession &session = it->second;
+    ++session.save_seq;
+    std::filesystem::path relative =
+        std::filesystem::path("replays") / (replay_id + "-" + std::to_string(session.save_seq) + ".mkv");
+    // Re-validate containment at write time: a "replays" symlink planted after
+    // replay.start cannot redirect the save outside $STREAMMATE_HOME/studio.
+    auto full_opt = confined_path(session.home, relative);
+    if (!full_opt) return err(-32602, "replay destination must be a relative path under the state directory");
+    std::filesystem::path full = *full_opt;
+    std::error_code ec;
+    std::filesystem::create_directories(full.parent_path(), ec);
+    if (ec) return err(-32603, "replay could not be materialized");
+    std::ofstream out(full, std::ios::binary | std::ios::trunc);
+    if (!out) return err(-32603, "replay could not be materialized");
+    out << "STMREPLAY1\n";
+    for (const std::string &chunk : session.chunks) out << chunk;
+    out.close();
+
+    long long saved_bytes = static_cast<long long>(std::filesystem::file_size(full, ec));
+    if (ec) saved_bytes = 0;
+    std::string label = "$STREAMMATE_HOME/studio/" + relative.generic_string();
+    pending_event_ =
+        "{\"type\":\"replay.saved\",\"sessionId\":\"local\",\"payload\":{\"replayId\":\"" +
+        json_escape(replay_id) + "\",\"status\":\"saved\",\"path\":\"" + json_escape(label) +
+        "\",\"savedBytes\":" + std::to_string(saved_bytes) + ",\"chunkCount\":" +
+        std::to_string(session.chunks.size()) + "}}";
+    return "{\"ok\":true,\"replayId\":\"" + json_escape(replay_id) +
+           "\",\"status\":\"saved\",\"path\":\"" + json_escape(label) + "\",\"savedBytes\":" +
+           std::to_string(saved_bytes) + ",\"chunkCount\":" + std::to_string(session.chunks.size()) + "}";
+  }
+
+  std::string stop_replay(const std::string &request) {
+    std::string replay_id = extract_json_string(request, "replayId");
+    if (replay_id.empty()) replay_id = "replay";
+    auto it = replays_.find(replay_id);
+    if (it == replays_.end()) return err(-32602, "replay buffer is not running");
+    it->second.running = false;
+    it->second.status = "stopped";
+    it->second.chunks.clear();
+    return "{\"ok\":true,\"replayId\":\"" + json_escape(replay_id) +
+           "\",\"running\":false,\"status\":\"stopped\"}";
+  }
+
+  std::string replay_status(const std::string &request) const {
+    std::string replay_id = extract_json_string(request, "replayId");
+    if (replay_id.empty()) replay_id = "replay";
+    auto it = replays_.find(replay_id);
+    if (it == replays_.end()) {
+      return "{\"ok\":true,\"replayId\":\"" + json_escape(replay_id) +
+             "\",\"running\":false,\"status\":\"idle\",\"bufferedChunks\":0}";
+    }
+    const ReplaySession &session = it->second;
+    return "{\"ok\":true,\"replayId\":\"" + json_escape(replay_id) + "\",\"running\":" +
+           (session.running ? "true" : "false") + ",\"status\":\"" + session.status +
+           "\",\"bufferedChunks\":" + std::to_string(session.chunks.size()) + "}";
+  }
+
+  std::optional<std::string> take_event() {
+    if (!pending_event_) return std::nullopt;
+    std::string event = *pending_event_;
+    pending_event_.reset();
+    return event;
+  }
+
+private:
+  static constexpr int kReplayChunks = 4;
+
+  struct RecordSession {
+    std::string record_id;
+    std::filesystem::path full_path;
+    std::string label;
+    std::string status = "idle";
+    bool running = false;
+    int frame_count = 0;
+    long long bytes = 0;
+  };
+
+  struct ReplaySession {
+    std::string replay_id;
+    std::filesystem::path home;
+    std::string status = "idle";
+    bool running = false;
+    int save_seq = 0;
+    std::vector<std::string> chunks;
+  };
+
+  std::string err(int code, const std::string &message) const {
+    return "__error__:" + std::to_string(code) + ":" + message;
+  }
+
+  // Home is the host's own state root, taken only from the process environment.
+  // A request never overrides it: the "$STREAMMATE_HOME/..." labels we return
+  // must describe the configured home, and a caller-supplied home would let a
+  // write land outside it while the label still claimed containment.
+  std::optional<std::filesystem::path> resolve_home() const {
+    std::string home = getenv_string("STREAMMATE_HOME");
+    if (home.empty()) return std::nullopt;
+    return std::filesystem::path(home);
+  }
+
+  // Rejects absolute / URL-shaped / parent-escaping destinations up front and
+  // returns the state-directory-relative path (e.g. "recordings/session.mkv").
+  // Containment against the on-disk state directory is enforced separately at
+  // write time by confined_path().
+  std::optional<std::filesystem::path> sanitized_relative(
+      const std::string &request, const std::string &subdir, const std::string &default_name) const {
+    std::string destination = extract_json_string(request, "destination");
+    if (destination.empty()) return std::filesystem::path(subdir) / default_name;
+    if (destination.find("://") != std::string::npos) return std::nullopt;
+    std::filesystem::path candidate(destination);
+    if (candidate.is_absolute()) return std::nullopt;
+    for (const auto &part : candidate) {
+      if (part == "..") return std::nullopt;
+    }
+    return std::filesystem::path(subdir) / candidate;
+  }
+
+  // Resolves the on-disk write path and confirms it is confined under
+  // $STREAMMATE_HOME/studio AFTER resolving symlinks. The trusted prefix is
+  // anchored to canonical(home)/"studio" (not to a canonicalized state dir), so
+  // a "studio" symlink pointing outside the home is rejected rather than trusted.
+  // Re-run immediately before every write so a symlink planted after start cannot
+  // redirect the write. Bounds-safe: never walks the resolved iterator past end.
+  std::optional<std::filesystem::path> confined_path(
+      const std::filesystem::path &home, const std::filesystem::path &relative) const {
+    try {
+      std::filesystem::path trusted = std::filesystem::weakly_canonical(home) / "studio";
+      std::filesystem::path full = std::filesystem::weakly_canonical(home / "studio" / relative);
+      auto tit = trusted.begin();
+      auto fit = full.begin();
+      for (; tit != trusted.end(); ++tit, ++fit) {
+        if (fit == full.end() || *fit != *tit) return std::nullopt;
+      }
+      return full;
+    } catch (const std::filesystem::filesystem_error &) {
+      return std::nullopt;
+    }
+  }
+
+  std::string record_json(const RecordSession &session, bool include_ok, bool include_stop_fields) const {
+    std::string out = std::string("{") + (include_ok ? "\"ok\":true," : "") +
+                      "\"recordId\":\"" + json_escape(session.record_id) + "\",\"running\":" +
+                      (session.running ? "true" : "false") + ",\"status\":\"" + session.status +
+                      "\",\"path\":\"" + json_escape(session.label) + "\"";
+    if (include_stop_fields) {
+      out += ",\"bytes\":" + std::to_string(session.bytes) +
+             ",\"frameCount\":" + std::to_string(session.frame_count);
+    }
+    return out + "}";
+  }
+
+  std::string record_event(const std::string &type, const RecordSession &session) const {
+    return "{\"type\":\"" + type + "\",\"sessionId\":\"local\",\"payload\":{\"recordId\":\"" +
+           json_escape(session.record_id) + "\",\"status\":\"" + session.status + "\",\"path\":\"" +
+           json_escape(session.label) + "\"}}";
+  }
+
+#if STREAMMATE_HAS_LIBOBS
+  // Real-path wiring (compile-proof). Creates the ffmpeg_muxer recording output
+  // and the replay_buffer output against libobs and releases them — no egress is
+  // ever started. Local files only. Compiled in the libobs CI lane without any
+  // `|| true` on the studio-host build.
+  obs_output_t *create_record_output(const std::string &path) const {
+    obs_data_t *settings = obs_data_create();
+    if (!settings) return nullptr;
+    obs_data_set_string(settings, "path", path.c_str());
+    obs_data_set_string(settings, "muxer_settings", "");
+    obs_output_t *output = obs_output_create("ffmpeg_muxer", "streammate-record", settings, nullptr);
+    obs_data_release(settings);
+    return output;
+  }
+
+  obs_output_t *create_replay_output(const std::string &directory, int max_seconds) const {
+    obs_data_t *settings = obs_data_create();
+    if (!settings) return nullptr;
+    obs_data_set_string(settings, "directory", directory.c_str());
+    obs_data_set_string(settings, "format", "mkv");
+    obs_data_set_string(settings, "extension", "mkv");
+    obs_data_set_int(settings, "max_time_sec", max_seconds);
+    obs_data_set_int(settings, "max_size_mb", 512);
+    obs_output_t *output = obs_output_create("replay_buffer", "streammate-replay", settings, nullptr);
+    obs_data_release(settings);
+    return output;
+  }
+
+  bool exercise_real_outputs(const std::string &record_path, const std::string &replay_dir) const {
+    obs_output_t *record = create_record_output(record_path);
+    obs_output_t *replay = create_replay_output(replay_dir, 20);
+    bool created = record != nullptr && replay != nullptr;
+    if (record) obs_output_release(record);
+    if (replay) obs_output_release(replay);
+    return created;
+  }
+#endif
+
+  std::map<std::string, RecordSession> records_;
+  std::map<std::string, ReplaySession> replays_;
+  std::optional<std::string> pending_event_;
+};
+
 class ControlServer {
 public:
   ControlServer(Options options, EngineLifecycle &engine, StateFile &state) : options_(std::move(options)), engine_(engine), state_(state) {
@@ -2448,6 +2761,20 @@ private:
       send_output_result(fd, id, output_.status(payload));
     } else if (method == "stats.subscribe") {
       send_output_result(fd, id, output_.subscribe(payload));
+    } else if (method == "record.start") {
+      send_record_result(fd, id, record_replay_.start_record(payload));
+    } else if (method == "record.stop") {
+      send_record_result(fd, id, record_replay_.stop_record(payload));
+    } else if (method == "record.status") {
+      send_record_result(fd, id, record_replay_.record_status(payload));
+    } else if (method == "replay.start") {
+      send_record_result(fd, id, record_replay_.start_replay(payload));
+    } else if (method == "replay.save") {
+      send_record_result(fd, id, record_replay_.save_replay(payload));
+    } else if (method == "replay.stop") {
+      send_record_result(fd, id, record_replay_.stop_replay(payload));
+    } else if (method == "replay.status") {
+      send_record_result(fd, id, record_replay_.replay_status(payload));
     } else if (method == "host.shutdown") {
       send_text_frame(fd, rpc_result(id, "{\"ok\":true}"));
       g_stop = 1;
@@ -2472,6 +2799,18 @@ private:
     }
   }
 
+  // record.*/replay.* results share the __error__ convention; on success any
+  // journaled event (record.started/stopped, replay.saved) is emitted after the
+  // RPC reply so the adapter can order it against the reply.
+  void send_record_result(int fd, const std::string &id, const std::string &result) {
+    if (is_renderer_error(result)) {
+      send_text_frame(fd, renderer_error_to_rpc(id, result));
+      return;
+    }
+    send_text_frame(fd, rpc_result(id, result));
+    if (auto event = record_replay_.take_event()) send_text_frame(fd, *event);
+  }
+
   Options options_;
   EngineLifecycle &engine_;
   StateFile &state_;
@@ -2479,6 +2818,7 @@ private:
   NativeOverlayManager native_overlays_;
   ObsImporter importer_;
   OutputController output_;
+  RecordReplayController record_replay_;
   int port_ = 0;
 };
 
