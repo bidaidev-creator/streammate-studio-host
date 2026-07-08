@@ -178,11 +178,17 @@ jobs:
           codesign --verify --strict --deep --verbose=2 "$app"
           outer="$(codesign -dvvv "$app" 2>&1 | awk -F= '/^Identifier=/{print $2; exit}')"
           test "$outer" = "com.streammate.studio-host"
-          # Every nested component keeps its own identifier (never the outer one).
+          # Every nested component gets its own distinct per-component identifier,
+          # namespaced under com.streammate.studio-host.vendored.* (never the
+          # outer one). The framework's is exactly the vendored libobs id.
           fw="$(codesign -dvvv "$app/Contents/Frameworks/libobs.framework" 2>&1 | awk -F= '/^Identifier=/{print $2; exit}')"
-          test "$fw" != "com.streammate.studio-host"
+          test "$fw" = "com.streammate.studio-host.vendored.libobs"
           for plugin in "$app"/Contents/PlugIns/obs-plugins/*.plugin; do
             pid="$(codesign -dvvv "$plugin" 2>&1 | awk -F= '/^Identifier=/{print $2; exit}')"
+            case "$pid" in
+              com.streammate.studio-host.vendored.*) ;;
+              *) echo "nested plugin identifier not namespaced: $pid" >&2; exit 1 ;;
+            esac
             test "$pid" != "com.streammate.studio-host"
           done
 

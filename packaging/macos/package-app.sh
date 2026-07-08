@@ -132,10 +132,10 @@ fi
 if [[ $skip_codesign -eq 0 ]]; then
   # Inside-out ad-hoc signing (Spec 34 Capability 8 / Q-123). Sign nested code
   # (dylibs, OBS plugin bundles, libobs.framework, the secondary executable)
-  # each with its OWN identifier first, then sign the outer bundle on its own
-  # (no recursive pass). The previous single recursive signing pass propagated
-  # the outer com.streammate.studio-host identifier onto every nested
-  # component, producing the recorded strictDeepCodesignOk:false ambiguity.
+  # each with its own distinct namespaced identifier first, then sign the outer
+  # bundle on its own (no recursive pass). The previous single recursive signing
+  # pass propagated the outer com.streammate.studio-host identifier onto every
+  # nested component, producing the recorded strictDeepCodesignOk:false ambiguity.
   # The bundle identifier (com.streammate.studio-host), the ad-hoc signing
   # approach, and the install path are byte-for-byte unchanged; reverting to
   # the prior behavior is a single-block change if Q-123 is not ratified.

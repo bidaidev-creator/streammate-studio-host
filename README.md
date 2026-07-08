@@ -16,7 +16,7 @@ Current prototype scope:
 - macOS CI scaffold for building the pinned upstream OBS sources without the Qt frontend, producing an ad-hoc-signed bundle artifact and sha256 manifest.
 - Fork guard scripts that fail if the OBS submodule has local modifications or drifts from the recorded pin.
 
-Output stays fake-ingest only (synthetic loopback writer); live RTMP/SRT egress is gated behind an explicit per-run opt-in and is not exercised here. Real macOS TCC rehearsal, Developer ID / notarized signing, and Stream Mate product logic remain out of scope — the IPC boundary is the GPL license boundary (ADR-0005).
+Output defaults to fake-ingest only (a synthetic loopback writer). Real RTMP/SRT live egress is default-off: `output.configure` refuses it unless a caller explicitly requests it against a libobs build, it is never enabled or exercised in CI, and — per the security posture below — turning it on requires explicit owner approval. Real macOS TCC rehearsal, Developer ID / notarized signing, and Stream Mate product logic remain out of scope — the IPC boundary is the GPL license boundary (ADR-0005).
 
 ## Pin-not-fork rule
 
@@ -58,7 +58,7 @@ It refuses non-loopback bind hosts, upgrades authorized WebSocket clients on `/c
 
 CI writes release-candidate artifacts under `dist/` and emits `dist/sha256-manifest.txt` with `shasum -a 256`. Downstream Stream Mate installation must verify this manifest before unpacking any host artifact.
 
-The bundle is ad-hoc signed **inside-out**: `packaging/macos/package-app.sh` signs each nested component (dylibs, `*.plugin` bundles, `libobs.framework`, and the secondary executable) with its own per-component identifier first, then signs the outer `.app` on its own (no recursive pass) with the stable identifier `com.streammate.studio-host`. This keeps every nested component's identity intact so `codesign --verify --strict --deep` passes; the earlier single recursive pass clobbered nested identifiers with the outer one and left the strict verification ambiguous. The identifier, the ad-hoc `--sign -` approach, and the install path are unchanged (Q-123, provisional). Ad-hoc signatures are content-derived, so packaging the same build tree twice is byte-deterministic; CI asserts both the strict verification and repack determinism before uploading the artifact (artifact upload does not preserve framework symlinks, so verification runs first).
+The bundle is ad-hoc signed **inside-out**: `packaging/macos/package-app.sh` signs each nested component (dylibs, `*.plugin` bundles, `libobs.framework`, and the secondary executable) with its own per-component identifier first, then signs the outer `.app` on its own (no recursive pass) with the stable identifier `com.streammate.studio-host`. This gives each nested component its own distinct per-component identifier (namespaced under `com.streammate.studio-host.vendored.*`) instead of the outer app identifier, so `codesign --verify --strict --deep` passes; the earlier single recursive pass clobbered every nested identifier with the outer one and left the strict verification ambiguous. The identifier, the ad-hoc `--sign -` approach, and the install path are unchanged (Q-123, provisional). Ad-hoc signatures are content-derived, so packaging the same build tree twice is byte-deterministic; CI asserts both the strict verification and repack determinism before uploading the artifact (artifact upload does not preserve framework symlinks, so verification runs first).
 
 ## Security and authority posture
 

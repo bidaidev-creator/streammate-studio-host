@@ -17,6 +17,7 @@ README = REPO_ROOT / "README.md"
 CI_NOTES = REPO_ROOT / "docs" / "ci-notes.md"
 
 OUTER_IDENTIFIER = "com.streammate.studio-host"
+VENDORED_PREFIX = "com.streammate.studio-host.vendored."
 NESTED_PLUGINS = ["mac-avcapture", "mac-capture", "obs-outputs", "obs-x264"]
 
 CODESIGN_AVAILABLE = sys.platform == "darwin" and shutil.which("codesign") is not None
@@ -55,16 +56,11 @@ class MacosPackagingTest(unittest.TestCase):
         binary.parent.mkdir(parents=True)
         binary.write_text(f"fake {name} plugin\n", encoding="utf-8")
 
-    def run_package(
-        self,
-        temp_root: Path,
-        extra: Optional[list[str]] = None,
-        codesign: bool = False,
-        output_name: str = "dist",
-    ) -> subprocess.CompletedProcess:
-        # Per-call input tree so the same test can package twice (repack
-        # determinism) with byte-identical fixture content at distinct paths.
-        inputs = temp_root / f"inputs-{output_name}"
+    def build_input_tree(self, temp_root: Path, name: str = "inputs") -> dict:
+        # Build one on-disk input (build) tree of fixtures. Returned separately
+        # from packaging so a single test can package the *same* tree twice to
+        # exercise repack determinism (rather than two look-alike trees).
+        inputs = temp_root / name
         build_root = inputs / "build"
         host_bin = build_root / "studio-host"
         smoke_bin = build_root / "studio-host-smoke"
@@ -80,16 +76,33 @@ class MacosPackagingTest(unittest.TestCase):
         graphics_module = inputs / "graphics" / "libobs-opengl.dylib"
         graphics_module.parent.mkdir(parents=True)
         graphics_module.write_text("fake graphics module\n", encoding="utf-8")
+        return {
+            "host_bin": host_bin,
+            "smoke_bin": smoke_bin,
+            "framework": framework,
+            "modules_dir": modules_dir,
+            "deps_dir": deps_dir,
+            "graphics_module": graphics_module,
+        }
+
+    def package_from_inputs(
+        self,
+        temp_root: Path,
+        inputs: dict,
+        extra: Optional[list[str]] = None,
+        codesign: bool = False,
+        output_name: str = "dist",
+    ) -> subprocess.CompletedProcess:
         output_dir = temp_root / output_name
         args = [
             str(PACKAGE_SCRIPT),
-            "--host-bin", str(host_bin),
-            "--smoke-bin", str(smoke_bin),
+            "--host-bin", str(inputs["host_bin"]),
+            "--smoke-bin", str(inputs["smoke_bin"]),
             "--info-plist", str(INFO_PLIST),
-            "--libobs-framework", str(framework),
-            "--obs-modules-dir", str(modules_dir),
-            "--obs-deps-lib-dir", str(deps_dir),
-            "--obs-graphics-module", str(graphics_module),
+            "--libobs-framework", str(inputs["framework"]),
+            "--obs-modules-dir", str(inputs["modules_dir"]),
+            "--obs-deps-lib-dir", str(inputs["deps_dir"]),
+            "--obs-graphics-module", str(inputs["graphics_module"]),
             "--output-dir", str(output_dir),
             "--skip-install-name-tool",
         ]
@@ -98,6 +111,18 @@ class MacosPackagingTest(unittest.TestCase):
         if extra:
             args.extend(extra)
         return subprocess.run(args, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=False)
+
+    def run_package(
+        self,
+        temp_root: Path,
+        extra: Optional[list[str]] = None,
+        codesign: bool = False,
+        output_name: str = "dist",
+    ) -> subprocess.CompletedProcess:
+        inputs = self.build_input_tree(temp_root, name=f"inputs-{output_name}")
+        return self.package_from_inputs(
+            temp_root, inputs, extra=extra, codesign=codesign, output_name=output_name
+        )
 
     def codesign_identifier(self, target: Path) -> Optional[str]:
         result = subprocess.run(
@@ -215,10 +240,15 @@ class MacosPackagingTest(unittest.TestCase):
                     self.assertEqual(result.returncode, 0, result.stdout)
 
     @unittest.skipUnless(CODESIGN_AVAILABLE, "codesign unavailable (non-macOS)")
-    def test_nested_components_retain_distinct_identities(self) -> None:
-        # The outer bundle keeps exactly com.streammate.studio-host while each
-        # nested component keeps its own identifier (the single `--deep` pass
-        # previously clobbered every nested identifier to the outer one).
+    def test_nested_components_get_distinct_vendored_identities(self) -> None:
+        # The outer bundle is signed with exactly com.streammate.studio-host,
+        # while every nested component is re-signed with its own distinct,
+        # namespaced com.streammate.studio-host.vendored.<name> identifier (the
+        # single `--deep` pass previously clobbered every nested identifier to
+        # the outer one). We assert the *exact* per-component identifier rather
+        # than a loose suffix/inequality check. (Ad-hoc signatures have a
+        # cdhash-based designated requirement, so the signing identifier is the
+        # meaningful, deterministic identity to pin here.)
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_root = Path(temp_dir)
             app = self.package_signed_app(temp_root)
@@ -228,33 +258,41 @@ class MacosPackagingTest(unittest.TestCase):
             frameworks = app / "Contents" / "Frameworks"
             plugins = app / "Contents" / "PlugIns" / "obs-plugins"
             component_expectations = {
-                frameworks / "libobs.framework": "libobs",
-                frameworks / "libdependency.dylib": "libdependency",
-                frameworks / "libobs-opengl.dylib": "libobs-opengl",
-                app / "Contents" / "MacOS" / "studio-host-smoke": "smoke",
+                frameworks / "libobs.framework": VENDORED_PREFIX + "libobs",
+                frameworks / "libdependency.dylib": VENDORED_PREFIX + "libdependency",
+                frameworks / "libobs-opengl.dylib": VENDORED_PREFIX + "libobs-opengl",
+                app / "Contents" / "MacOS" / "studio-host-smoke": VENDORED_PREFIX + "smoke",
             }
             for name in NESTED_PLUGINS:
-                component_expectations[plugins / f"{name}.plugin"] = name
+                component_expectations[plugins / f"{name}.plugin"] = VENDORED_PREFIX + name
 
-            for component, suffix in component_expectations.items():
+            for component, expected in component_expectations.items():
                 with self.subTest(component=component.name):
                     identifier = self.codesign_identifier(component)
-                    self.assertIsNotNone(identifier)
-                    self.assertNotEqual(identifier, OUTER_IDENTIFIER)
-                    self.assertTrue(
-                        identifier.endswith(suffix),
-                        f"{component.name} identifier {identifier!r} lost its own name",
+                    self.assertEqual(
+                        identifier,
+                        expected,
+                        f"{component.name} identifier {identifier!r} != expected {expected!r}",
                     )
+                    self.assertNotEqual(identifier, OUTER_IDENTIFIER)
 
     @unittest.skipUnless(CODESIGN_AVAILABLE, "codesign unavailable (non-macOS)")
     def test_repack_of_same_build_tree_is_byte_deterministic(self) -> None:
-        # Packaging the same inputs twice must yield identical bundle content
-        # hashes; ad-hoc signatures are content-derived, so the sha256 manifests
-        # (which cover the embedded _CodeSignature data) must match exactly.
+        # Package the *same* on-disk build tree twice (one shared input tree, not
+        # two look-alike trees) and require identical bundle content hashes;
+        # ad-hoc signatures are content-derived, so the sha256 manifests (which
+        # cover the embedded _CodeSignature data) must match exactly.
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_root = Path(temp_dir)
-            self.package_signed_app(temp_root, output_name="dist-a")
-            self.package_signed_app(temp_root, output_name="dist-b")
+            inputs = self.build_input_tree(temp_root, name="inputs-shared")
+            first = self.package_from_inputs(
+                temp_root, inputs, codesign=True, output_name="dist-a"
+            )
+            self.assertEqual(first.returncode, 0, first.stdout)
+            second = self.package_from_inputs(
+                temp_root, inputs, codesign=True, output_name="dist-b"
+            )
+            self.assertEqual(second.returncode, 0, second.stdout)
 
             manifest_a = (temp_root / "dist-a" / "sha256-manifest.txt").read_text(encoding="utf-8")
             manifest_b = (temp_root / "dist-b" / "sha256-manifest.txt").read_text(encoding="utf-8")
@@ -297,6 +335,28 @@ class MacosPackagingTest(unittest.TestCase):
         notes = CI_NOTES.read_text(encoding="utf-8")
         self.assertRegex(notes, r"(?i)inside-out")
         self.assertIn("--strict", notes)
+
+    def test_docs_do_not_overclaim_nested_identity_preservation(self) -> None:
+        # Inside-out signing re-signs nested components with new namespaced
+        # vendored.* identifiers; it does NOT preserve their pre-existing
+        # identities. Docs must describe the distinct per-component identifiers
+        # rather than claim identity is kept "intact" (would be an overclaim).
+        for doc in (README, CI_NOTES):
+            text = doc.read_text(encoding="utf-8")
+            with self.subTest(doc=doc.name):
+                self.assertNotIn("identity intact", text)
+                self.assertNotIn("identities intact", text)
+                self.assertIn(VENDORED_PREFIX.rstrip("."), text)
+
+    def test_readme_frames_live_egress_as_default_off_not_available_opt_in(self) -> None:
+        # Guards the live-egress hard-gate posture: the README must not soften
+        # real RTMP/SRT egress into a routine "opt-in", and must state it is
+        # default-off, fake-ingest-only by default, and approval-gated.
+        readme = README.read_text(encoding="utf-8")
+        self.assertNotIn("gated behind an explicit per-run opt-in", readme)
+        self.assertRegex(readme, r"(?i)default-off")
+        self.assertRegex(readme, r"(?i)fake-ingest only")
+        self.assertRegex(readme, r"(?i)requires explicit (?:owner )?approval")
 
 
 if __name__ == "__main__":
