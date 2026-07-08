@@ -130,7 +130,48 @@ if [[ $skip_install_name_tool -eq 0 && -x /usr/bin/install_name_tool ]]; then
 fi
 
 if [[ $skip_codesign -eq 0 ]]; then
-  /usr/bin/codesign --force --deep --sign - --identifier com.streammate.studio-host "$app"
+  # Inside-out ad-hoc signing (Spec 34 Capability 8 / Q-123). Sign nested code
+  # (dylibs, OBS plugin bundles, libobs.framework, the secondary executable)
+  # each with its OWN identifier first, then sign the outer bundle on its own
+  # (no recursive pass). The previous single recursive signing pass propagated
+  # the outer com.streammate.studio-host identifier onto every nested
+  # component, producing the recorded strictDeepCodesignOk:false ambiguity.
+  # The bundle identifier (com.streammate.studio-host), the ad-hoc signing
+  # approach, and the install path are byte-for-byte unchanged; reverting to
+  # the prior behavior is a single-block change if Q-123 is not ratified.
+  sign_adhoc() {
+    # $1 = code-signing identifier, $2 = target path. --timestamp=none keeps
+    # the ad-hoc signature offline and content-derived (repack determinism).
+    /usr/bin/codesign --force --sign - --timestamp=none --identifier "$1" "$2"
+  }
+  nested_identifier() {
+    # Derive a stable per-component identifier from the basename, namespaced
+    # under our reverse-DNS so it can never equal the outer app identifier.
+    local base
+    base="$(basename "$1")"
+    base="${base%.*}"
+    base="$(printf '%s' "$base" | LC_ALL=C tr -c 'A-Za-z0-9.-' '-')"
+    printf 'com.streammate.studio-host.vendored.%s' "$base"
+  }
+
+  shopt -s nullglob
+  # 1. Leaf dynamic libraries staged in Contents/Frameworks.
+  for dylib in "$frameworks"/*.dylib; do
+    sign_adhoc "$(nested_identifier "$dylib")" "$dylib"
+  done
+  # 2. OBS plugin/module bundles in Contents/PlugIns/obs-plugins.
+  for module in "$plugins"/*.plugin "$plugins"/*.so "$plugins"/*.dylib; do
+    sign_adhoc "$(nested_identifier "$module")" "$module"
+  done
+  # 3. Versioned frameworks (deepest bundles) after their own leaf code.
+  for framework_bundle in "$frameworks"/*.framework; do
+    sign_adhoc "$(nested_identifier "$framework_bundle")" "$framework_bundle"
+  done
+  # 4. Secondary Mach-O executable (the main executable is signed with the app).
+  sign_adhoc "com.streammate.studio-host.vendored.smoke" "$macos/studio-host-smoke"
+  shopt -u nullglob
+  # 5. Outer bundle on its own (no recursive pass), stable app identifier.
+  /usr/bin/codesign --force --sign - --identifier com.streammate.studio-host "$app"
 fi
 
 script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
