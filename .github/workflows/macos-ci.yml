@@ -148,6 +148,17 @@ jobs:
       - name: Run obs_startup smoke headlessly
         run: ./build/host/studio-host-smoke
 
+      # Spec 34 Capability 3 / chunk 34.H3: compile the in-tree OBS plugin module
+      # and its HAS_LIBOBS smoke. No `|| true` — the module MUST compile.
+      - name: Build native-overlay OBS plugin module and smoke
+        run: cmake --build build/host --target streammate-native-overlay native-overlay-module-smoke
+
+      - name: Run native-overlay module smoke headlessly
+        run: |
+          module_bin="build/host/streammate-native-overlay.plugin/Contents/MacOS/streammate-native-overlay"
+          test -f "$module_bin"
+          ./build/host/native-overlay-module-smoke "$module_bin" tests/unit/native_overlay_golden.txt
+
       - name: Package ad-hoc-signed bundle and checksum manifest
         run: |
           packaging/macos/package-app.sh \
@@ -158,6 +169,7 @@ jobs:
             --obs-modules-dir "${{ steps.libobs.outputs.modules_dir }}" \
             --obs-deps-lib-dir "$PWD/external/obs-studio/.deps/obs-deps-2025-08-23-universal/lib" \
             --obs-graphics-module "${{ steps.libobs.outputs.graphics_module }}" \
+            --streammate-plugin build/host/streammate-native-overlay.plugin \
             --output-dir dist
 
       - name: Verify relocatable app artifact from scratch copy
@@ -202,6 +214,7 @@ jobs:
             --obs-modules-dir "${{ steps.libobs.outputs.modules_dir }}" \
             --obs-deps-lib-dir "$PWD/external/obs-studio/.deps/obs-deps-2025-08-23-universal/lib" \
             --obs-graphics-module "${{ steps.libobs.outputs.graphics_module }}" \
+            --streammate-plugin build/host/streammate-native-overlay.plugin \
             --output-dir dist-repack
           # Ad-hoc signatures are content-derived, so a second packaging of the
           # same build tree must produce byte-identical manifests.

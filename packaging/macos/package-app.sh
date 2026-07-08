@@ -8,6 +8,7 @@ libobs_framework=""
 obs_modules_dir=""
 obs_deps_lib_dir=""
 obs_graphics_module=""
+streammate_plugin=""
 output_dir="dist"
 skip_codesign=0
 skip_install_name_tool=0
@@ -17,6 +18,7 @@ usage() {
 usage: package-app.sh --host-bin PATH --smoke-bin PATH --info-plist PATH \
   --libobs-framework PATH --obs-modules-dir PATH --obs-deps-lib-dir PATH \
   --obs-graphics-module PATH \
+  [--streammate-plugin PATH] \
   [--output-dir PATH] [--skip-codesign] [--skip-install-name-tool]
 USAGE
 }
@@ -30,6 +32,7 @@ while [[ $# -gt 0 ]]; do
     --obs-modules-dir) obs_modules_dir="${2:-}"; shift 2 ;;
     --obs-deps-lib-dir) obs_deps_lib_dir="${2:-}"; shift 2 ;;
     --obs-graphics-module) obs_graphics_module="${2:-}"; shift 2 ;;
+    --streammate-plugin) streammate_plugin="${2:-}"; shift 2 ;;
     --output-dir) output_dir="${2:-}"; shift 2 ;;
     --skip-codesign) skip_codesign=1; shift ;;
     --skip-install-name-tool) skip_install_name_tool=1; shift ;;
@@ -104,6 +107,17 @@ for bundle in "$obs_modules_dir"/*.plugin "$obs_modules_dir"/*.so "$obs_modules_
   cp -R "$bundle" "$plugins/"
 done
 shopt -u nullglob
+
+# Spec 34 Capability 3 / chunk 34.H3 (Q-121): stage the in-tree Stream Mate OBS
+# plugin module under Contents/PlugIns/obs-plugins/ alongside the upstream
+# modules, so the host's normal module load path (obs_add_module_path +
+# obs_load_all_modules over %module%.plugin/Contents/MacOS) enumerates it. It is
+# a first-party module built from this repo's source tree, not a third-party
+# binary. Staging keeps a separately-distributed-artifact reversal cheap.
+if [[ -n "$streammate_plugin" ]]; then
+  require_dir "Stream Mate plugin bundle" "$streammate_plugin"
+  cp -R "$streammate_plugin" "$plugins/"
+fi
 
 required_modules=(mac-avcapture mac-capture obs-outputs obs-x264)
 missing_modules=()
