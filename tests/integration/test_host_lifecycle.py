@@ -805,6 +805,261 @@ class StudioHostLifecycleTest(unittest.TestCase):
         self.assertIn("refuses non-loopback", process.stdout)
         self.assertNotIn("/Users/", process.stdout)
 
+    def test_scene_list_returns_loaded_scenes_with_program_marked(self) -> None:
+        process, port, _ = start_host()
+        self.addCleanup(stop_process, process)
+        sock = websocket_connect(port)
+        self.addCleanup(sock.close)
+
+        rpc(sock, 200, "scene.load", {"sceneId": "scene-a", "width": 64, "height": 36})
+        rpc(sock, 201, "scene.load", {"sceneId": "scene-b", "width": 64, "height": 36})
+        rpc(sock, 202, "scene.setProgram", {"sceneId": "scene-b"})
+
+        listed = rpc(sock, 203, "scene.list", {})["result"]
+        self.assertTrue(listed["ok"])
+        self.assertEqual(listed["programSceneId"], "scene-b")
+        by_id = {scene["sceneId"]: scene for scene in listed["scenes"]}
+        self.assertEqual(set(by_id), {"scene-a", "scene-b"})
+        self.assertFalse(by_id["scene-a"]["program"])
+        self.assertTrue(by_id["scene-b"]["program"])
+
+        # The program marker round-trips after a subsequent scene.setProgram.
+        rpc(sock, 204, "scene.setProgram", {"sceneId": "scene-a"})
+        relisted = rpc(sock, 205, "scene.list", {})["result"]
+        self.assertEqual(relisted["programSceneId"], "scene-a")
+        reindexed = {scene["sceneId"]: scene for scene in relisted["scenes"]}
+        self.assertTrue(reindexed["scene-a"]["program"])
+        self.assertFalse(reindexed["scene-b"]["program"])
+
+    def test_scene_item_transform_is_observable_in_capture_and_state(self) -> None:
+        process, port, _ = start_host()
+        self.addCleanup(stop_process, process)
+        sock = websocket_connect(port)
+        self.addCleanup(sock.close)
+
+        rpc(sock, 210, "scene.load", {"sceneId": "xf-scene", "width": 64, "height": 36})
+        rpc(
+            sock,
+            211,
+            "source.create",
+            {
+                "sceneId": "xf-scene",
+                "sourceId": "item",
+                "kind": "browser",
+                "url": overlay_url_with_secret("transform-secret"),
+                "x": 0,
+                "y": 0,
+                "width": 64,
+                "height": 36,
+            },
+        )
+
+        before = rpc(sock, 212, "scene.captureFrame", {"sceneId": "xf-scene", "format": "png"})["result"]["pngBase64"]
+
+        transformed = rpc(
+            sock,
+            213,
+            "scene.itemTransform",
+            {"sceneId": "xf-scene", "sourceId": "item", "x": 4, "y": 6, "width": 10, "height": 8},
+        )["result"]
+        self.assertTrue(transformed["ok"])
+        self.assertEqual(transformed["sceneId"], "xf-scene")
+        self.assertEqual(transformed["sourceId"], "item")
+        self.assertEqual(transformed["transform"], {"x": 4, "y": 6, "width": 10, "height": 8})
+        self.assertNotIn("transform-secret", json.dumps(transformed))
+
+        after = rpc(sock, 214, "scene.captureFrame", {"sceneId": "xf-scene", "format": "png"})["result"]["pngBase64"]
+        self.assertNotEqual(before, after)
+
+        # A transform against an unknown scene item fails with a named error.
+        ghost = rpc(sock, 215, "scene.itemTransform", {"sceneId": "xf-scene", "sourceId": "ghost", "x": 1})
+        self.assertEqual(ghost["error"]["code"], -32602)
+        self.assertIn("source not found", ghost["error"]["message"])
+
+        # A transform against an unloaded scene fails with a named error.
+        no_scene = rpc(sock, 216, "scene.itemTransform", {"sceneId": "missing-scene", "sourceId": "item", "x": 1})
+        self.assertEqual(no_scene["error"]["code"], -32602)
+        self.assertIn("scene not loaded", no_scene["error"]["message"])
+
+        # A rejected transform (invalid dimension) must not partially apply x/y.
+        rejected = rpc(
+            sock,
+            217,
+            "scene.itemTransform",
+            {"sceneId": "xf-scene", "sourceId": "item", "x": 50, "height": 0},
+        )
+        self.assertEqual(rejected["error"]["code"], -32602)
+        self.assertIn("height must be positive", rejected["error"]["message"])
+        # The prior valid transform (x=4) is still in effect — x=50 was not applied.
+        reread = rpc(
+            sock,
+            218,
+            "scene.itemTransform",
+            {"sceneId": "xf-scene", "sourceId": "item"},
+        )["result"]
+        self.assertEqual(reread["transform"], {"x": 4, "y": 6, "width": 10, "height": 8})
+
+    def test_source_remove_deletes_source_and_stale_update_fails_named(self) -> None:
+        process, port, _ = start_host()
+        self.addCleanup(stop_process, process)
+        sock = websocket_connect(port)
+        self.addCleanup(sock.close)
+
+        rpc(sock, 220, "scene.load", {"sceneId": "rm-scene", "width": 64, "height": 36})
+        rpc(
+            sock,
+            221,
+            "source.create",
+            {"sceneId": "rm-scene", "sourceId": "doomed", "kind": "browser", "url": "https://station.localhost/overlay"},
+        )
+
+        removed = rpc(sock, 222, "source.remove", {"sourceId": "doomed"})["result"]
+        self.assertTrue(removed["ok"])
+        self.assertEqual(removed["sourceId"], "doomed")
+        self.assertTrue(removed["removed"])
+
+        # A subsequent source.update on the removed id fails with a named error.
+        stale = rpc(sock, 223, "source.update", {"sourceId": "doomed", "opacity": 0.5})
+        self.assertEqual(stale["error"]["code"], -32602)
+        self.assertIn("source not found", stale["error"]["message"])
+
+        # Removing an already-removed id fails with the same named error.
+        again = rpc(sock, 224, "source.remove", {"sourceId": "doomed"})
+        self.assertEqual(again["error"]["code"], -32602)
+        self.assertIn("source not found", again["error"]["message"])
+
+        # The removed source no longer contributes to the offscreen composite.
+        captured = rpc(sock, 225, "scene.captureFrame", {"sceneId": "rm-scene", "format": "png"})["result"]
+        self.assertEqual(captured["sourceCount"], 0)
+
+    def test_live_egress_refused_without_launch_flag_and_no_endpoint_contact(self) -> None:
+        ingest = FakeRtmpIngest()
+        self.addCleanup(ingest.kill_ingest)
+        process, port, _ = start_host()  # launched WITHOUT --allow-live-egress
+        self.addCleanup(stop_process, process)
+        sock = websocket_connect(port)
+        self.addCleanup(sock.close)
+        stream_key = synthetic_stream_key()
+
+        # The configure gate refuses the JSON allowLiveEgress flag when the launch flag is absent.
+        configured = rpc(
+            sock,
+            230,
+            "output.configure",
+            {"outputId": "rtmp-main", "endpoint": ingest.endpoint, "allowLiveEgress": True},
+        )
+        self.assertEqual(configured["error"]["code"], -32602)
+        self.assertIn("allow-live-egress", configured["error"]["message"])
+        self.assertNotIn(stream_key, json.dumps(configured))
+
+        # output.start carrying allowLiveEgress:true fails closed before any endpoint is touched.
+        started = rpc(
+            sock,
+            231,
+            "output.start",
+            {"outputId": "rtmp-main", "endpoint": ingest.endpoint, "streamKey": stream_key, "allowLiveEgress": True},
+        )
+        self.assertEqual(started["error"]["code"], -32602)
+        self.assertIn("allow-live-egress", started["error"]["message"])
+        self.assertNotIn(stream_key, json.dumps(started))
+        self.assertNotIn("/Users/", json.dumps(started))
+
+        # Connection-attempt probe: no socket was opened to the (loopback) fake ingest endpoint.
+        time.sleep(0.3)
+        self.assertEqual(ingest.connection_count, 0)
+
+    def test_launch_flag_opens_configure_live_gate(self) -> None:
+        ingest = FakeRtmpIngest()
+        self.addCleanup(ingest.kill_ingest)
+        process, port, _ = start_host("--allow-live-egress")
+        self.addCleanup(stop_process, process)
+        sock = websocket_connect(port)
+        self.addCleanup(sock.close)
+
+        configured = rpc(
+            sock,
+            240,
+            "output.configure",
+            {"outputId": "rtmp-main", "endpoint": ingest.endpoint, "allowLiveEgress": True},
+        )["result"]
+        self.assertTrue(configured["ok"])
+        self.assertTrue(configured["allowLiveEgress"])
+
+    def test_rejected_live_start_does_not_arm_live_egress_for_later_call(self) -> None:
+        # Regression: a rejected output.start carrying allowLiveEgress:true must not
+        # leave the live-egress flag armed for a subsequent start that omits it.
+        ingest = FakeRtmpIngest()
+        self.addCleanup(ingest.kill_ingest)
+        process, port, _ = start_host("--allow-live-egress")
+        self.addCleanup(stop_process, process)
+        sock = websocket_connect(port)
+        self.addCleanup(sock.close)
+        stream_key = synthetic_stream_key()
+
+        # Configure the fake-ingest output WITHOUT requesting live egress.
+        rpc(sock, 260, "output.configure", {"outputId": "rtmp-main", "endpoint": ingest.endpoint})
+
+        # A start for the wrong output id carrying allowLiveEgress:true is rejected.
+        rejected = rpc(
+            sock,
+            261,
+            "output.start",
+            {"outputId": "wrong-id", "endpoint": "rtmp://live.example.invalid/app", "allowLiveEgress": True, "streamKey": stream_key},
+        )
+        self.assertEqual(rejected["error"]["code"], -32602)
+        self.assertIn("output is not configured", rejected["error"]["message"])
+        self.assertNotIn(stream_key, json.dumps(rejected))
+
+        # A plain start for the configured output (no allowLiveEgress) still takes
+        # the fake-ingest path — the rejected call did not arm live egress.
+        started = rpc(
+            sock,
+            262,
+            "output.start",
+            {"outputId": "rtmp-main", "endpoint": ingest.endpoint, "streamKey": stream_key},
+        )["result"]
+        self.assertTrue(started["ok"])
+        self.assertTrue(started["running"])
+        self.assertEqual(started["streamKeyStatus"], "memory-only-redacted")
+        ingest.wait_for_bytes()
+        rpc(sock, 263, "output.stop", {"outputId": "rtmp-main"})
+
+    def test_launch_flag_present_keeps_fake_ingest_path_byte_compatible(self) -> None:
+        ingest = FakeRtmpIngest()
+        self.addCleanup(ingest.kill_ingest)
+        process, port, _ = start_host("--allow-live-egress")
+        self.addCleanup(stop_process, process)
+        sock = websocket_connect(port)
+        self.addCleanup(sock.close)
+        stream_key = synthetic_stream_key()
+
+        configured = rpc(
+            sock,
+            250,
+            "output.configure",
+            {"outputId": "rtmp-main", "endpoint": ingest.endpoint, "videoEncoder": "videotoolbox_h264", "audioEncoder": "aac"},
+        )["result"]
+        self.assertTrue(configured["ok"])
+        self.assertEqual(configured["streamKeyStatus"], "not-stored")
+        self.assertNotIn("allowLiveEgress", configured)
+
+        started = rpc(
+            sock,
+            251,
+            "output.start",
+            {"outputId": "rtmp-main", "endpoint": ingest.endpoint, "streamKey": stream_key},
+        )["result"]
+        self.assertTrue(started["ok"])
+        self.assertTrue(started["running"])
+        self.assertEqual(started["streamKeyStatus"], "memory-only-redacted")
+        self.assertNotIn(stream_key, json.dumps(started))
+        ingest.wait_for_bytes()
+
+        stopped = rpc(sock, 252, "output.stop", {"outputId": "rtmp-main"})["result"]
+        self.assertTrue(stopped["ok"])
+        self.assertFalse(stopped["running"])
+        self.assertEqual(stopped["streamKeyStatus"], "cleared")
+
     def test_sigkill_leaves_valid_state_file(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             state_file = Path(temp_dir) / "host-state.json"

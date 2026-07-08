@@ -54,6 +54,8 @@ The current `studio-host` binary accepts:
 
 It refuses non-loopback bind hosts, upgrades authorized WebSocket clients on `/control`, emits `host.started` / `host.ready` / periodic `host.health` events, and handles the JSON-RPC requests listed under Current scope (lifecycle, scene, source, import, output, and stats). The host has no Station journal authority; Station will translate host lifecycle observations into `studio.*` journal events in the monorepo adapter chunk.
 
+The optional `--allow-live-egress` launch flag (default **off**) is a defense-in-depth gate over the caller-supplied `allowLiveEgress` JSON flag: unless the process was launched with `--allow-live-egress`, an `output.configure`/`output.start` request carrying `allowLiveEgress:true` is refused with a sanitized reason before any endpoint is contacted. Both gates must be open for the live-egress path; the fake loopback ingest path is unaffected. This is a provisional hardening pending owner ratification (Q-122); it is additive and trivially removable.
+
 ## Artifact/checksum posture
 
 CI writes release-candidate artifacts under `dist/` and emits `dist/sha256-manifest.txt` with `shasum -a 256`. Downstream Stream Mate installation must verify this manifest before unpacking any host artifact.

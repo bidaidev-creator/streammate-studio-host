@@ -55,6 +55,7 @@ struct Options {
   int port = 0;
   std::string token;
   std::string state_file;
+  bool allow_live_egress = false;
 };
 
 std::string json_escape(const std::string &input) {
@@ -110,6 +111,11 @@ Options parse_args(int argc, char **argv) {
       options.token = require_value("--token");
     } else if (arg == "--state-file") {
       options.state_file = require_value("--state-file");
+    } else if (arg == "--allow-live-egress") {
+      // Q-122 defense-in-depth: a launch-time gate over the caller-supplied
+      // allowLiveEgress JSON flag. Default off; both layers must assert before
+      // any live egress path is reachable.
+      options.allow_live_egress = true;
     } else {
       throw std::runtime_error("unknown argument");
     }
@@ -745,6 +751,53 @@ public:
            "\"width\":" + std::to_string(scene_it->second.width) + ",\"height\":" + std::to_string(scene_it->second.height) +
            ",\"sourceCount\":" + std::to_string(source_count) + ",\"mutedSourceCount\":" + std::to_string(muted_count) +
            ",\"pngBase64\":\"" + base64(png.data(), png.size()) + "\"}";
+  }
+
+  std::string list_scenes(const std::string &) const {
+    std::string scenes_json;
+    bool first = true;
+    for (const auto &entry : scenes_) {
+      if (!first) scenes_json += ",";
+      first = false;
+      bool is_program = entry.first == program_scene_id_;
+      scenes_json += "{\"sceneId\":\"" + json_escape(entry.first) + "\",\"program\":" +
+                     std::string(is_program ? "true" : "false") + "}";
+    }
+    return "{\"ok\":true,\"programSceneId\":\"" + json_escape(program_scene_id_) + "\",\"scenes\":[" + scenes_json + "]}";
+  }
+
+  std::string item_transform(const std::string &request) {
+    std::string scene_id = extract_json_string(request, "sceneId");
+    if (scene_id.empty() || scenes_.find(scene_id) == scenes_.end()) return rpc_error_result(-32602, "scene not loaded");
+    std::string source_id = extract_json_string(request, "sourceId");
+    auto it = sources_.find(source_id);
+    if (source_id.empty() || it == sources_.end() || it->second.scene_id != scene_id) {
+      return rpc_error_result(-32602, "source not found");
+    }
+    // Validate every field before mutating so a rejected transform leaves the
+    // scene item untouched (no partial application observable in state/capture).
+    auto x = extract_json_int(request, "x");
+    auto y = extract_json_int(request, "y");
+    auto width = extract_json_int(request, "width");
+    auto height = extract_json_int(request, "height");
+    if (width && *width <= 0) return rpc_error_result(-32602, "transform width must be positive");
+    if (height && *height <= 0) return rpc_error_result(-32602, "transform height must be positive");
+    SourceModel &source = it->second;
+    if (x) source.x = *x;
+    if (y) source.y = *y;
+    if (width) source.width = *width;
+    if (height) source.height = *height;
+    return "{\"ok\":true,\"sceneId\":\"" + json_escape(scene_id) + "\",\"sourceId\":\"" + json_escape(source_id) +
+           "\",\"transform\":{\"x\":" + std::to_string(source.x) + ",\"y\":" + std::to_string(source.y) +
+           ",\"width\":" + std::to_string(source.width) + ",\"height\":" + std::to_string(source.height) + "}}";
+  }
+
+  std::string remove_source(const std::string &request) {
+    std::string source_id = extract_json_string(request, "sourceId");
+    auto it = sources_.find(source_id);
+    if (source_id.empty() || it == sources_.end()) return rpc_error_result(-32602, "source not found");
+    sources_.erase(it);
+    return "{\"ok\":true,\"sourceId\":\"" + json_escape(source_id) + "\",\"removed\":true}";
   }
 
 private:
@@ -1530,9 +1583,14 @@ struct OutputStats {
 
 class OutputController {
 public:
+  // Q-122: the launch-time gate that must be open before the caller-supplied
+  // allowLiveEgress JSON flag is honored. Default off; set once at startup.
+  void set_launch_allow_live_egress(bool allowed) { launch_allow_live_egress_ = allowed; }
+
   std::string configure(const std::string &request) {
     std::string output_id = extract_json_string(request, "outputId");
     if (output_id.empty()) return rpc_error_result(-32602, "outputId is required");
+    if (auto refusal = live_egress_launch_gate(request)) return *refusal;
     std::string endpoint = extract_json_string(request, "endpoint");
     if (!endpoint.empty()) {
       EndpointPreview parsed = parse_rtmp_endpoint(endpoint);
@@ -1558,6 +1616,12 @@ public:
   std::string start(const std::string &request) {
     std::string output_id = extract_json_string(request, "outputId");
     if (output_id.empty()) return rpc_error_result(-32602, "outputId is required");
+    // Assert the launch-flag gate before any endpoint is parsed or contacted.
+    // A caller-supplied allowLiveEgress:true here is refused unless the host was
+    // launched with --allow-live-egress. The live path itself is armed only by
+    // output.configure (the recorded L5 contract); start never mutates that
+    // stored flag, so a rejected start cannot arm live egress for a later call.
+    if (auto refusal = live_egress_launch_gate(request)) return *refusal;
     std::string endpoint = extract_json_string(request, "endpoint");
     if (!endpoint.empty()) {
       EndpointPreview parsed = parse_rtmp_endpoint(endpoint);
@@ -1570,7 +1634,9 @@ public:
       configured_ = true;
     }
     if (output_id != output_id_) return rpc_error_result(-32602, "output is not configured");
-    if (allow_live_egress_) {
+    // Both gates must assert: the JSON flag (recorded in allow_live_egress_ by
+    // output.configure) and the launch flag. Neither alone reaches live egress.
+    if (allow_live_egress_ && launch_allow_live_egress_) {
 #if STREAMMATE_HAS_LIBOBS
       return start_live(stream_key_from_request(request));
 #else
@@ -1699,6 +1765,17 @@ public:
 private:
   std::string rpc_error_result(int code, const std::string &message) const {
     return "__error__:" + std::to_string(code) + ":" + message;
+  }
+
+  // Q-122 defense-in-depth: refuse a caller-supplied allowLiveEgress:true unless
+  // the host was launched with --allow-live-egress. Returns a sanitized refusal
+  // (no endpoint, key, or path echoed) before any endpoint is touched.
+  std::optional<std::string> live_egress_launch_gate(const std::string &request) const {
+    bool wants_live = extract_json_bool(request, "allowLiveEgress").value_or(false);
+    if (wants_live && !launch_allow_live_egress_) {
+      return rpc_error_result(-32602, "live egress requires the --allow-live-egress launch flag");
+    }
+    return std::nullopt;
   }
 
   std::string actual_video_encoder() const {
@@ -2012,6 +2089,7 @@ private:
   bool running_ = false;
   bool stats_subscribed_ = false;
   bool allow_live_egress_ = false;
+  bool launch_allow_live_egress_ = false;
   bool panic_audio_hard_muted_ = false;
   bool started_pending_ = false;
   bool stopped_pending_ = false;
@@ -2052,7 +2130,9 @@ std::string output_error_to_rpc(const std::string &id, const std::string &result
 
 class ControlServer {
 public:
-  ControlServer(Options options, EngineLifecycle &engine, StateFile &state) : options_(std::move(options)), engine_(engine), state_(state) {}
+  ControlServer(Options options, EngineLifecycle &engine, StateFile &state) : options_(std::move(options)), engine_(engine), state_(state) {
+    output_.set_launch_allow_live_egress(options_.allow_live_egress);
+  }
 
   int run() {
     int server = socket(AF_INET, SOCK_STREAM, 0);
@@ -2161,6 +2241,12 @@ private:
       send_renderer_result(fd, id, renderer_.load_scene(payload));
     } else if (method == "scene.setProgram") {
       send_renderer_result(fd, id, renderer_.set_program(payload));
+    } else if (method == "scene.list") {
+      send_renderer_result(fd, id, renderer_.list_scenes(payload));
+    } else if (method == "scene.itemTransform") {
+      send_renderer_result(fd, id, renderer_.item_transform(payload));
+    } else if (method == "source.remove") {
+      send_renderer_result(fd, id, renderer_.remove_source(payload));
     } else if (method == "source.create") {
       send_renderer_result(fd, id, renderer_.create_source(payload));
     } else if (method == "source.update") {
