@@ -4,7 +4,9 @@
 Scaffold-mode proof: synthetic recording/replay files under the host state
 directory (STREAMMATE_HOME), loopback-only, honest status transitions. The
 HAS_LIBOBS ffmpeg_muxer/replay_buffer wiring is asserted at the source level
-(compile-proof) because a real libobs build is not available in this lane.
+(compile-proof): even in the CI libobs lane, which does build studio-host,
+obs_output_create requires a fully initialised obs runtime context that this
+lane does not stand up, so output creation itself is not exercised by a smoke.
 """
 from __future__ import annotations
 
