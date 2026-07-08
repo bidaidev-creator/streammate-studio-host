@@ -73,10 +73,13 @@ class NativeOverlayModuleSourceTest(unittest.TestCase):
 
     def test_module_carries_no_product_logic(self) -> None:
         # ADR-0005 Decision 2: the host/module carry no policy/playbook/journal
-        # product logic. Guard against obvious leakage.
-        text = MODULE_SRC.read_text(encoding="utf-8").lower()
+        # product logic. Guard against leakage in *code* (comments may name the
+        # boundary they preserve), so strip // line comments before scanning.
+        code = "\n".join(
+            line.split("//", 1)[0] for line in MODULE_SRC.read_text(encoding="utf-8").splitlines()
+        ).lower()
         for banned in ("playbook", "journal", "approval", "policy-gate"):
-            self.assertNotIn(banned, text, f"product-logic token {banned!r} leaked into the module")
+            self.assertNotIn(banned, code, f"product-logic token {banned!r} leaked into the module code")
 
 
 class NativeOverlayModuleSmokeSourceTest(unittest.TestCase):

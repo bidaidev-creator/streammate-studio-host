@@ -62,6 +62,47 @@ if(STREAMMATE_REQUIRE_LIBOBS)
       set_target_properties(${target} PROPERTIES BUILD_RPATH "${STREAMMATE_STUDIO_HOST_RPATHS}")
     endif()
   endforeach()
+
+  # Spec 34 Capability 3 / chunk 34.H3 — the in-tree OBS plugin module for the
+  # Phase B native renderer (ADR-0005 Decision 1: modules in our own source
+  # tree, loaded by studio-host; never a submodule patch). A CMake MODULE
+  # library producing a <name>.plugin CFBundle that libobs loads through the
+  # host's normal module load path. The 34.H2 rasterizer core stays a plain
+  # shared library (native-overlay-renderer) linked here rather than forked, so
+  # either Q-121 packaging answer stays cheap. Built only under HAS_LIBOBS.
+  set(STREAMMATE_OBS_INCLUDE_DIRS "${STREAMMATE_OBS_INCLUDE_DIR}")
+  if(STREAMMATE_OBS_DEPS_INCLUDE_DIR)
+    list(APPEND STREAMMATE_OBS_INCLUDE_DIRS "${STREAMMATE_OBS_DEPS_INCLUDE_DIR}")
+  endif()
+  if(STREAMMATE_OBS_GENERATED_INCLUDE_DIR)
+    list(APPEND STREAMMATE_OBS_INCLUDE_DIRS "${STREAMMATE_OBS_GENERATED_INCLUDE_DIR}")
+  endif()
+
+  add_library(streammate-native-overlay MODULE src/obs_module/native_overlay_obs_module.cpp)
+  set_target_properties(streammate-native-overlay PROPERTIES
+    BUNDLE TRUE
+    BUNDLE_EXTENSION plugin
+    PREFIX ""
+    OUTPUT_NAME streammate-native-overlay
+  )
+  target_compile_definitions(streammate-native-overlay PRIVATE STREAMMATE_HAS_LIBOBS=1)
+  target_include_directories(streammate-native-overlay PRIVATE ${STREAMMATE_OBS_INCLUDE_DIRS})
+  target_link_libraries(streammate-native-overlay PRIVATE native-overlay-renderer "${STREAMMATE_OBS_LIBRARY}")
+
+  # HAS_LIBOBS smoke: loads the module through libobs, creates the registered
+  # source, applies a fixture toast, drives one async render cycle, asserts a
+  # frame was delivered and that its hash equals the shared scaffold golden.
+  add_executable(native-overlay-module-smoke src/obs_module/native_overlay_module_smoke.cpp)
+  target_compile_definitions(native-overlay-module-smoke PRIVATE STREAMMATE_HAS_LIBOBS=1)
+  target_include_directories(native-overlay-module-smoke PRIVATE ${STREAMMATE_OBS_INCLUDE_DIRS})
+  target_link_libraries(native-overlay-module-smoke PRIVATE native-overlay-renderer "${STREAMMATE_OBS_LIBRARY}")
+
+  if(APPLE AND STREAMMATE_STUDIO_HOST_RPATHS)
+    # Both the dlopen-ed module and the smoke need to locate libobs.framework
+    # (and its deps) at load time via @rpath.
+    set_target_properties(streammate-native-overlay PROPERTIES BUILD_RPATH "${STREAMMATE_STUDIO_HOST_RPATHS}")
+    set_target_properties(native-overlay-module-smoke PROPERTIES BUILD_RPATH "${STREAMMATE_STUDIO_HOST_RPATHS}")
+  endif()
 else()
   foreach(target studio-host studio-host-smoke)
     target_compile_definitions(${target} PRIVATE STREAMMATE_HAS_LIBOBS=0)
@@ -95,6 +136,11 @@ if(BUILD_TESTING)
     NAME macos-ci-workflow
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_macos_ci_workflow.py
   )
+  add_test(
+    NAME native-overlay-module
+    COMMAND ${Python3_EXECUTABLE} -m unittest discover -s ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration -p test_native_overlay_module.py
+  )
+  set_tests_properties(native-overlay-module PROPERTIES WORKING_DIRECTORY ${CMAKE_CURRENT_SOURCE_DIR})
 endif()
 
 install(TARGETS studio-host studio-host-smoke RUNTIME DESTINATION bin)
