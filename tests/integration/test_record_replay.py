@@ -26,8 +26,10 @@ WORKFLOW = Path(__file__).resolve().parents[2] / ".github" / "workflows" / "maco
 
 def host_tcp_peers(pid: int) -> list[str]:
     """Every remote TCP endpoint the host process currently holds open."""
+    # `-a` ANDs the -p and -iTCP selectors; without it lsof ORs them and returns
+    # every TCP connection on the host, not just this process's.
     result = subprocess.run(
-        ["lsof", "-nP", "-p", str(pid), "-iTCP"],
+        ["lsof", "-nP", "-a", "-p", str(pid), "-iTCP"],
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
