@@ -192,6 +192,67 @@ class MacosPackagingTest(unittest.TestCase):
             )
             self.assertEqual(verify.returncode, 0, verify.stdout)
 
+    def make_streammate_plugin(self, root: Path, name: str = "streammate-native-overlay") -> Path:
+        # A minimal CFBundle .plugin layout matching what the CMake MODULE
+        # target emits and what the host's normal module load path enumerates
+        # (Contents/MacOS/<name>).
+        bundle = root / f"{name}.plugin"
+        binary = bundle / "Contents" / "MacOS" / name
+        binary.parent.mkdir(parents=True)
+        binary.write_text(f"fake {name} obs module\n", encoding="utf-8")
+        return bundle
+
+    def test_streammate_module_staged_into_obs_plugins_alongside_upstream(self) -> None:
+        # Spec 34 Capability 3 / chunk 34.H3: the in-tree Stream Mate OBS plugin
+        # module is staged under Contents/PlugIns/obs-plugins/ by package-app.sh
+        # alongside the upstream modules (loaded by the host's normal module load
+        # path). Q-121 provisional: in-host-repo tree, bundle-staged.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            inputs = self.build_input_tree(temp_root, name="inputs-streammate")
+            plugin = self.make_streammate_plugin(temp_root / "streammate-module")
+            result = self.package_from_inputs(
+                temp_root,
+                inputs,
+                extra=["--streammate-plugin", str(plugin)],
+                output_name="dist",
+            )
+            self.assertEqual(result.returncode, 0, result.stdout)
+            app = temp_root / "dist" / "StreamMateStudioHost.app"
+            plugins = app / "Contents" / "PlugIns" / "obs-plugins"
+            staged = plugins / "streammate-native-overlay.plugin"
+            self.assertTrue(
+                (staged / "Contents" / "MacOS" / "streammate-native-overlay").exists(),
+                "streammate-native-overlay.plugin missing from staged obs-plugins",
+            )
+            # Staged alongside (not instead of) the upstream modules.
+            for name in NESTED_PLUGINS:
+                self.assertTrue((plugins / f"{name}.plugin").exists())
+
+    @unittest.skipUnless(CODESIGN_AVAILABLE, "codesign unavailable (non-macOS)")
+    def test_streammate_module_gets_distinct_vendored_identity(self) -> None:
+        # The staged module is signed inside-out with its own namespaced
+        # identifier (never the outer com.streammate.studio-host), same as the
+        # upstream plugins — the ad-hoc, first-party in-tree module is not a
+        # third-party binary and does not change the signing approach (Q-123).
+        with tempfile.TemporaryDirectory() as temp_dir:
+            temp_root = Path(temp_dir)
+            inputs = self.build_input_tree(temp_root, name="inputs-streammate-sign")
+            plugin = self.make_streammate_plugin(temp_root / "streammate-module")
+            result = self.package_from_inputs(
+                temp_root,
+                inputs,
+                extra=["--streammate-plugin", str(plugin)],
+                codesign=True,
+                output_name="dist",
+            )
+            self.assertEqual(result.returncode, 0, result.stdout)
+            app = temp_root / "dist" / "StreamMateStudioHost.app"
+            staged = app / "Contents" / "PlugIns" / "obs-plugins" / "streammate-native-overlay.plugin"
+            identifier = self.codesign_identifier(staged)
+            self.assertEqual(identifier, VENDORED_PREFIX + "streammate-native-overlay")
+            self.assertNotEqual(identifier, OUTER_IDENTIFIER)
+
     def test_libobs_framework_is_required_for_l4_bundle(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_root = Path(temp_dir)
