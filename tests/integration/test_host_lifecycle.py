@@ -150,7 +150,11 @@ def recv_text(sock: socket.socket, timeout: float = 7.0) -> dict:
     if length == 126:
         length = struct.unpack("!H", sock.recv(2))[0]
     elif length == 127:
-        raise AssertionError("unexpected 64-bit frame")
+        # 64-bit extended length carries the native overlay raster PNG at 1280x720.
+        ext = b""
+        while len(ext) < 8:
+            ext += sock.recv(8 - len(ext))
+        length = struct.unpack("!Q", ext)[0]
     payload = b""
     while len(payload) < length:
         payload += sock.recv(length - len(payload))
@@ -931,6 +935,122 @@ class StudioHostLifecycleTest(unittest.TestCase):
         # The removed source no longer contributes to the offscreen composite.
         captured = rpc(sock, 225, "scene.captureFrame", {"sceneId": "rm-scene", "format": "png"})["result"]
         self.assertEqual(captured["sourceCount"], 0)
+
+    def test_native_overlay_source_is_explicit_opt_in_and_renders_action(self) -> None:
+        # Spec 34 Capability 2: source.create kind "native-overlay" is the explicit
+        # opt-in surface; it renders OverlayAction payloads at 1280x720 with
+        # apply->rendered timing keyed to the Spec 07 budget keys.
+        process, port, _ = start_host()
+        self.addCleanup(stop_process, process)
+        sock = websocket_connect(port)
+        self.addCleanup(sock.close)
+
+        created = rpc(
+            sock,
+            240,
+            "source.create",
+            {"sourceId": "phase-b-overlay", "kind": "native-overlay"},
+        )["result"]
+        self.assertTrue(created["ok"])
+        self.assertEqual(created["sourceId"], "phase-b-overlay")
+        self.assertEqual(created["kind"], "native-overlay")
+        self.assertEqual(created["renderer"], "native-overlay-rasterizer")
+        self.assertEqual(created["width"], 1280)
+        self.assertEqual(created["height"], 720)
+
+        applied = rpc(
+            sock,
+            241,
+            "source.update",
+            {
+                "sourceId": "phase-b-overlay",
+                "overlayAction": {
+                    "type": "toast",
+                    "layer": "foreground",
+                    "payload": {"message": "NOW LIVE", "tone": "success"},
+                },
+            },
+        )["result"]
+        self.assertTrue(applied["ok"])
+        self.assertEqual(applied["kind"], "native-overlay")
+        self.assertEqual(applied["category"], "toast")
+        self.assertEqual(set(applied["timing"].keys()), {"enterMs", "exitMs"})
+        self.assertFalse(applied["empty"])
+        decoded = base64.b64decode(applied["pngBase64"])
+        self.assertTrue(decoded.startswith(b"\x89PNG\r\n\x1a\n"))
+        self.assertEqual(struct.unpack("!II", decoded[16:24]), (1280, 720))
+
+        # clear empties the raster within one apply cycle.
+        cleared = rpc(
+            sock,
+            242,
+            "source.update",
+            {"sourceId": "phase-b-overlay", "overlayAction": {"type": "clear", "layer": "panic", "payload": {"reason": "panic"}}},
+        )["result"]
+        self.assertEqual(cleared["category"], "clear")
+        self.assertEqual(set(cleared["timing"].keys()), {"appliesMs"})
+        self.assertTrue(cleared["empty"])
+
+    def test_native_overlay_action_url_is_redacted(self) -> None:
+        process, port, _ = start_host()
+        self.addCleanup(stop_process, process)
+        sock = websocket_connect(port)
+        self.addCleanup(sock.close)
+
+        rpc(sock, 250, "source.create", {"sourceId": "gen-overlay", "kind": "native-overlay"})
+        secret_url = overlay_url_with_secret("native-overlay-secret")
+        applied = rpc(
+            sock,
+            251,
+            "source.update",
+            {
+                "sourceId": "gen-overlay",
+                "overlayAction": {
+                    "type": "generated-image",
+                    "payload": {"assetId": "img-1", "alt": "A CASTLE", "caption": "CASTLE", "url": secret_url},
+                },
+            },
+        )
+        self.assertTrue(applied["result"]["ok"])
+        self.assertEqual(applied["result"]["category"], "generated-image")
+        self.assertNotIn("native-overlay-secret", json.dumps(applied))
+        self.assertNotIn(secret_url, json.dumps(applied))
+
+    def test_session_without_native_overlay_instantiates_zero_renderer_state(self) -> None:
+        # Opt-in isolation: a session that never sends kind "native-overlay" holds
+        # zero native renderer state and the default browser source.create path is
+        # byte-compatible with pre-chunk behavior.
+        process, port, _ = start_host()
+        self.addCleanup(stop_process, process)
+        sock = websocket_connect(port)
+        self.addCleanup(sock.close)
+
+        health_before = rpc(sock, 260, "host.health")["result"]
+        self.assertEqual(health_before["nativeOverlaySourceCount"], 0)
+
+        rpc(sock, 261, "scene.load", {"sceneId": "iso-scene", "width": 64, "height": 36})
+        created = rpc(
+            sock,
+            262,
+            "source.create",
+            {"sceneId": "iso-scene", "sourceId": "browser-only", "kind": "browser", "url": "https://station.localhost/overlay"},
+        )["result"]
+        # Default browser create is byte-compatible with pre-chunk tests.
+        self.assertTrue(created["ok"])
+        self.assertEqual(created["kind"], "browser")
+        self.assertEqual(created["urlStatus"], "stored-redacted")
+        self.assertNotIn("renderer", created)
+
+        health_still_zero = rpc(sock, 263, "host.health")["result"]
+        self.assertEqual(health_still_zero["nativeOverlaySourceCount"], 0)
+
+        # Opting in instantiates exactly one native renderer; removing it returns to zero.
+        rpc(sock, 264, "source.create", {"sourceId": "opt-in", "kind": "native-overlay"})
+        health_opted = rpc(sock, 265, "host.health")["result"]
+        self.assertEqual(health_opted["nativeOverlaySourceCount"], 1)
+        rpc(sock, 266, "source.remove", {"sourceId": "opt-in"})
+        health_after = rpc(sock, 267, "host.health")["result"]
+        self.assertEqual(health_after["nativeOverlaySourceCount"], 0)
 
     def test_live_egress_refused_without_launch_flag_and_no_endpoint_contact(self) -> None:
         ingest = FakeRtmpIngest()

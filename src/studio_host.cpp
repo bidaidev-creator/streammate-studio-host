@@ -30,6 +30,8 @@
 #include <unistd.h>
 #include <vector>
 
+#include "native_overlay_renderer.h"
+
 #if defined(__APPLE__)
 #include <CoreGraphics/CoreGraphics.h>
 #include <mach-o/dyld.h>
@@ -409,7 +411,13 @@ bool send_text_frame(int fd, const std::string &payload) {
     frame.push_back(static_cast<uint8_t>((payload.size() >> 8) & 0xff));
     frame.push_back(static_cast<uint8_t>(payload.size() & 0xff));
   } else {
-    return false;
+    // 64-bit length frames carry the native overlay raster PNG, which exceeds the
+    // 16-bit frame limit at 1280x720 (RFC 6455 extended payload length).
+    frame.push_back(127);
+    const uint64_t len = payload.size();
+    for (int shift = 56; shift >= 0; shift -= 8) {
+      frame.push_back(static_cast<uint8_t>((len >> shift) & 0xff));
+    }
   }
   frame.insert(frame.end(), payload.begin(), payload.end());
   return send_all(fd, frame.data(), frame.size());
@@ -2128,6 +2136,156 @@ std::string output_error_to_rpc(const std::string &id, const std::string &result
   return renderer_error_to_rpc(id, result);
 }
 
+// Encode an RGBA buffer as a PNG (reuses the same hand-rolled encoder as the
+// scaffold offscreen path). Used to return the native overlay raster over the
+// control protocol for the parity capture driver (34.M3).
+std::vector<uint8_t> encode_rgba_png(const std::vector<uint8_t> &rgba, int width, int height) {
+  std::vector<uint8_t> raw;
+  raw.reserve(static_cast<size_t>((width * 4 + 1) * height));
+  for (int y = 0; y < height; ++y) {
+    raw.push_back(0); // filter: none
+    const size_t row = static_cast<size_t>(y) * static_cast<size_t>(width) * 4;
+    raw.insert(raw.end(), rgba.begin() + static_cast<long>(row),
+               rgba.begin() + static_cast<long>(row + static_cast<size_t>(width) * 4));
+  }
+  std::vector<uint8_t> png = {0x89, 'P', 'N', 'G', '\r', '\n', 0x1a, '\n'};
+  std::vector<uint8_t> ihdr;
+  append_be32(ihdr, static_cast<uint32_t>(width));
+  append_be32(ihdr, static_cast<uint32_t>(height));
+  ihdr.push_back(8);
+  ihdr.push_back(6);
+  ihdr.push_back(0);
+  ihdr.push_back(0);
+  ihdr.push_back(0);
+  append_png_chunk(png, "IHDR", ihdr);
+  append_png_chunk(png, "IDAT", zlib_store(raw));
+  append_png_chunk(png, "IEND", {});
+  return png;
+}
+
+std::string hex_u64(uint64_t value) {
+  char buf[17];
+  std::snprintf(buf, sizeof(buf), "%016llx", static_cast<unsigned long long>(value));
+  return std::string(buf);
+}
+
+std::string format_ms(double value) {
+  if (value < 0.0) value = 0.0;
+  char buf[64];
+  std::snprintf(buf, sizeof(buf), "%.3f", value);
+  return std::string(buf);
+}
+
+// Extract the raw JSON substring for an object-valued key (brace-matched).
+// Naive but sufficient for the controlled overlayAction payloads driven over the
+// loopback protocol; returns empty when the key is absent or not an object.
+std::string extract_json_object(const std::string &json, const std::string &key) {
+  const std::string needle = "\"" + key + "\"";
+  size_t pos = json.find(needle);
+  if (pos == std::string::npos) return "";
+  pos = json.find(':', pos + needle.size());
+  if (pos == std::string::npos) return "";
+  ++pos;
+  while (pos < json.size() && std::isspace(static_cast<unsigned char>(json[pos]))) ++pos;
+  if (pos >= json.size() || json[pos] != '{') return "";
+  size_t start = pos;
+  int depth = 0;
+  bool in_string = false;
+  for (; pos < json.size(); ++pos) {
+    char c = json[pos];
+    if (in_string) {
+      if (c == '\\') {
+        ++pos;
+        continue;
+      }
+      if (c == '"') in_string = false;
+      continue;
+    }
+    if (c == '"') {
+      in_string = true;
+    } else if (c == '{') {
+      ++depth;
+    } else if (c == '}') {
+      if (--depth == 0) return json.substr(start, pos - start + 1);
+    }
+  }
+  return "";
+}
+
+// Host-side glue for the explicit opt-in Phase B native overlay renderer.
+// Owns one NativeOverlayRenderer per opted-in source; a session that never sends
+// kind "native-overlay" constructs zero renderer state. Carries no product logic
+// (ADR-0005 Decision 2) — it routes payloads to the plain rasterizer library.
+class NativeOverlayManager {
+public:
+  std::string create(const std::string &request) {
+    std::string source_id = extract_json_string(request, "sourceId");
+    if (source_id.empty()) return error(-32602, "sourceId is required");
+    if (sources_.count(source_id)) return error(-32602, "source already exists");
+    auto entry = std::make_unique<Entry>();
+    entry->scene_id = extract_json_string(request, "sceneId");
+    sources_[source_id] = std::move(entry);
+    return "{\"ok\":true,\"sourceId\":\"" + json_escape(source_id) +
+           "\",\"kind\":\"native-overlay\",\"renderer\":\"native-overlay-rasterizer\",\"width\":" +
+           std::to_string(streammate::overlay::kOverlayWidth) + ",\"height\":" +
+           std::to_string(streammate::overlay::kOverlayHeight) + "}";
+  }
+
+  bool has(const std::string &source_id) const { return sources_.count(source_id) != 0; }
+
+  std::string apply(const std::string &request) {
+    std::string source_id = extract_json_string(request, "sourceId");
+    auto it = sources_.find(source_id);
+    if (it == sources_.end()) return error(-32602, "source not found");
+    std::string action = extract_json_object(request, "overlayAction");
+    if (action.empty()) return error(-32602, "overlayAction object is required");
+
+    streammate::overlay::NativeOverlayRenderer &renderer = it->second->renderer;
+    streammate::overlay::OverlayRasterResult res = renderer.apply(action);
+    if (!res.ok) return error(-32602, res.error.empty() ? "unsupported overlay action" : res.error);
+
+    std::string timing = "{";
+    bool first = true;
+    for (const auto &kv : res.timing) {
+      if (!first) timing += ",";
+      first = false;
+      timing += "\"" + json_escape(kv.first) + "\":" + format_ms(kv.second);
+    }
+    timing += "}";
+
+    std::vector<uint8_t> png = encode_rgba_png(renderer.rgba(), renderer.width(), renderer.height());
+    std::string out = "{\"ok\":true,\"sourceId\":\"" + json_escape(source_id) +
+                      "\",\"kind\":\"native-overlay\",\"category\":\"" + json_escape(res.category) +
+                      "\",\"timing\":" + timing + ",\"rasterHash\":\"" + hex_u64(res.raster_hash) +
+                      "\",\"empty\":" + std::string(res.empty ? "true" : "false");
+    if (!res.trigger_record.empty()) {
+      out += ",\"trigger\":\"" + json_escape(res.trigger_record) + "\"";
+    }
+    out += ",\"pngBase64\":\"" + base64(png.data(), png.size()) + "\"}";
+    return out;
+  }
+
+  std::string remove_source(const std::string &request) {
+    std::string source_id = extract_json_string(request, "sourceId");
+    auto it = sources_.find(source_id);
+    if (it == sources_.end()) return error(-32602, "source not found");
+    sources_.erase(it);
+    return "{\"ok\":true,\"sourceId\":\"" + json_escape(source_id) + "\",\"removed\":true}";
+  }
+
+  size_t count() const { return sources_.size(); }
+
+private:
+  struct Entry {
+    std::string scene_id;
+    streammate::overlay::NativeOverlayRenderer renderer;
+  };
+  std::string error(int code, const std::string &message) const {
+    return "__error__:" + std::to_string(code) + ":" + message;
+  }
+  std::map<std::string, std::unique_ptr<Entry>> sources_;
+};
+
 class ControlServer {
 public:
   ControlServer(Options options, EngineLifecycle &engine, StateFile &state) : options_(std::move(options)), engine_(engine), state_(state) {
@@ -2234,7 +2392,8 @@ private:
                                       "\",\"heartbeatMs\":" + std::to_string(kHeartbeatMs) + "}"));
     } else if (method == "host.health") {
       send_text_frame(fd, rpc_result(id, "{\"status\":\"ready\",\"engineStarted\":" + std::string(engine_.started() ? "true" : "false") +
-                                      ",\"heartbeatMs\":" + std::to_string(kHeartbeatMs) + "}"));
+                                      ",\"heartbeatMs\":" + std::to_string(kHeartbeatMs) +
+                                      ",\"nativeOverlaySourceCount\":" + std::to_string(native_overlays_.count()) + "}"));
     } else if (method == "host.exerciseTccPrompts") {
       send_renderer_result(fd, id, importer_.exercise_tcc_prompts(payload));
     } else if (method == "scene.load") {
@@ -2246,11 +2405,29 @@ private:
     } else if (method == "scene.itemTransform") {
       send_renderer_result(fd, id, renderer_.item_transform(payload));
     } else if (method == "source.remove") {
-      send_renderer_result(fd, id, renderer_.remove_source(payload));
+      // Explicit opt-in Phase B native overlay sources are routed to their own
+      // manager; every other id stays on the scaffold browser-source path.
+      std::string source_id = extract_json_string(payload, "sourceId");
+      if (native_overlays_.has(source_id)) {
+        send_renderer_result(fd, id, native_overlays_.remove_source(payload));
+      } else {
+        send_renderer_result(fd, id, renderer_.remove_source(payload));
+      }
     } else if (method == "source.create") {
-      send_renderer_result(fd, id, renderer_.create_source(payload));
+      // kind "native-overlay" is the explicit opt-in surface (Spec 34 Capability
+      // 2); the default browser create path is untouched (ADR-0003 stands).
+      if (extract_json_string(payload, "kind") == "native-overlay") {
+        send_renderer_result(fd, id, native_overlays_.create(payload));
+      } else {
+        send_renderer_result(fd, id, renderer_.create_source(payload));
+      }
     } else if (method == "source.update") {
-      send_renderer_result(fd, id, renderer_.update_source(payload));
+      std::string source_id = extract_json_string(payload, "sourceId");
+      if (native_overlays_.has(source_id)) {
+        send_renderer_result(fd, id, native_overlays_.apply(payload));
+      } else {
+        send_renderer_result(fd, id, renderer_.update_source(payload));
+      }
     } else if (method == "source.mute") {
       send_renderer_result(fd, id, renderer_.mute_source(payload));
     } else if (method == "scene.captureFrame") {
@@ -2299,6 +2476,7 @@ private:
   EngineLifecycle &engine_;
   StateFile &state_;
   RendererState renderer_;
+  NativeOverlayManager native_overlays_;
   ObsImporter importer_;
   OutputController output_;
   int port_ = 0;

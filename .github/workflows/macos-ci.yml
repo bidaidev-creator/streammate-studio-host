@@ -38,7 +38,7 @@ jobs:
         run: cmake -S . -B build/scaffold -G Ninja -DSTREAMMATE_REQUIRE_LIBOBS=OFF
 
       - name: Build scaffold host and smoke
-        run: cmake --build build/scaffold --target studio-host studio-host-smoke
+        run: cmake --build build/scaffold --target studio-host studio-host-smoke native-overlay-renderer-test
 
       - name: Run scaffold smoke
         run: ./build/scaffold/studio-host-smoke
