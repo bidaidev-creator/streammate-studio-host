@@ -179,13 +179,15 @@ class ProductionControlVerbTest(unittest.TestCase):
         _, sock = self._connect()
         self._synthetic_scene(sock)
 
-        self._assert_rpc_error(sock, 425, "sceneItem.setOrder", {"sceneId": SCENE_ID, "itemId": SOURCE_ID, "position": 0})
-        self._assert_rpc_error(
+        missing = self._assert_rpc_error(sock, 425, "sceneItem.setOrder", {"sceneId": SCENE_ID, "itemId": SOURCE_ID, "position": 0})
+        self.assertEqual(missing["error"]["message"], "idempotencyToken is required")
+        invalid = self._assert_rpc_error(
             sock,
             426,
             "sceneItem.setOrder",
             {"sceneId": SCENE_ID, "itemId": SOURCE_ID, "position": 0, "idempotencyToken": "bad token"},
         )
+        self.assertEqual(invalid["error"]["message"], "idempotencyToken is invalid")
 
     def test_filter_settings_unknown_key_is_refused_fail_closed(self) -> None:
         _, sock = self._connect()
@@ -278,6 +280,16 @@ class ProductionControlVerbTest(unittest.TestCase):
                 582,
                 f'{{"jsonrpc":"2.0","id":582,"method":"filter.setSettings","params":{{"sourceId":"{SOURCE_ID}",'
                 f'"filterId":"{FILTER_ID}","settings":{{"key_color_type":"green\\q"}}}}}}',
+            ),
+            (
+                583,
+                f'{{"jsonrpc":"2.0","id":583,"method":"filter.setSettings","params":{{"sourceId":"{SOURCE_ID}",'
+                f'"filterId":"{FILTER_ID}","settings":{{,"brightness":1}}}}}}',
+            ),
+            (
+                584,
+                f'{{"jsonrpc":"2.0","id":584,"method":"filter.setSettings","params":{{"sourceId":"{SOURCE_ID}",'
+                f'"filterId":"{FILTER_ID}","settings":{{"brightness":1,,"contrast":2}}}}}}',
             ),
         ]
         for rpc_id, raw in raw_cases:
