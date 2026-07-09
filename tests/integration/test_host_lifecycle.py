@@ -257,6 +257,7 @@ def write_obs_fixture(root: Path) -> Path:
         "name": "Fixture Main",
         "sources": [
             {"name": "Main", "id": "scene"},
+            {"name": "Caf\u00e9 Cam", "id": "av_capture_input", "device_id": "fixture-cafe-camera"},
             {"name": "Color Backdrop", "id": "color_source"},
             {"id": "color_source", "name": "ID First Color"},
             {"name": "Station Overlay", "id": "browser_source", "filters": [{"name": "LUT", "id": "color_filter_v2"}]},
@@ -317,6 +318,7 @@ def expected_import_report(service_key_action: str = "requires-consent") -> dict
             {"id": "source:Media Clip", "kind": "source", "label": "Media Clip", "state": "mapped", "reason": "mapped_native", "moduleName": "ffmpeg_source"},
         ],
         "degraded": [
+            {"id": "source:Caf\u00e9 Cam", "kind": "source", "label": "Caf\u00e9 Cam", "state": "degraded", "reason": "permission_required", "moduleName": "av_capture_input", "tccClass": "camera", "notes": ["Native import defers camera permission until explicit operator approval."]},
             {"id": "source:Face Camera", "kind": "source", "label": "Face Camera", "state": "degraded", "reason": "permission_required", "moduleName": "av_capture_input", "tccClass": "camera", "notes": ["Native import defers camera permission until explicit operator approval."]},
             {"id": "source:Desk Mic", "kind": "source", "label": "Desk Mic", "state": "degraded", "reason": "permission_required", "moduleName": "coreaudio_input_capture", "tccClass": "microphone", "notes": ["Native import defers microphone permission until explicit operator approval."]},
             {"id": "source:Screen Share", "kind": "source", "label": "Screen Share", "state": "degraded", "reason": "permission_required", "moduleName": "screen_capture", "tccClass": "screen", "notes": ["Native import defers screen permission until explicit operator approval."]},
@@ -395,7 +397,7 @@ class StudioHostLifecycleTest(unittest.TestCase):
                         {
                             "collectionId": "fixture-main",
                             "name": "Fixture Main",
-                            "sourceCount": 12,
+                            "sourceCount": 13,
                             "profileCount": 1,
                             "serviceKeyAction": "requires-consent",
                         }
@@ -412,11 +414,11 @@ class StudioHostLifecycleTest(unittest.TestCase):
                 {
                     "mode": "scaffold-no-tcc",
                     "promptCapable": False,
-                    "cameraCount": 2,
+                    "cameraCount": 3,
                     "microphoneCount": 1,
                     "screenCount": 1,
                     "instantiatedCount": 0,
-                    "deferredCount": 4,
+                    "deferredCount": 5,
                     "failedCount": 0,
                 },
             )

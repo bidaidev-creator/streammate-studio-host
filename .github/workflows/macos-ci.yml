@@ -59,6 +59,7 @@ jobs:
             -DCMAKE_C_FLAGS="-Wno-error=deprecated-declarations" \
             -DCMAKE_CXX_FLAGS="-Wno-error=deprecated-declarations" \
             -DENABLE_UI=OFF \
+            -DENABLE_SERVICE_UPDATES=OFF \
             -DENABLE_SCRIPTING=OFF \
             -DENABLE_WEBRTC=OFF \
             -DENABLE_VST=OFF \
@@ -180,6 +181,14 @@ jobs:
           cp -R dist/StreamMateStudioHost.app "$scratch/"
           "$scratch/StreamMateStudioHost.app/Contents/MacOS/studio-host-smoke" --version
           (cd dist && shasum -a 256 -c sha256-manifest.txt)
+
+      - name: Run HAS_LIBOBS production-control verb smoke against packaged app
+        run: |
+          # The raw build/host binary cannot dlopen libobs-opengl.dylib (Frameworks
+          # only exist inside the packaged bundle), so the verb smoke runs against
+          # the relocatable app exactly as an installed host would.
+          python3 tests/integration/test_production_control_verbs.py \
+            dist/StreamMateStudioHost.app/Contents/MacOS/studio-host
 
       - name: Verify inside-out ad-hoc signature before upload
         run: |

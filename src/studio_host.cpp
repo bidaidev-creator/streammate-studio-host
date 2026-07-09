@@ -9,16 +9,20 @@
 #include <cstdint>
 #include <cstdlib>
 #include <cstring>
+#include <cmath>
 #include <fcntl.h>
 #include <filesystem>
 #include <cerrno>
 #include <fstream>
+#include <functional>
+#include <iomanip>
 #include <iostream>
 #include <limits.h>
 #include <map>
 #include <netinet/in.h>
 #include <optional>
 #include <regex>
+#include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -39,6 +43,8 @@
 
 #if STREAMMATE_HAS_LIBOBS
 #include <obs.h>
+#include <callback/calldata.h>
+#include <callback/proc.h>
 #endif
 
 namespace {
@@ -46,6 +52,7 @@ constexpr const char *kVersion = STREAMMATE_STUDIO_HOST_VERSION;
 constexpr int kUsageExit = 64;
 constexpr int kRuntimeExit = 70;
 constexpr int kHeartbeatMs = 5000;
+constexpr int kMaxSceneItemPosition = 1000000;
 constexpr std::uintmax_t kMaxSceneCollectionBytes = 8 * 1024 * 1024;
 constexpr const char *kWebSocketGuid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 volatile std::sig_atomic_t g_stop = 0;
@@ -537,6 +544,54 @@ std::optional<bool> extract_json_bool(const std::string &json, const std::string
   return std::nullopt;
 }
 
+std::optional<std::string> extract_json_object_body(const std::string &json, const std::string &key) {
+  std::string marker = "\"" + key + "\"";
+  auto pos = json.find(marker);
+  if (pos == std::string::npos) return std::nullopt;
+  pos = json.find(':', pos);
+  if (pos == std::string::npos) return std::nullopt;
+  pos = json.find_first_not_of(" \t\r\n", pos + 1);
+  if (pos == std::string::npos || json[pos] != '{') return std::nullopt;
+
+  size_t start = pos + 1;
+  int depth = 0;
+  bool in_string = false;
+  bool escape = false;
+  for (; pos < json.size(); ++pos) {
+    char c = json[pos];
+    if (in_string) {
+      if (escape) {
+        escape = false;
+      } else if (c == '\\') {
+        escape = true;
+      } else if (c == '"') {
+        in_string = false;
+      }
+      continue;
+    }
+    if (c == '"') {
+      in_string = true;
+    } else if (c == '{') {
+      ++depth;
+    } else if (c == '}') {
+      --depth;
+      if (depth == 0) return json.substr(start, pos - start);
+    }
+  }
+  return std::nullopt;
+}
+
+std::optional<std::string> parse_json_string_token(const std::string &json, size_t &pos);
+void skip_json_whitespace(const std::string &json, size_t &pos);
+
+bool is_safe_protocol_id(const std::string &value) {
+  if (value.empty() || value.size() > 255) return false;
+  for (unsigned char c : value) {
+    if (!(std::isalnum(c) || c == '.' || c == '_' || c == '-')) return false;
+  }
+  return true;
+}
+
 std::string rpc_result(const std::string &id, const std::string &result) {
   return "{\"jsonrpc\":\"2.0\",\"id\":" + id + ",\"result\":" + result + "}";
 }
@@ -661,10 +716,38 @@ struct SourceModel {
   int height = 72;
   double opacity = 1.0;
   bool muted = false;
+  bool visible = true;
+  int position = 0;
+  double volume_db = 0.0;
+  std::string media_action = "stop";
+  int browser_refresh_count = 0;
+};
+
+enum class FilterSettingKind { Number, Bool, String };
+
+struct FilterSettingValue {
+  FilterSettingKind kind = FilterSettingKind::String;
+  double number_value = 0.0;
+  bool bool_value = false;
+  std::string string_value;
+};
+
+struct FilterModel {
+  std::string id;
+  std::string kind;
+  std::string label;
+  bool enabled = true;
+  std::map<std::string, FilterSettingValue> settings;
 };
 
 class RendererState {
 public:
+  ~RendererState() {
+#if STREAMMATE_HAS_LIBOBS
+    release_obs_mirrors();
+#endif
+  }
+
   std::string load_scene(const std::string &request) {
     std::string scene_id = extract_json_string(request, "sceneId");
     if (scene_id.empty()) return rpc_error_result(-32602, "sceneId is required");
@@ -681,6 +764,9 @@ public:
     if (!background.empty()) scene.background = parse_color(background);
     scenes_[scene_id] = scene;
     if (program_scene_id_.empty()) program_scene_id_ = scene_id;
+#if STREAMMATE_HAS_LIBOBS
+    mirror_scene_load(scene_id);
+#endif
     return "{\"ok\":true,\"sceneId\":\"" + json_escape(scene_id) + "\",\"width\":" + std::to_string(width) +
            ",\"height\":" + std::to_string(height) + ",\"renderer\":\"offscreen-scaffold\"}";
   }
@@ -689,6 +775,9 @@ public:
     std::string scene_id = extract_json_string(request, "sceneId");
     if (scene_id.empty() || scenes_.find(scene_id) == scenes_.end()) return rpc_error_result(-32602, "scene not loaded");
     program_scene_id_ = scene_id;
+#if STREAMMATE_HAS_LIBOBS
+    mirror_set_program(scene_id);
+#endif
     return "{\"ok\":true,\"programSceneId\":\"" + json_escape(scene_id) + "\"}";
   }
 
@@ -712,7 +801,12 @@ public:
     source.height = extract_json_int(request, "height").value_or(scene.height);
     source.opacity = std::clamp(extract_json_double(request, "opacity").value_or(1.0), 0.0, 1.0);
     source.muted = extract_json_bool(request, "muted").value_or(false);
+    source.position = next_position(scene_id);
     sources_[source_id] = source;
+    filters_[source_id] = {default_filter()};
+#if STREAMMATE_HAS_LIBOBS
+    mirror_source_create(sources_[source_id]);
+#endif
     return source_result(source, true);
   }
 
@@ -734,9 +828,135 @@ public:
     std::string source_id = extract_json_string(request, "sourceId");
     auto it = sources_.find(source_id);
     if (source_id.empty() || it == sources_.end()) return rpc_error_result(-32602, "source not found");
-    it->second.muted = extract_json_bool(request, "muted").value_or(true);
+    const bool muted = extract_json_bool(request, "muted").value_or(true);
+#if STREAMMATE_HAS_LIBOBS
+    if (!mirror_mute_source(source_id, muted)) return rpc_error_result(-32603, "libobs source unavailable");
+#endif
+    it->second.muted = muted;
     return "{\"ok\":true,\"sourceId\":\"" + json_escape(source_id) + "\",\"muted\":" +
            std::string(it->second.muted ? "true" : "false") + "}";
+  }
+
+  std::string set_item_visible(const std::string &request) {
+    std::string scene_id = extract_json_string(request, "sceneId");
+    std::string item_id = extract_json_string(request, "itemId");
+    auto it = sources_.find(item_id);
+    if (scene_id.empty() || scenes_.find(scene_id) == scenes_.end()) return rpc_error_result(-32602, "scene not loaded");
+    if (item_id.empty() || it == sources_.end() || it->second.scene_id != scene_id) return rpc_error_result(-32602, "scene item not found");
+    auto visible = extract_json_bool(request, "visible");
+    if (!visible) return rpc_error_result(-32602, "visible is required");
+#if STREAMMATE_HAS_LIBOBS
+    if (!mirror_item_visible(scene_id, item_id, *visible)) return rpc_error_result(-32603, "libobs scene item unavailable");
+#endif
+    it->second.visible = *visible;
+    return "{\"ok\":true,\"sceneId\":\"" + json_escape(scene_id) + "\",\"itemId\":\"" + json_escape(item_id) +
+           "\",\"visible\":" + std::string(*visible ? "true" : "false") + "}";
+  }
+
+  std::string set_item_order(const std::string &request) {
+    std::string scene_id = extract_json_string(request, "sceneId");
+    std::string item_id = extract_json_string(request, "itemId");
+    auto it = sources_.find(item_id);
+    if (scene_id.empty() || scenes_.find(scene_id) == scenes_.end()) return rpc_error_result(-32602, "scene not loaded");
+    if (item_id.empty() || it == sources_.end() || it->second.scene_id != scene_id) return rpc_error_result(-32602, "scene item not found");
+    std::string idempotency_token = extract_json_string(request, "idempotencyToken");
+    if (request.find("\"idempotencyToken\"") == std::string::npos) {
+      return rpc_error_result(-32602, "idempotencyToken is required");
+    }
+    if (!is_safe_protocol_id(idempotency_token)) return rpc_error_result(-32602, "idempotencyToken is invalid");
+    auto position = extract_json_int(request, "position");
+    if (!position || *position < 0 || *position > kMaxSceneItemPosition) {
+      return rpc_error_result(-32602, "position must be a bounded non-negative integer");
+    }
+#if STREAMMATE_HAS_LIBOBS
+    if (!mirror_item_order(scene_id, item_id, *position)) return rpc_error_result(-32603, "libobs scene item unavailable");
+#endif
+    it->second.position = *position;
+    return "{\"ok\":true,\"sceneId\":\"" + json_escape(scene_id) + "\",\"itemId\":\"" + json_escape(item_id) +
+           "\",\"position\":" + std::to_string(*position) + "}";
+  }
+
+  std::string list_filters(const std::string &request) {
+    std::string source_id = extract_json_string(request, "sourceId");
+    if (source_id.empty() || sources_.find(source_id) == sources_.end()) return rpc_error_result(-32602, "source not found");
+#if STREAMMATE_HAS_LIBOBS
+    mirror_list_filters(source_id);
+#endif
+    return filter_list_json(source_id);
+  }
+
+  std::string set_filter_enabled(const std::string &request) {
+    std::string source_id = extract_json_string(request, "sourceId");
+    std::string filter_id = extract_json_string(request, "filterId");
+    auto filter = find_filter(source_id, filter_id);
+    if (!filter) return rpc_error_result(-32602, "filter not found");
+    auto enabled = extract_json_bool(request, "enabled");
+    if (!enabled) return rpc_error_result(-32602, "enabled is required");
+#if STREAMMATE_HAS_LIBOBS
+    if (!mirror_filter_enabled(source_id, filter_id, *enabled)) return rpc_error_result(-32603, "libobs filter unavailable");
+#endif
+    filter->get().enabled = *enabled;
+    return "{\"ok\":true,\"sourceId\":\"" + json_escape(source_id) + "\",\"filterId\":\"" + json_escape(filter_id) +
+           "\",\"enabled\":" + std::string(*enabled ? "true" : "false") + "}";
+  }
+
+  std::string set_filter_settings(const std::string &request) {
+    std::string source_id = extract_json_string(request, "sourceId");
+    std::string filter_id = extract_json_string(request, "filterId");
+    auto filter = find_filter(source_id, filter_id);
+    if (!filter) return rpc_error_result(-32602, "filter not found");
+    auto parsed = parse_filter_settings(request);
+    if (!parsed.ok) return rpc_error_result(-32602, parsed.error);
+#if STREAMMATE_HAS_LIBOBS
+    if (!mirror_filter_settings(source_id, filter_id, parsed.settings)) return rpc_error_result(-32603, "libobs filter unavailable");
+#endif
+    for (const auto &entry : parsed.settings) filter->get().settings[entry.first] = entry.second;
+    return "{\"ok\":true,\"sourceId\":\"" + json_escape(source_id) + "\",\"filterId\":\"" + json_escape(filter_id) +
+           "\",\"settings\":" + settings_json(parsed.settings) + "}";
+  }
+
+  std::string set_audio_volume(const std::string &request) {
+    std::string source_id = extract_json_string(request, "sourceId");
+    auto it = sources_.find(source_id);
+    if (source_id.empty() || it == sources_.end()) return rpc_error_result(-32602, "source not found");
+    auto volume_db = extract_json_double(request, "volumeDb");
+    if (!volume_db || !std::isfinite(*volume_db) || *volume_db < -100.0 || *volume_db > 26.0) {
+      return rpc_error_result(-32602, "volumeDb must be a finite number between -100 and 26");
+    }
+    const bool muted = *volume_db <= -100.0;
+#if STREAMMATE_HAS_LIBOBS
+    if (!mirror_audio_volume(source_id, *volume_db, muted)) return rpc_error_result(-32603, "libobs source unavailable");
+#endif
+    it->second.volume_db = *volume_db;
+    // OBS treats the bottom of the fader as silence; mirror that as explicit mute at -100 dB.
+    it->second.muted = muted;
+    return "{\"ok\":true,\"sourceId\":\"" + json_escape(source_id) + "\",\"volumeDb\":" + json_number(*volume_db) + "}";
+  }
+
+  std::string media_control(const std::string &request) {
+    std::string source_id = extract_json_string(request, "sourceId");
+    std::string action = extract_json_string(request, "action");
+    auto it = sources_.find(source_id);
+    if (source_id.empty() || it == sources_.end()) return rpc_error_result(-32602, "source not found");
+    if (action != "play" && action != "pause" && action != "restart" && action != "stop") {
+      return rpc_error_result(-32602, "action must be one of play, pause, restart, stop");
+    }
+#if STREAMMATE_HAS_LIBOBS
+    if (!mirror_media_control(source_id, action)) return rpc_error_result(-32603, "libobs source unavailable");
+#endif
+    it->second.media_action = action;
+    return "{\"ok\":true,\"sourceId\":\"" + json_escape(source_id) + "\",\"action\":\"" + json_escape(action) + "\"}";
+  }
+
+  std::string refresh_browser(const std::string &request) {
+    std::string source_id = extract_json_string(request, "sourceId");
+    auto it = sources_.find(source_id);
+    if (source_id.empty() || it == sources_.end()) return rpc_error_result(-32602, "source not found");
+#if STREAMMATE_HAS_LIBOBS
+    if (!mirror_refresh_browser(source_id)) return rpc_error_result(-32603, "libobs browser refresh unavailable");
+#endif
+    ++it->second.browser_refresh_count;
+    return "{\"ok\":true,\"sourceId\":\"" + json_escape(source_id) + "\",\"refreshed\":true}";
   }
 
   std::string capture_frame(const std::string &request) {
@@ -804,11 +1024,21 @@ public:
     std::string source_id = extract_json_string(request, "sourceId");
     auto it = sources_.find(source_id);
     if (source_id.empty() || it == sources_.end()) return rpc_error_result(-32602, "source not found");
+#if STREAMMATE_HAS_LIBOBS
+    release_obs_source(source_id);
+#endif
+    filters_.erase(source_id);
     sources_.erase(it);
     return "{\"ok\":true,\"sourceId\":\"" + json_escape(source_id) + "\",\"removed\":true}";
   }
 
 private:
+  struct ParsedSettings {
+    bool ok = false;
+    std::string error;
+    std::map<std::string, FilterSettingValue> settings;
+  };
+
   std::string rpc_error_result(int code, const std::string &message) const {
     return "__error__:" + std::to_string(code) + ":" + message;
   }
@@ -820,6 +1050,166 @@ private:
            std::string(url_touched || !source.url.empty() ? "stored-redacted" : "empty") + "\"}";
   }
 
+  int next_position(const std::string &scene_id) const {
+    int position = 0;
+    for (const auto &entry : sources_) {
+      if (entry.second.scene_id == scene_id) position = std::max(position, entry.second.position + 1);
+    }
+    return position;
+  }
+
+  static FilterModel default_filter() {
+    return {"color-correction", "color_filter_v2", "Color Correction", true, {}};
+  }
+
+  std::optional<std::reference_wrapper<FilterModel>> find_filter(const std::string &source_id, const std::string &filter_id) {
+    if (source_id.empty() || sources_.find(source_id) == sources_.end() || filter_id.empty()) return std::nullopt;
+    auto list = filters_.find(source_id);
+    if (list == filters_.end()) return std::nullopt;
+    for (FilterModel &filter : list->second) {
+      if (filter.id == filter_id) return filter;
+    }
+    return std::nullopt;
+  }
+
+  std::string filter_list_json(const std::string &source_id) const {
+    auto it = filters_.find(source_id);
+    std::string out = "{\"sourceId\":\"" + json_escape(source_id) + "\",\"filters\":[";
+    if (it != filters_.end()) {
+      for (size_t i = 0; i < it->second.size(); ++i) {
+        const FilterModel &filter = it->second[i];
+        if (i) out += ",";
+        out += "{\"filterId\":\"" + json_escape(filter.id) + "\",\"filterKind\":\"" + json_escape(filter.kind) +
+               "\",\"label\":\"" + json_escape(filter.label) + "\",\"enabled\":" +
+               std::string(filter.enabled ? "true" : "false") + "}";
+      }
+    }
+    out += "]}";
+    return out;
+  }
+
+  static const std::set<std::string> &known_filter_setting_keys() {
+    static const std::set<std::string> keys = {
+        "brightness", "contrast", "gamma", "saturation", "hue_shift", "opacity", "color_multiply", "color_add",
+        "similarity", "smoothness", "spill", "key_color_type", "key_color", "left", "right", "top", "bottom",
+        "relative", "db", "gain_db", "ratio", "threshold", "open_threshold", "close_threshold", "attack_time",
+        "hold_time", "release_time", "suppress_level", "sharpness"};
+    return keys;
+  }
+
+  static bool settings_string_refused(const std::string &value) {
+    static const std::regex url_scheme("[A-Za-z][A-Za-z0-9+.-]*://");
+    static const std::regex scheme_relative("(^|\\s)//");
+    static const std::regex windows_absolute("^[A-Za-z]:[\\\\/]");
+    static const std::regex live_or_secret_key("\\b(live|sk)_[A-Za-z0-9_-]+\\b", std::regex_constants::icase);
+    static const std::regex query_key("(^|[?&\\s])key=[A-Za-z0-9_-]+", std::regex_constants::icase);
+
+    std::string lower;
+    lower.reserve(value.size());
+    for (unsigned char c : value) lower.push_back(static_cast<char>(std::tolower(c)));
+
+    return std::regex_search(value, url_scheme) || std::regex_search(value, scheme_relative) ||
+           value.rfind("/", 0) == 0 || value.rfind("~/", 0) == 0 || std::regex_search(value, windows_absolute) ||
+           lower.rfind("stm_", 0) == 0 || lower.find("stream-key") != std::string::npos ||
+           lower.find("secret") != std::string::npos || std::regex_search(value, live_or_secret_key) ||
+           std::regex_search(value, query_key);
+  }
+
+  ParsedSettings parse_filter_settings(const std::string &request) const {
+    auto body = extract_json_object_body(request, "settings");
+    if (!body) return {false, "settings must be an object of known filter-settings keys", {}};
+    ParsedSettings parsed;
+    size_t pos = 0;
+    bool first = true;
+    while (true) {
+      skip_json_whitespace(*body, pos);
+      if (pos >= body->size()) break;
+      if (!first) {
+        if ((*body)[pos] != ',') return {false, "settings entries must be separated by commas", {}};
+        ++pos;
+        skip_json_whitespace(*body, pos);
+        if (pos >= body->size() || (*body)[pos] == ',') {
+          return {false, "settings entries must be separated by commas", {}};
+        }
+      } else if ((*body)[pos] == ',') {
+        return {false, "settings entries must be separated by commas", {}};
+      }
+      auto key = parse_json_string_token(*body, pos);
+      if (!key) return {false, "settings must contain string keys", {}};
+      if (known_filter_setting_keys().find(*key) == known_filter_setting_keys().end()) {
+        return {false, "unknown filter-settings key (refused fail-closed)", {}};
+      }
+      skip_json_whitespace(*body, pos);
+      if (pos >= body->size() || (*body)[pos] != ':') return {false, "settings must contain key/value pairs", {}};
+      ++pos;
+      skip_json_whitespace(*body, pos);
+      if (pos >= body->size()) return {false, "settings value is required", {}};
+
+      FilterSettingValue value;
+      if ((*body)[pos] == '"') {
+        auto string_value = parse_json_string_token(*body, pos);
+        if (!string_value || string_value->empty() || string_value->size() > 120 || settings_string_refused(*string_value)) {
+          return {false, "filter-settings string value refused", {}};
+        }
+        value.kind = FilterSettingKind::String;
+        value.string_value = *string_value;
+      } else if (body->compare(pos, 4, "true") == 0) {
+        value.kind = FilterSettingKind::Bool;
+        value.bool_value = true;
+        pos += 4;
+      } else if (body->compare(pos, 5, "false") == 0) {
+        value.kind = FilterSettingKind::Bool;
+        value.bool_value = false;
+        pos += 5;
+      } else {
+        size_t end = body->find_first_not_of("-0123456789.eE+", pos);
+        try {
+          value.kind = FilterSettingKind::Number;
+          value.number_value = std::stod(body->substr(pos, end == std::string::npos ? std::string::npos : end - pos));
+          if (!std::isfinite(value.number_value)) return {false, "filter-settings number must be finite", {}};
+          if (std::fabs(value.number_value) > 1000000.0) return {false, "filter-settings number is out of range", {}};
+          pos = end == std::string::npos ? body->size() : end;
+        } catch (...) {
+          return {false, "filter-settings values must be primitive", {}};
+        }
+      }
+      parsed.settings[*key] = value;
+      first = false;
+      skip_json_whitespace(*body, pos);
+      if (pos < body->size() && (*body)[pos] != ',') return {false, "settings entries must be separated by commas", {}};
+    }
+    if (parsed.settings.empty()) return {false, "settings must set at least one known filter-settings key", {}};
+    parsed.ok = true;
+    return parsed;
+  }
+
+  static std::string json_number(double value) {
+    std::ostringstream out;
+    out << std::setprecision(17) << value;
+    return out.str();
+  }
+
+  static std::string setting_value_json(const FilterSettingValue &value) {
+    switch (value.kind) {
+    case FilterSettingKind::Number: return json_number(value.number_value);
+    case FilterSettingKind::Bool: return value.bool_value ? "true" : "false";
+    case FilterSettingKind::String: return "\"" + json_escape(value.string_value) + "\"";
+    }
+    return "null";
+  }
+
+  static std::string settings_json(const std::map<std::string, FilterSettingValue> &settings) {
+    std::string out = "{";
+    bool first = true;
+    for (const auto &entry : settings) {
+      if (!first) out += ",";
+      first = false;
+      out += "\"" + json_escape(entry.first) + "\":" + setting_value_json(entry.second);
+    }
+    out += "}";
+    return out;
+  }
+
   std::vector<uint8_t> render_png(const SceneModel &scene) const {
     std::vector<uint8_t> raw;
     raw.reserve(static_cast<size_t>((scene.width * 4 + 1) * scene.height));
@@ -829,7 +1219,7 @@ private:
         Rgba pixel = scene.background;
         for (const auto &entry : sources_) {
           const SourceModel &source = entry.second;
-          if (source.scene_id != scene.id || source.muted) continue;
+          if (source.scene_id != scene.id || source.muted || !source.visible) continue;
           if (x >= source.x && y >= source.y && x < source.x + source.width && y < source.y + source.height) {
             double alpha = std::clamp(source.opacity, 0.0, 1.0) * 0.65;
             Rgba overlay{136, 72, 216, 255};
@@ -862,7 +1252,207 @@ private:
 
   std::map<std::string, SceneModel> scenes_;
   std::map<std::string, SourceModel> sources_;
+  std::map<std::string, std::vector<FilterModel>> filters_;
   std::string program_scene_id_;
+
+#if STREAMMATE_HAS_LIBOBS
+  static std::string scene_item_key(const std::string &scene_id, const std::string &source_id) {
+    return scene_id + "\n" + source_id;
+  }
+
+  void release_obs_mirrors() {
+    for (auto &entry : obs_sources_) obs_source_release(entry.second);
+    obs_sources_.clear();
+    obs_scene_items_.clear();
+    for (auto &entry : obs_scenes_) obs_scene_release(entry.second);
+    obs_scenes_.clear();
+  }
+
+  void release_obs_source(const std::string &source_id) {
+    auto source = obs_sources_.find(source_id);
+    if (source != obs_sources_.end()) {
+      obs_source_release(source->second);
+      obs_sources_.erase(source);
+    }
+    for (auto it = obs_scene_items_.begin(); it != obs_scene_items_.end();) {
+      if (it->first.size() > source_id.size() && it->first.ends_with("\n" + source_id)) {
+        it = obs_scene_items_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+
+  void purge_obs_scene_items(const std::string &scene_id) {
+    const std::string prefix = scene_id + "\n";
+    for (auto it = obs_scene_items_.begin(); it != obs_scene_items_.end();) {
+      if (it->first.rfind(prefix, 0) == 0) {
+        it = obs_scene_items_.erase(it);
+      } else {
+        ++it;
+      }
+    }
+  }
+
+  void mirror_scene_load(const std::string &scene_id) {
+    auto existing = obs_scenes_.find(scene_id);
+    if (existing != obs_scenes_.end()) {
+      purge_obs_scene_items(scene_id);
+      obs_scene_release(existing->second);
+      obs_scenes_.erase(existing);
+    }
+    obs_scene_t *scene = obs_scene_create(scene_id.c_str());
+    if (!scene) return;
+    obs_scenes_[scene_id] = scene;
+    for (const auto &entry : sources_) {
+      if (entry.second.scene_id != scene_id) continue;
+      auto source = obs_sources_.find(entry.first);
+      if (source == obs_sources_.end()) continue;
+      obs_sceneitem_t *item = obs_scene_add(scene, source->second);
+      if (item) obs_scene_items_[scene_item_key(scene_id, entry.first)] = item;
+    }
+  }
+
+  void mirror_set_program(const std::string &scene_id) {
+    auto scene = obs_scenes_.find(scene_id);
+    if (scene == obs_scenes_.end()) return;
+    obs_source_t *source = obs_scene_get_source(scene->second);
+    if (source) obs_set_output_source(0, source);
+  }
+
+  void mirror_source_create(const SourceModel &model) {
+    auto scene = obs_scenes_.find(model.scene_id);
+    if (scene == obs_scenes_.end()) return;
+    release_obs_source(model.id);
+
+    obs_data_t *settings = obs_data_create();
+    if (!settings) return;
+    obs_data_set_string(settings, "url", model.url.c_str());
+    obs_data_set_int(settings, "width", model.width);
+    obs_data_set_int(settings, "height", model.height);
+    obs_source_t *source = obs_source_create("browser_source", model.id.c_str(), settings, nullptr);
+    if (!source) source = obs_source_create("color_source", model.id.c_str(), settings, nullptr);
+    obs_data_release(settings);
+    if (!source) return;
+
+    obs_sources_[model.id] = source;
+    obs_sceneitem_t *item = obs_scene_add(scene->second, source);
+    if (item) obs_scene_items_[scene_item_key(model.scene_id, model.id)] = item;
+
+    obs_source_t *filter = obs_source_create("color_filter_v2", "color-correction", nullptr, nullptr);
+    if (filter) {
+      obs_source_filter_add(source, filter);
+      obs_source_release(filter);
+    }
+  }
+
+  bool mirror_mute_source(const std::string &source_id, bool muted) {
+    auto source = obs_sources_.find(source_id);
+    if (source == obs_sources_.end()) return false;
+    obs_source_set_muted(source->second, muted);
+    return true;
+  }
+
+  bool mirror_item_visible(const std::string &scene_id, const std::string &item_id, bool visible) {
+    auto item = obs_scene_items_.find(scene_item_key(scene_id, item_id));
+    if (item == obs_scene_items_.end()) return false;
+    obs_sceneitem_set_visible(item->second, visible);
+    return true;
+  }
+
+  bool mirror_item_order(const std::string &scene_id, const std::string &item_id, int position) {
+    auto item = obs_scene_items_.find(scene_item_key(scene_id, item_id));
+    if (item == obs_scene_items_.end()) return false;
+    obs_sceneitem_set_order_position(item->second, position);
+    return true;
+  }
+
+  void mirror_list_filters(const std::string &source_id) {
+    (void)source_id;
+    // filter.list intentionally answers from the authoritative in-memory model;
+    // libobs enumeration is not used to shape the RPC response in either build mode.
+  }
+
+  bool mirror_filter_enabled(const std::string &source_id, const std::string &filter_id, bool enabled) {
+    auto source = obs_sources_.find(source_id);
+    if (source == obs_sources_.end()) return false;
+    obs_source_t *filter = obs_source_get_filter_by_name(source->second, filter_id.c_str());
+    if (!filter) return false;
+    obs_source_set_enabled(filter, enabled);
+    obs_source_release(filter);
+    return true;
+  }
+
+  bool mirror_filter_settings(const std::string &source_id, const std::string &filter_id,
+                              const std::map<std::string, FilterSettingValue> &settings) {
+    auto source = obs_sources_.find(source_id);
+    if (source == obs_sources_.end()) return false;
+    obs_source_t *filter = obs_source_get_filter_by_name(source->second, filter_id.c_str());
+    if (!filter) return false;
+    obs_data_t *data = obs_data_create();
+    if (!data) {
+      obs_source_release(filter);
+      return false;
+    }
+    for (const auto &entry : settings) {
+      switch (entry.second.kind) {
+      case FilterSettingKind::Number:
+        obs_data_set_double(data, entry.first.c_str(), entry.second.number_value);
+        break;
+      case FilterSettingKind::Bool:
+        obs_data_set_bool(data, entry.first.c_str(), entry.second.bool_value);
+        break;
+      case FilterSettingKind::String:
+        obs_data_set_string(data, entry.first.c_str(), entry.second.string_value.c_str());
+        break;
+      }
+    }
+    obs_source_update(filter, data);
+    obs_data_release(data);
+    obs_source_release(filter);
+    return true;
+  }
+
+  bool mirror_audio_volume(const std::string &source_id, double volume_db, bool muted) {
+    auto source = obs_sources_.find(source_id);
+    if (source == obs_sources_.end()) return false;
+    float scalar = volume_db <= -100.0 ? 0.0f : static_cast<float>(std::pow(10.0, volume_db / 20.0));
+    obs_source_set_volume(source->second, scalar);
+    obs_source_set_muted(source->second, muted);
+    return true;
+  }
+
+  bool mirror_media_control(const std::string &source_id, const std::string &action) {
+    auto source = obs_sources_.find(source_id);
+    if (source == obs_sources_.end()) return false;
+    if (action == "play") {
+      obs_source_media_play_pause(source->second, false);
+    } else if (action == "pause") {
+      obs_source_media_play_pause(source->second, true);
+    } else if (action == "restart") {
+      obs_source_media_restart(source->second);
+    } else if (action == "stop") {
+      obs_source_media_stop(source->second);
+    }
+    return true;
+  }
+
+  bool mirror_refresh_browser(const std::string &source_id) {
+    auto source = obs_sources_.find(source_id);
+    if (source == obs_sources_.end()) return false;
+    proc_handler_t *handler = obs_source_get_proc_handler(source->second);
+    if (!handler) return false;
+    calldata_t data;
+    calldata_init(&data);
+    proc_handler_call(handler, "refresh", &data);
+    calldata_free(&data);
+    return true;
+  }
+
+  std::map<std::string, obs_scene_t *> obs_scenes_;
+  std::map<std::string, obs_source_t *> obs_sources_;
+  std::map<std::string, obs_sceneitem_t *> obs_scene_items_;
+#endif
 };
 
 std::string getenv_string(const char *name) {
@@ -916,6 +1506,58 @@ struct ObsSourceEntry {
   std::string module;
 };
 
+std::optional<uint32_t> json_hex_value(char c) {
+  if (c >= '0' && c <= '9') return static_cast<uint32_t>(c - '0');
+  if (c >= 'a' && c <= 'f') return static_cast<uint32_t>(10 + c - 'a');
+  if (c >= 'A' && c <= 'F') return static_cast<uint32_t>(10 + c - 'A');
+  return std::nullopt;
+}
+
+std::optional<uint32_t> parse_json_hex4_at(const std::string &json, size_t pos) {
+  if (pos + 4 > json.size()) return std::nullopt;
+  uint32_t value = 0;
+  for (size_t i = 0; i < 4; ++i) {
+    auto digit = json_hex_value(json[pos + i]);
+    if (!digit) return std::nullopt;
+    value = (value << 4) | *digit;
+  }
+  return value;
+}
+
+void append_utf8_codepoint(std::string &value, uint32_t codepoint) {
+  if (codepoint <= 0x7f) {
+    value.push_back(static_cast<char>(codepoint));
+  } else if (codepoint <= 0x7ff) {
+    value.push_back(static_cast<char>(0xc0 | (codepoint >> 6)));
+    value.push_back(static_cast<char>(0x80 | (codepoint & 0x3f)));
+  } else if (codepoint <= 0xffff) {
+    value.push_back(static_cast<char>(0xe0 | (codepoint >> 12)));
+    value.push_back(static_cast<char>(0x80 | ((codepoint >> 6) & 0x3f)));
+    value.push_back(static_cast<char>(0x80 | (codepoint & 0x3f)));
+  } else if (codepoint <= 0x10ffff) {
+    value.push_back(static_cast<char>(0xf0 | (codepoint >> 18)));
+    value.push_back(static_cast<char>(0x80 | ((codepoint >> 12) & 0x3f)));
+    value.push_back(static_cast<char>(0x80 | ((codepoint >> 6) & 0x3f)));
+    value.push_back(static_cast<char>(0x80 | (codepoint & 0x3f)));
+  } else {
+    append_utf8_codepoint(value, 0xfffd);
+  }
+}
+
+void consume_json_string_remainder(const std::string &json, size_t &pos) {
+  bool escape = false;
+  while (pos < json.size()) {
+    char c = json[pos++];
+    if (escape) {
+      escape = false;
+    } else if (c == '\\') {
+      escape = true;
+    } else if (c == '"') {
+      return;
+    }
+  }
+}
+
 std::optional<std::string> parse_json_string_token(const std::string &json, size_t &pos) {
   if (pos >= json.size() || json[pos] != '"') return std::nullopt;
   ++pos;
@@ -946,9 +1588,33 @@ std::optional<std::string> parse_json_string_token(const std::string &json, size
       case 't':
         value.push_back('\t');
         break;
-      default:
-        value.push_back(escaped);
+      case 'u': {
+        auto code_unit = parse_json_hex4_at(json, pos);
+        if (!code_unit) {
+          consume_json_string_remainder(json, pos);
+          return std::nullopt;
+        }
+        pos += 4;
+        if (*code_unit >= 0xd800 && *code_unit <= 0xdbff) {
+          if (pos + 6 <= json.size() && json[pos] == '\\' && json[pos + 1] == 'u') {
+            auto low = parse_json_hex4_at(json, pos + 2);
+            if (low && *low >= 0xdc00 && *low <= 0xdfff) {
+              pos += 6;
+              append_utf8_codepoint(value, 0x10000 + (((*code_unit - 0xd800) << 10) | (*low - 0xdc00)));
+              break;
+            }
+          }
+          append_utf8_codepoint(value, 0xfffd);
+        } else if (*code_unit >= 0xdc00 && *code_unit <= 0xdfff) {
+          append_utf8_codepoint(value, 0xfffd);
+        } else {
+          append_utf8_codepoint(value, *code_unit);
+        }
         break;
+      }
+      default:
+        consume_json_string_remainder(json, pos);
+        return std::nullopt;
       }
     } else {
       value.push_back(c);
@@ -2717,6 +3383,10 @@ private:
       send_renderer_result(fd, id, renderer_.list_scenes(payload));
     } else if (method == "scene.itemTransform") {
       send_renderer_result(fd, id, renderer_.item_transform(payload));
+    } else if (method == "sceneItem.setVisible") {
+      send_renderer_result(fd, id, renderer_.set_item_visible(payload));
+    } else if (method == "sceneItem.setOrder") {
+      send_renderer_result(fd, id, renderer_.set_item_order(payload));
     } else if (method == "source.remove") {
       // Explicit opt-in Phase B native overlay sources are routed to their own
       // manager; every other id stays on the scaffold browser-source path.
@@ -2743,6 +3413,18 @@ private:
       }
     } else if (method == "source.mute") {
       send_renderer_result(fd, id, renderer_.mute_source(payload));
+    } else if (method == "filter.list") {
+      send_renderer_result(fd, id, renderer_.list_filters(payload));
+    } else if (method == "filter.setEnabled") {
+      send_renderer_result(fd, id, renderer_.set_filter_enabled(payload));
+    } else if (method == "filter.setSettings") {
+      send_renderer_result(fd, id, renderer_.set_filter_settings(payload));
+    } else if (method == "audio.setVolume") {
+      send_renderer_result(fd, id, renderer_.set_audio_volume(payload));
+    } else if (method == "media.control") {
+      send_renderer_result(fd, id, renderer_.media_control(payload));
+    } else if (method == "source.refreshBrowser") {
+      send_renderer_result(fd, id, renderer_.refresh_browser(payload));
     } else if (method == "scene.captureFrame") {
       send_renderer_result(fd, id, renderer_.capture_frame(payload));
     } else if (method == "import.scan") {
