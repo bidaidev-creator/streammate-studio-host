@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import socket
+import struct
 import subprocess
 import sys
 import tempfile
@@ -19,6 +20,19 @@ SOURCE_ID = "station-overlay"
 SCENE_ID = "control-scene"
 FILTER_ID = "color-correction"
 SECRET_SHAPED = "stm_studio-host_AbCdEfGhIjKlMnOpQrStUvWxYz012345"
+
+
+def send_raw_text(sock: socket.socket, raw: str) -> None:
+    payload = raw.encode("utf-8")
+    mask = os.urandom(4)
+    if len(payload) < 126:
+        header = bytes([0x81, 0x80 | len(payload)])
+    elif len(payload) <= 0xFFFF:
+        header = bytes([0x81, 0x80 | 126]) + struct.pack("!H", len(payload))
+    else:
+        raise AssertionError("test payload too large")
+    masked = bytes(byte ^ mask[index % 4] for index, byte in enumerate(payload))
+    sock.sendall(header + mask + masked)
 
 
 def tree_files(root: Path) -> dict[str, bytes]:
@@ -80,6 +94,16 @@ class ProductionControlVerbTest(unittest.TestCase):
         )["result"]
         self.assertEqual(created["sourceId"], SOURCE_ID)
 
+    def _assert_rpc_error(self, sock: socket.socket, rpc_id: int, method: str, params: dict, code: int = -32602) -> dict:
+        response = host.rpc(sock, rpc_id, method, params)
+        self.assertNotIn("result", response, response)
+        self.assertEqual(response["error"]["code"], code, response)
+        return response
+
+    def _assert_host_still_healthy(self, sock: socket.socket, rpc_id: int) -> None:
+        health = host.rpc(sock, rpc_id, "host.health", {})["result"]
+        self.assertEqual(health["status"], "ready")
+
     def test_scaffold_contract_shape_parity_for_each_new_verb(self) -> None:
         _, sock = self._connect()
         self._synthetic_scene(sock)
@@ -130,6 +154,39 @@ class ProductionControlVerbTest(unittest.TestCase):
         refreshed = host.rpc(sock, 420, "source.refreshBrowser", {"sourceId": SOURCE_ID})["result"]
         self.assertEqual(refreshed, {"ok": True, "sourceId": SOURCE_ID, "refreshed": True})
 
+    def test_scene_reload_then_scene_item_mutations_remain_safe(self) -> None:
+        _, sock = self._connect()
+        self._synthetic_scene(sock)
+
+        reloaded = host.rpc(sock, 421, "scene.load", {"sceneId": SCENE_ID, "width": 64, "height": 36})["result"]
+        self.assertEqual(reloaded["sceneId"], SCENE_ID)
+
+        visible = host.rpc(sock, 422, "sceneItem.setVisible", {"sceneId": SCENE_ID, "itemId": SOURCE_ID, "visible": False})[
+            "result"
+        ]
+        self.assertEqual(visible, {"ok": True, "sceneId": SCENE_ID, "itemId": SOURCE_ID, "visible": False})
+
+        ordered = host.rpc(
+            sock,
+            423,
+            "sceneItem.setOrder",
+            {"sceneId": SCENE_ID, "itemId": SOURCE_ID, "position": 0, "idempotencyToken": "reload-order-1"},
+        )["result"]
+        self.assertEqual(ordered, {"ok": True, "sceneId": SCENE_ID, "itemId": SOURCE_ID, "position": 0})
+        self._assert_host_still_healthy(sock, 424)
+
+    def test_scene_item_set_order_requires_valid_idempotency_token(self) -> None:
+        _, sock = self._connect()
+        self._synthetic_scene(sock)
+
+        self._assert_rpc_error(sock, 425, "sceneItem.setOrder", {"sceneId": SCENE_ID, "itemId": SOURCE_ID, "position": 0})
+        self._assert_rpc_error(
+            sock,
+            426,
+            "sceneItem.setOrder",
+            {"sceneId": SCENE_ID, "itemId": SOURCE_ID, "position": 0, "idempotencyToken": "bad token"},
+        )
+
     def test_filter_settings_unknown_key_is_refused_fail_closed(self) -> None:
         _, sock = self._connect()
         self._synthetic_scene(sock)
@@ -142,6 +199,95 @@ class ProductionControlVerbTest(unittest.TestCase):
         )
         self.assertEqual(refused["error"]["code"], -32602)
         self.assertIn("unknown filter-settings key", refused["error"]["message"])
+
+    def test_filter_settings_refuse_out_of_range_numeric_value(self) -> None:
+        _, sock = self._connect()
+        self._synthetic_scene(sock)
+
+        self._assert_rpc_error(
+            sock,
+            431,
+            "filter.setSettings",
+            {"sourceId": SOURCE_ID, "filterId": FILTER_ID, "settings": {"brightness": 1000000.1}},
+        )
+
+    def test_filter_settings_refuse_url_path_and_secret_shaped_strings(self) -> None:
+        _, sock = self._connect()
+        self._synthetic_scene(sock)
+
+        refused_values = [
+            "https://example.invalid/x",
+            "rtmp://example.invalid/live",
+            "//host/x",
+            "file:///Users/x",
+            "/Users/x/secret",
+            "stm_agent_abc123",
+        ]
+        for offset, value in enumerate(refused_values, start=432):
+            with self.subTest(value=value):
+                self._assert_rpc_error(
+                    sock,
+                    offset,
+                    "filter.setSettings",
+                    {"sourceId": SOURCE_ID, "filterId": FILTER_ID, "settings": {"key_color_type": value}},
+                )
+
+    def test_malformed_new_verb_requests_fail_closed_and_keep_host_alive(self) -> None:
+        _, sock = self._connect()
+        self._synthetic_scene(sock)
+
+        cases = [
+            ("sceneItem.setVisible", {"sceneId": "missing-scene", "itemId": SOURCE_ID, "visible": True}),
+            ("sceneItem.setVisible", {"sceneId": SCENE_ID, "itemId": "missing-item", "visible": True}),
+            ("filter.list", {"sourceId": "missing-source"}),
+            ("filter.setEnabled", {"sourceId": SOURCE_ID, "filterId": "missing-filter", "enabled": True}),
+            ("sceneItem.setVisible", {"sceneId": SCENE_ID, "itemId": SOURCE_ID, "visible": "false"}),
+            (
+                "sceneItem.setOrder",
+                {"sceneId": SCENE_ID, "itemId": SOURCE_ID, "position": -1, "idempotencyToken": "bad-position-1"},
+            ),
+            (
+                "sceneItem.setOrder",
+                {"sceneId": SCENE_ID, "itemId": SOURCE_ID, "position": 1000001, "idempotencyToken": "bad-position-2"},
+            ),
+            ("audio.setVolume", {"sourceId": SOURCE_ID, "volumeDb": -101}),
+            ("audio.setVolume", {"sourceId": SOURCE_ID, "volumeDb": "loud"}),
+            ("media.control", {"sourceId": SOURCE_ID, "action": "scrub"}),
+        ]
+        for offset, (method, params) in enumerate(cases, start=460):
+            with self.subTest(method=method, params=params):
+                self._assert_rpc_error(sock, offset, method, params)
+                self._assert_host_still_healthy(sock, offset + 100)
+
+    def test_filter_settings_malformed_json_fails_with_timeout_bound(self) -> None:
+        _, sock = self._connect()
+        self._synthetic_scene(sock)
+
+        raw_cases = [
+            (
+                580,
+                f'{{"jsonrpc":"2.0","id":580,"method":"filter.setSettings","params":{{"sourceId":"{SOURCE_ID}",'
+                f'"filterId":"{FILTER_ID}","settings":{{"key_color_type":"green}}}}}}',
+            ),
+            (
+                581,
+                f'{{"jsonrpc":"2.0","id":581,"method":"filter.setSettings","params":{{"sourceId":"{SOURCE_ID}",'
+                f'"filterId":"{FILTER_ID}","settings":{{"brightness" 0.25}}}}}}',
+            ),
+            (
+                582,
+                f'{{"jsonrpc":"2.0","id":582,"method":"filter.setSettings","params":{{"sourceId":"{SOURCE_ID}",'
+                f'"filterId":"{FILTER_ID}","settings":{{"key_color_type":"green\\q"}}}}}}',
+            ),
+        ]
+        for rpc_id, raw in raw_cases:
+            with self.subTest(rpc_id=rpc_id):
+                send_raw_text(sock, raw)
+                response = host.recv_text(sock, timeout=1.0)
+                while response.get("id") != rpc_id:
+                    response = host.recv_text(sock, timeout=1.0)
+                self.assertEqual(response["error"]["code"], -32602, response)
+                self._assert_host_still_healthy(sock, rpc_id + 100)
 
     def test_loopback_binding_and_no_live_egress_remain_unchanged(self) -> None:
         process, sock = self._connect()
@@ -176,12 +322,13 @@ class ProductionControlVerbTest(unittest.TestCase):
                 {"sceneId": SCENE_ID, "itemId": SOURCE_ID, "position": 0, "idempotencyToken": "disk-1"},
             )
             host.rpc(sock, 452, "filter.setEnabled", {"sourceId": SOURCE_ID, "filterId": FILTER_ID, "enabled": False})
-            host.rpc(
+            refused_secret = host.rpc(
                 sock,
                 453,
                 "filter.setSettings",
                 {"sourceId": SOURCE_ID, "filterId": FILTER_ID, "settings": {"key_color_type": SECRET_SHAPED}},
             )
+            self.assertEqual(refused_secret["error"]["code"], -32602)
             host.rpc(sock, 454, "audio.setVolume", {"sourceId": SOURCE_ID, "volumeDb": -6})
             host.rpc(sock, 455, "media.control", {"sourceId": SOURCE_ID, "action": "stop"})
             host.rpc(sock, 456, "source.refreshBrowser", {"sourceId": SOURCE_ID})
