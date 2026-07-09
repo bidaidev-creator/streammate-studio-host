@@ -148,9 +148,6 @@ jobs:
       - name: Run obs_startup smoke headlessly
         run: ./build/host/studio-host-smoke
 
-      - name: Run HAS_LIBOBS production-control verb smoke
-        run: ctest --test-dir build/host -R production-control-verbs --output-on-failure
-
       # Spec 34 Capability 3 / chunk 34.H3: compile the in-tree OBS plugin module
       # and its HAS_LIBOBS smoke. No `|| true` — the module MUST compile.
       - name: Build native-overlay OBS plugin module and smoke
@@ -183,6 +180,14 @@ jobs:
           cp -R dist/StreamMateStudioHost.app "$scratch/"
           "$scratch/StreamMateStudioHost.app/Contents/MacOS/studio-host-smoke" --version
           (cd dist && shasum -a 256 -c sha256-manifest.txt)
+
+      - name: Run HAS_LIBOBS production-control verb smoke against packaged app
+        run: |
+          # The raw build/host binary cannot dlopen libobs-opengl.dylib (Frameworks
+          # only exist inside the packaged bundle), so the verb smoke runs against
+          # the relocatable app exactly as an installed host would.
+          python3 tests/integration/test_production_control_verbs.py \
+            dist/StreamMateStudioHost.app/Contents/MacOS/studio-host
 
       - name: Verify inside-out ad-hoc signature before upload
         run: |
