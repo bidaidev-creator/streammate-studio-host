@@ -128,6 +128,11 @@ if(BUILD_TESTING)
     NAME record-replay
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_record_replay.py $<TARGET_FILE:studio-host>
   )
+  # Chunk 37.H1: per-finding security regressions (PR07-07 / PR07-08 / NHR-01).
+  add_test(
+    NAME import-hardening
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_import_hardening.py $<TARGET_FILE:studio-host>
+  )
   add_test(
     NAME macos-packaging
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_macos_packaging.py
