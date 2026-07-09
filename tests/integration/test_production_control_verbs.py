@@ -55,10 +55,12 @@ def host_tcp_peers(pid: int) -> list[str]:
     )
     peers: list[str] = []
     for line in result.stdout.splitlines():
-        if "->" not in line:
+        # Take the token that actually carries the connection pair; lsof line
+        # shapes vary (state suffix present/absent, LISTEN rows have no "->").
+        token = next((part for part in line.split() if "->" in part), None)
+        if token is None:
             continue
-        name = line.split()[-2] if line.split()[-1] == "(ESTABLISHED)" else line.split()[-1]
-        peers.append(name.split("->", 1)[1])
+        peers.append(token.split("->", 1)[1])
     return peers
 
 
