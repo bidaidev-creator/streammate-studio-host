@@ -355,8 +355,10 @@ class ProductionControlVerbTest(unittest.TestCase):
 class ProductionControlCiWorkflowTest(unittest.TestCase):
     def test_has_libobs_lane_runs_new_control_verb_smoke(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
-        self.assertIn("production-control-verbs", workflow)
-        self.assertRegex(workflow, r"ctest --test-dir build/host .*production-control-verbs")
+        # The HAS_LIBOBS lane must run this suite against the packaged app (the
+        # raw build binary cannot dlopen the bundled libobs graphics module).
+        self.assertIn("tests/integration/test_production_control_verbs.py", workflow)
+        self.assertIn("dist/StreamMateStudioHost.app/Contents/MacOS/studio-host", workflow)
 
 
 if __name__ == "__main__":
