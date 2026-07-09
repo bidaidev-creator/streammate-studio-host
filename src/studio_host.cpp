@@ -860,7 +860,10 @@ public:
     if (scene_id.empty() || scenes_.find(scene_id) == scenes_.end()) return rpc_error_result(-32602, "scene not loaded");
     if (item_id.empty() || it == sources_.end() || it->second.scene_id != scene_id) return rpc_error_result(-32602, "scene item not found");
     std::string idempotency_token = extract_json_string(request, "idempotencyToken");
-    if (!is_safe_protocol_id(idempotency_token)) return rpc_error_result(-32602, "idempotencyToken is required");
+    if (request.find("\"idempotencyToken\"") == std::string::npos) {
+      return rpc_error_result(-32602, "idempotencyToken is required");
+    }
+    if (!is_safe_protocol_id(idempotency_token)) return rpc_error_result(-32602, "idempotencyToken is invalid");
     auto position = extract_json_int(request, "position");
     if (!position || *position < 0 || *position > kMaxSceneItemPosition) {
       return rpc_error_result(-32602, "position must be a bounded non-negative integer");
@@ -1117,12 +1120,19 @@ private:
     if (!body) return {false, "settings must be an object of known filter-settings keys", {}};
     ParsedSettings parsed;
     size_t pos = 0;
-    while (pos < body->size()) {
+    bool first = true;
+    while (true) {
       skip_json_whitespace(*body, pos);
       if (pos >= body->size()) break;
-      if ((*body)[pos] == ',') {
+      if (!first) {
+        if ((*body)[pos] != ',') return {false, "settings entries must be separated by commas", {}};
         ++pos;
-        continue;
+        skip_json_whitespace(*body, pos);
+        if (pos >= body->size() || (*body)[pos] == ',') {
+          return {false, "settings entries must be separated by commas", {}};
+        }
+      } else if ((*body)[pos] == ',') {
+        return {false, "settings entries must be separated by commas", {}};
       }
       auto key = parse_json_string_token(*body, pos);
       if (!key) return {false, "settings must contain string keys", {}};
@@ -1164,11 +1174,9 @@ private:
         }
       }
       parsed.settings[*key] = value;
+      first = false;
       skip_json_whitespace(*body, pos);
-      if (pos < body->size()) {
-        if ((*body)[pos] != ',') return {false, "settings entries must be separated by commas", {}};
-        ++pos;
-      }
+      if (pos < body->size() && (*body)[pos] != ',') return {false, "settings entries must be separated by commas", {}};
     }
     if (parsed.settings.empty()) return {false, "settings must set at least one known filter-settings key", {}};
     parsed.ok = true;
@@ -1498,6 +1506,58 @@ struct ObsSourceEntry {
   std::string module;
 };
 
+std::optional<uint32_t> json_hex_value(char c) {
+  if (c >= '0' && c <= '9') return static_cast<uint32_t>(c - '0');
+  if (c >= 'a' && c <= 'f') return static_cast<uint32_t>(10 + c - 'a');
+  if (c >= 'A' && c <= 'F') return static_cast<uint32_t>(10 + c - 'A');
+  return std::nullopt;
+}
+
+std::optional<uint32_t> parse_json_hex4_at(const std::string &json, size_t pos) {
+  if (pos + 4 > json.size()) return std::nullopt;
+  uint32_t value = 0;
+  for (size_t i = 0; i < 4; ++i) {
+    auto digit = json_hex_value(json[pos + i]);
+    if (!digit) return std::nullopt;
+    value = (value << 4) | *digit;
+  }
+  return value;
+}
+
+void append_utf8_codepoint(std::string &value, uint32_t codepoint) {
+  if (codepoint <= 0x7f) {
+    value.push_back(static_cast<char>(codepoint));
+  } else if (codepoint <= 0x7ff) {
+    value.push_back(static_cast<char>(0xc0 | (codepoint >> 6)));
+    value.push_back(static_cast<char>(0x80 | (codepoint & 0x3f)));
+  } else if (codepoint <= 0xffff) {
+    value.push_back(static_cast<char>(0xe0 | (codepoint >> 12)));
+    value.push_back(static_cast<char>(0x80 | ((codepoint >> 6) & 0x3f)));
+    value.push_back(static_cast<char>(0x80 | (codepoint & 0x3f)));
+  } else if (codepoint <= 0x10ffff) {
+    value.push_back(static_cast<char>(0xf0 | (codepoint >> 18)));
+    value.push_back(static_cast<char>(0x80 | ((codepoint >> 12) & 0x3f)));
+    value.push_back(static_cast<char>(0x80 | ((codepoint >> 6) & 0x3f)));
+    value.push_back(static_cast<char>(0x80 | (codepoint & 0x3f)));
+  } else {
+    append_utf8_codepoint(value, 0xfffd);
+  }
+}
+
+void consume_json_string_remainder(const std::string &json, size_t &pos) {
+  bool escape = false;
+  while (pos < json.size()) {
+    char c = json[pos++];
+    if (escape) {
+      escape = false;
+    } else if (c == '\\') {
+      escape = true;
+    } else if (c == '"') {
+      return;
+    }
+  }
+}
+
 std::optional<std::string> parse_json_string_token(const std::string &json, size_t &pos) {
   if (pos >= json.size() || json[pos] != '"') return std::nullopt;
   ++pos;
@@ -1528,7 +1588,32 @@ std::optional<std::string> parse_json_string_token(const std::string &json, size
       case 't':
         value.push_back('\t');
         break;
+      case 'u': {
+        auto code_unit = parse_json_hex4_at(json, pos);
+        if (!code_unit) {
+          consume_json_string_remainder(json, pos);
+          return std::nullopt;
+        }
+        pos += 4;
+        if (*code_unit >= 0xd800 && *code_unit <= 0xdbff) {
+          if (pos + 6 <= json.size() && json[pos] == '\\' && json[pos + 1] == 'u') {
+            auto low = parse_json_hex4_at(json, pos + 2);
+            if (low && *low >= 0xdc00 && *low <= 0xdfff) {
+              pos += 6;
+              append_utf8_codepoint(value, 0x10000 + (((*code_unit - 0xd800) << 10) | (*low - 0xdc00)));
+              break;
+            }
+          }
+          append_utf8_codepoint(value, 0xfffd);
+        } else if (*code_unit >= 0xdc00 && *code_unit <= 0xdfff) {
+          append_utf8_codepoint(value, 0xfffd);
+        } else {
+          append_utf8_codepoint(value, *code_unit);
+        }
+        break;
+      }
       default:
+        consume_json_string_remainder(json, pos);
         return std::nullopt;
       }
     } else {

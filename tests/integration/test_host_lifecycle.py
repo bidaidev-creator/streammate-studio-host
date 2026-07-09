@@ -418,7 +418,7 @@ class StudioHostLifecycleTest(unittest.TestCase):
                     "microphoneCount": 1,
                     "screenCount": 1,
                     "instantiatedCount": 0,
-                    "deferredCount": 4,
+                    "deferredCount": 5,
                     "failedCount": 0,
                 },
             )
