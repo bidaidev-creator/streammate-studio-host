@@ -3,30 +3,34 @@
 
 Chunk 37.H1 (native-host live demo program, security lane). One named
 regression test per finding, L1-A pattern, proving the studio-host #9
-remediation holds at head:
+remediation holds at head. Every assertion here was calibrated against a
+faithfully-reverted binary (the exact #9 hunks reverted in the head
+source) so the tests FAIL against the vulnerable code and PASS at head -
+see the PR body's revert-experiment table.
 
 - PR07-07 (prototype review 2026-07-07, src/studio_host.cpp
-  copy_config_without_service_json): copy_file used to dereference
-  symlinks, so a symlink planted inside an imported OBS config directory
-  copied an arbitrary target file's content into the import output. The
-  fix skips every symlink entry (file and directory) during the
-  recursive copy. A regression re-introducing dereferencing copy makes
-  test_pr07_07_* fail on the "symlink target content in output" asserts.
+  copy_config_without_service_json): copy_file dereferenced symlinks, so
+  a symlink planted inside an imported OBS config directory copied an
+  arbitrary target file's content into the import output. Under the
+  vulnerable code std::filesystem::relative resolves the symlink and the
+  secret lands OUTSIDE the collection directory (a sibling under
+  studio/obs-imports/), so a scan confined to the collection dir misses
+  it. These tests scan the whole STREAMMATE_HOME for the canary and
+  assert obs-imports/ contains ONLY the collection directory.
 
-- PR07-08 (same review, parse_obs_source_entries): a backtracking
-  std::regex with a lazy gap gave quadratic blow-up on brace-less
-  hostile scene-collection input (88 KB -> ~16 s) on the RPC thread,
-  and imports had no size cap. The fix is a brace-aware single-pass
-  scanner plus kMaxSceneCollectionBytes (8 MiB) enforced at read time.
-  A regression makes test_pr07_08_* fail either the elapsed-time bound
-  (scanner) or the -32602 size-limit refusal (cap).
+- PR07-08 (same review, parse_obs_source_entries + read cap): a
+  backtracking std::regex with a lazy "name"..gap.."id" pattern gave
+  catastrophic blow-up on input with many "name" anchors and no matching
+  "id" (a single anchor does NOT trigger it), and imports had no size
+  cap. The fix is a brace-aware single-pass scanner plus
+  kMaxSceneCollectionBytes (8 MiB). The timing test uses a many-anchor,
+  no-id body (head ~0.00s; reverted >7s) with a comfortable 2.0s bound;
+  the cap test asserts a >8 MiB collection is refused.
 
 - NHR-01 (native-host IPC review 2026-07-07, contested only because the
   host C++ source was outside that review's worktree): the combined
-  hostile-config class - symlinks plus pathological scene-collection
-  content in one import. test_nhr_01_* proves at the host repo's head
-  that such a config imports with symlinks skipped, bounded parse time,
-  intact output, and a host that stays serviceable afterwards.
+  hostile-config class - a genuinely pathological (many-anchor, no-id)
+  scene-collection AND planted file/dir symlinks in one import.
 
 Finding-register status flips remain owner-ratification-pending; this
 file only proves behavior at head.
@@ -46,6 +50,18 @@ from pathlib import Path
 # identically in the imported module.
 import test_host_lifecycle as lifecycle
 
+CANARY = "nhr-37h1-outside-secret-material"
+
+# Many "name" anchors with NO matching "id": the shape that drives the pre-fix
+# backtracking regex quadratic. Head single-pass scanner handles it in ~0.00s;
+# the reverted binary exceeds 7s. Kept well above the 2.0s bound either way.
+PATHOLOGICAL_ANCHORS = 1500
+
+
+def pathological_collection_body(name: str = "Hostile") -> str:
+    anchors = ',"name":"YYYYYYYYYY"' * PATHOLOGICAL_ANCHORS
+    return '{"name":"' + name + '"' + anchors + "}"
+
 
 def start_connected_host(env: dict[str, str] | None = None):
     process, port, _ = lifecycle.start_host(env=env)
@@ -61,6 +77,28 @@ def write_minimal_collection(obs_dir: Path, body: str, name: str = "fixture-main
     return collection
 
 
+def home_contains_canary(streammate_home: Path, canary: str) -> list[str]:
+    """Scan the ENTIRE STREAMMATE_HOME (not just the collection dir) for the
+    canary content. The vulnerable copy lands the secret at a sibling of the
+    collection directory, so a collection-scoped scan misses it."""
+    hits: list[str] = []
+    for path in streammate_home.rglob("*"):
+        if path.is_file():
+            try:
+                if canary in path.read_text(encoding="utf-8", errors="replace"):
+                    hits.append(str(path.relative_to(streammate_home)))
+            except OSError:
+                continue
+    return hits
+
+
+def obs_imports_children(streammate_home: Path) -> list[str]:
+    imports = streammate_home / "studio" / "obs-imports"
+    if not imports.is_dir():
+        return []
+    return sorted(child.name for child in imports.iterdir())
+
+
 class Pr0707SymlinkExfilRegressionTest(unittest.TestCase):
     """PR07-07: symlinks inside an imported OBS config dir are never followed."""
 
@@ -73,12 +111,11 @@ class Pr0707SymlinkExfilRegressionTest(unittest.TestCase):
 
             outside = temp_root / "outside"
             outside.mkdir()
-            secret = "pr07-07-outside-secret-material"
             secret_file = outside / "credential.txt"
-            secret_file.write_text(secret, encoding="utf-8")
+            secret_file.write_text(CANARY, encoding="utf-8")
             outside_dir = outside / "keys"
             outside_dir.mkdir()
-            (outside_dir / "nested-credential.txt").write_text(secret, encoding="utf-8")
+            (outside_dir / "nested-credential.txt").write_text(CANARY, encoding="utf-8")
 
             # A benign regular file that MUST still be copied (the fix skips
             # symlinks, not regular content).
@@ -113,29 +150,26 @@ class Pr0707SymlinkExfilRegressionTest(unittest.TestCase):
             self.assertFalse((imported_root / "innocent-name.json").exists())
             self.assertFalse((imported_root / "basic" / "scenes" / "linked-scene.json").exists())
             self.assertFalse((imported_root / "linked-profile-dir").exists())
-            # service.json exclusion is unchanged by the hardening.
             self.assertFalse((imported_root / "service.json").exists())
-            # The regression signature: symlink-target bytes anywhere in the
-            # import output tree or in the RPC response.
-            for path in imported_root.rglob("*"):
-                if path.is_file():
-                    self.assertNotIn(secret, path.read_text(encoding="utf-8", errors="replace"))
-            self.assertNotIn(secret, json.dumps(loaded))
+
+            # Teeth against the real defect: the vulnerable copy dereferences
+            # symlinks and lands the target under a SIBLING of the collection
+            # dir. Assert obs-imports/ holds only the collection, and scan the
+            # whole home for the canary bytes.
+            self.assertEqual(obs_imports_children(streammate_home), ["fixture-main"])
+            self.assertEqual(home_contains_canary(streammate_home, CANARY), [])
+            self.assertNotIn(CANARY, json.dumps(loaded))
 
 
 class Pr0708ParseRedosRegressionTest(unittest.TestCase):
     """PR07-08: scene-collection parsing is single-pass and size-capped."""
 
-    def test_pr07_08_braceless_hostile_collection_scans_promptly(self) -> None:
+    def test_pr07_08_multi_anchor_hostile_collection_scans_promptly(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             obs_dir = Path(temp_dir) / "obs-config"
-            # ~400 KB brace-free body: quadratic backtracking (the pre-fix
-            # behavior blew past 16 s at 88 KB) cannot survive the bound below;
-            # the single-pass scanner finishes in milliseconds.
-            write_minimal_collection(
-                obs_dir,
-                '"name":"Brace Free",' + ('"padding":"xxxxxxxxxxxxxxxxxxxx",' * 16000),
-            )
+            # Many "name" anchors, no matching "id": the pattern that makes the
+            # pre-fix backtracking regex blow up (a single anchor does not).
+            write_minimal_collection(obs_dir, pathological_collection_body("Brace Free"))
 
             process, sock = start_connected_host()
             self.addCleanup(lifecycle.stop_process, process)
@@ -144,6 +178,8 @@ class Pr0708ParseRedosRegressionTest(unittest.TestCase):
             started = time.monotonic()
             scan = lifecycle.rpc(sock, 3801, "import.scan", {"configDir": str(obs_dir)})
             elapsed = time.monotonic() - started
+            # Head: ~0.00s. Reverted: >7s (rpc recv times out). 2.0s bound has
+            # a >30x margin at head yet fails hard against the vulnerable parser.
             self.assertLess(elapsed, 2.0)
             self.assertIn("result", scan)
             self.assertEqual(scan["result"]["collections"][0]["name"], "Brace Free")
@@ -153,7 +189,7 @@ class Pr0708ParseRedosRegressionTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             temp_root = Path(temp_dir)
             obs_dir = temp_root / "obs-config"
-            # One byte past kMaxSceneCollectionBytes (8 MiB).
+            # One object just past kMaxSceneCollectionBytes (8 MiB).
             oversized = '{"name":"Too Big","padding":"' + ("x" * (8 * 1024 * 1024 - 28)) + '"}'
             write_minimal_collection(obs_dir, oversized)
 
@@ -182,8 +218,8 @@ class Pr0708ParseRedosRegressionTest(unittest.TestCase):
 
 
 class Nhr01HostileConfigRegressionTest(unittest.TestCase):
-    """NHR-01: the combined hostile-config class (symlink + pathological
-    scene-collection) is dead at head - previously contested because the host
+    """NHR-01: the combined hostile-config class (pathological scene-collection
+    + planted symlinks) is dead at head - previously contested because the host
     source was outside the monorepo review's worktree."""
 
     @unittest.skipUnless(hasattr(os, "symlink"), "symlink support is required")
@@ -192,24 +228,18 @@ class Nhr01HostileConfigRegressionTest(unittest.TestCase):
             temp_root = Path(temp_dir)
             obs_dir = temp_root / "obs-config"
             streammate_home = temp_root / "streammate-home"
-            # Pathological content: a hostile name full of regex metacharacters
-            # plus a large brace-free tail, in one loadable collection.
-            hostile_name = "((((a+)+)+)+)$" + ".*" * 32
-            write_minimal_collection(
-                obs_dir,
-                json.dumps({"name": hostile_name, "sources": [{"name": "Backdrop", "id": "color_source"}]})[:-1]
-                + ","
-                + ('"padding":"xxxxxxxxxxxxxxxxxxxx",' * 8000)[:-1]
-                + "}",
-            )
+            # Genuinely pathological: many "name" anchors, no matching "id".
+            write_minimal_collection(obs_dir, pathological_collection_body("Hostile"))
 
             outside = temp_root / "outside"
             outside.mkdir()
-            secret = "nhr-01-outside-secret-material"
-            (outside / "loot.txt").write_text(secret, encoding="utf-8")
+            (outside / "loot.txt").write_text(CANARY, encoding="utf-8")
+            outside_dir = outside / "loot-keys"
+            outside_dir.mkdir()
+            (outside_dir / "nested.txt").write_text(CANARY, encoding="utf-8")
             try:
                 os.symlink(outside / "loot.txt", obs_dir / "basic" / "scenes" / "loot-link.json")
-                os.symlink(outside, obs_dir / "loot-dir")
+                os.symlink(outside_dir, obs_dir / "loot-dir")
             except OSError as exc:
                 self.skipTest(f"symlink creation unavailable: {exc}")
 
@@ -225,21 +255,22 @@ class Nhr01HostileConfigRegressionTest(unittest.TestCase):
             started = time.monotonic()
             loaded = lifecycle.rpc(sock, 3901, "import.load", {"collectionId": "fixture-main"})
             elapsed = time.monotonic() - started
+            # Bounded parse (reverted parser exceeds 7s on this input).
             self.assertLess(elapsed, 2.0)
             self.assertIn("result", loaded)
 
             imported_root = streammate_home / "studio" / "obs-imports" / "fixture-main"
             self.assertFalse((imported_root / "basic" / "scenes" / "loot-link.json").exists())
             self.assertFalse((imported_root / "loot-dir").exists())
-            for path in imported_root.rglob("*"):
-                if path.is_file():
-                    self.assertNotIn(secret, path.read_text(encoding="utf-8", errors="replace"))
-            self.assertNotIn(secret, json.dumps(loaded))
+            # Whole-home canary scan + obs-imports has only the collection dir.
+            self.assertEqual(obs_imports_children(streammate_home), ["fixture-main"])
+            self.assertEqual(home_contains_canary(streammate_home, CANARY), [])
+            self.assertNotIn(CANARY, json.dumps(loaded))
 
             # The host stays serviceable after digesting the hostile config.
             report = lifecycle.rpc(sock, 3902, "import.report", {"collectionId": "fixture-main"})
             self.assertIn("result", report)
-            self.assertNotIn(secret, json.dumps(report))
+            self.assertNotIn(CANARY, json.dumps(report))
 
 
 if __name__ == "__main__":

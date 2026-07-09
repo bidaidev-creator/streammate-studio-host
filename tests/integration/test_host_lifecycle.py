@@ -478,9 +478,15 @@ class StudioHostLifecycleTest(unittest.TestCase):
             self.assertFalse((imported_root / "scene.json").exists())
             self.assertFalse((imported_root / "basic" / "scenes" / "secret-scene.json").exists())
             self.assertFalse((imported_root / "linked-dir").exists())
-            for path in imported_root.rglob("*"):
+            # The vulnerable copy dereferences symlinks via std::filesystem::relative
+            # and lands the target under a SIBLING of the collection dir, outside
+            # imported_root. Assert obs-imports/ holds only the collection dir and
+            # scan the WHOLE STREAMMATE_HOME for the secret, not just the collection.
+            imports_root = streammate_home / "studio" / "obs-imports"
+            self.assertEqual(sorted(child.name for child in imports_root.iterdir()), ["fixture-main"])
+            for path in streammate_home.rglob("*"):
                 if path.is_file():
-                    self.assertNotIn(secret, path.read_text(encoding="utf-8"))
+                    self.assertNotIn(secret, path.read_text(encoding="utf-8", errors="replace"))
 
     def test_obs_import_pathological_braceless_collection_scan_is_bounded(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -489,7 +495,11 @@ class StudioHostLifecycleTest(unittest.TestCase):
             scenes_dir = obs_dir / "basic" / "scenes"
             scenes_dir.mkdir(parents=True)
             collection = scenes_dir / "fixture-main.json"
-            collection.write_text('"name":"Brace Free",' + ('"padding":"xxxxxxxxxx",' * 10000), encoding="utf-8")
+            # Many "name" anchors with NO matching "id": the pattern that drove
+            # the pre-fix backtracking regex quadratic (a single "name" anchor,
+            # as an earlier version of this test used, does NOT). Head
+            # single-pass scanner: ~0.00s; the pre-fix parser exceeds 7s here.
+            collection.write_text('{"name":"Brace Free"' + (',"name":"YYYYYYYYYY"' * 1500) + "}", encoding="utf-8")
 
             process, port, _ = start_host()
             self.addCleanup(stop_process, process)
@@ -499,7 +509,7 @@ class StudioHostLifecycleTest(unittest.TestCase):
             started = time.monotonic()
             scan = rpc(sock, 104, "import.scan", {"configDir": str(obs_dir)})
             elapsed = time.monotonic() - started
-            self.assertLess(elapsed, 1.0)
+            self.assertLess(elapsed, 2.0)
             self.assertEqual(
                 scan["result"],
                 {
