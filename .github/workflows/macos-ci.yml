@@ -59,6 +59,7 @@ jobs:
             -DCMAKE_C_FLAGS="-Wno-error=deprecated-declarations" \
             -DCMAKE_CXX_FLAGS="-Wno-error=deprecated-declarations" \
             -DENABLE_UI=OFF \
+            -DENABLE_SERVICE_UPDATES=OFF \
             -DENABLE_SCRIPTING=OFF \
             -DENABLE_WEBRTC=OFF \
             -DENABLE_VST=OFF \
