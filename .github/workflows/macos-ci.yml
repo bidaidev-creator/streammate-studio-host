@@ -148,6 +148,9 @@ jobs:
       - name: Run obs_startup smoke headlessly
         run: ./build/host/studio-host-smoke
 
+      - name: Run HAS_LIBOBS production-control verb smoke
+        run: ctest --test-dir build/host -R production-control-verbs --output-on-failure
+
       # Spec 34 Capability 3 / chunk 34.H3: compile the in-tree OBS plugin module
       # and its HAS_LIBOBS smoke. No `|| true` — the module MUST compile.
       - name: Build native-overlay OBS plugin module and smoke
