@@ -3391,12 +3391,29 @@ private:
            ",\"supportedCommands\":" + supported_commands_json_ + "}";
   }
 
+  // A safe method name is an ASCII identifier: alpha-led, then alnum/dot
+  // (uppercase is expected -- setProgram, refreshBrowser, exerciseTccPrompts).
+  // build_command_table validates every entry against this before serializing,
+  // so no name can carry a '"' or '\\' that would emit malformed JSON -- and any
+  // malformed/non-string entry would void the WHOLE declaration in the monorepo
+  // parser, silently disabling the native-host track.
+  static bool is_safe_method_name(const char *name) {
+    if (name == nullptr || *name == '\0') return false;
+    auto is_alpha = [](char c) { return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'); };
+    if (!is_alpha(name[0])) return false;
+    for (const char *p = name + 1; *p != '\0'; ++p) {
+      char c = *p;
+      if (!(is_alpha(c) || (c >= '0' && c <= '9') || c == '.')) return false;
+    }
+    return true;
+  }
+
   std::string build_supported_commands_json() const {
     std::string out = "[";
     for (std::size_t i = 0; i < command_table_.size(); ++i) {
       if (i) out += ",";
-      // Method names are trusted internal literals ([a-z.] only); emit as
-      // JSON strings.
+      // Names are validated against is_safe_method_name at construction, so
+      // they are safe to emit verbatim as JSON strings.
       out += "\"";
       out += command_table_[i].method;
       out += "\"";
@@ -3542,6 +3559,12 @@ private:
       g_stop = 1;
     });
     // <<< STUDIO_HOST_COMMAND_TABLE
+    for (const auto &entry : command_table_) {
+      if (!is_safe_method_name(entry.method)) {
+        throw std::runtime_error(std::string("unsafe command method name in dispatch table: ") +
+                                 (entry.method ? entry.method : "(null)"));
+      }
+    }
     supported_commands_json_ = build_supported_commands_json();
   }
 

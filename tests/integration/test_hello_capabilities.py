@@ -11,6 +11,7 @@ region of the C++ source), so the two cannot drift.
 """
 from __future__ import annotations
 
+import json
 import re
 import socket
 import sys
@@ -33,16 +34,63 @@ TABLE_END = "<<< STUDIO_HOST_COMMAND_TABLE"
 # must be rejected by the unknown-method path.
 ABSENT_VERB = "filter.reorder"
 
+# The real invariant the host declares (and validates at construction): a JSON
+# string method name -- alpha-led, then alnum/dot. Uppercase is expected
+# (setProgram, refreshBrowser, exerciseTccPrompts, ...).
+SAFE_METHOD_NAME = re.compile(r"^[A-Za-z][A-Za-z0-9.]*$")
+
+
+def _strip_cxx_comments(text: str) -> str:
+    """Remove C/C++ comments so parsing cannot be defeated by a commented-out or
+    documentation `add("phantom", ...)` or a quoted method name inside a comment
+    (e.g. `// kind "native-overlay"`)."""
+    text = re.sub(r"/\*.*?\*/", "", text, flags=re.DOTALL)
+    text = re.sub(r"//[^\n]*", "", text)
+    return text
+
+
+def _brace_body(text: str, signature: str) -> str:
+    """Return the brace-matched body of the function whose declaration contains
+    `signature`."""
+    start = text.index(signature)
+    open_brace = text.index("{", start)
+    depth = 0
+    for index in range(open_brace, len(text)):
+        char = text[index]
+        if char == "{":
+            depth += 1
+        elif char == "}":
+            depth -= 1
+            if depth == 0:
+                return text[open_brace + 1 : index]
+    raise AssertionError(f"unbalanced braces after {signature!r}")
+
 
 def dispatch_table_commands() -> list[str]:
     """Return the ordered method names registered in the dispatch table, parsed
-    straight from the C++ source's command-table region."""
+    straight from the C++ source's command-table region.
+
+    Hardened against parser defeats: comments/raw text are stripped, and EVERY
+    add() call must take a single string-literal method name as its first
+    argument. A concatenated (`add("new." "verb", ...)`) or computed
+    (`add(kName, ...)`) name -- which would diverge from what the runtime
+    dispatches -- makes the strict count mismatch the total and fails loudly."""
     text = SOURCE.read_text(encoding="utf-8")
     begin = text.index(TABLE_BEGIN)
     end = text.index(TABLE_END, begin)
-    region = text[begin:end]
-    # Each entry is registered as: add("method.name", [this](...){ ... });
-    return re.findall(r'add\("([^"]+)"', region)
+    region = _strip_cxx_comments(text[begin:end])
+    total_adds = re.findall(r"\badd\s*\(", region)
+    # Each entry is: add("method.name", [this](...){ ... }); -- the first arg is
+    # exactly one string literal immediately followed by a comma.
+    names = re.findall(r'\badd\s*\(\s*"((?:[^"\\]|\\.)*)"\s*,', region)
+    if len(names) != len(total_adds):
+        raise AssertionError(
+            f"every command-table add() must take a single string-literal method "
+            f"name (found {len(total_adds)} add() calls but "
+            f"{len(names)} single-literal names); a concatenated or computed name "
+            "would diverge from the runtime dispatch"
+        )
+    return names
 
 
 def hello_supported_commands(sock: socket.socket) -> object:
@@ -107,6 +155,57 @@ class HelloCapabilitiesTest(unittest.TestCase):
             response = host.rpc(sock, 100, verb, {})
             code = response.get("error", {}).get("code")
             self.assertNotEqual(code, -32601, f"declared verb not dispatched: {verb}")
+
+    def test_dispatch_only_through_command_table(self) -> None:
+        # H1: prove the table is the ONLY dispatch path, so "declaration ==
+        # table" also means "table == everything actually dispatched". A future
+        # direct branch (e.g. `if (method == "new.verb") { ... }` before the
+        # table loop) would dispatch an UNDECLARED command while every other
+        # capability test still passed. Assert handle_message contains no method
+        # matching against a string literal outside the table scan; the loop's
+        # own `method == entry.method` (a variable, no literal) is allowed.
+        body = _strip_cxx_comments(
+            _brace_body(
+                SOURCE.read_text(encoding="utf-8"),
+                "void handle_message(int fd, const std::string &payload) {",
+            )
+        )
+        forbidden = [
+            (r'method\s*==\s*"', "method == <literal>"),
+            (r'"[^"]*"\s*==\s*method\b', "<literal> == method"),
+            (r"method\s*\.\s*compare\s*\(", "method.compare("),
+            (r"method\s*\.\s*rfind\s*\(", "method.rfind( (prefix dispatch)"),
+            (r"method\s*\.\s*find\s*\(", "method.find("),
+            (r"method\s*\.\s*starts_with\s*\(", "method.starts_with("),
+            (r"strcmp\s*\([^)]*\bmethod\b", "strcmp( ... method"),
+        ]
+        offenders: list[str] = []
+        for pattern, label in forbidden:
+            for match in re.finditer(pattern, body):
+                line = body[: match.start()].count("\n") + 1
+                offenders.append(f"{label} at handle_message body line {line}: {match.group(0)!r}")
+        self.assertEqual(
+            offenders,
+            [],
+            "handle_message must dispatch ONLY via the command-table scan; a "
+            "direct method comparison would dispatch an undeclared verb:\n"
+            + "\n".join(offenders),
+        )
+
+    def test_hello_result_is_valid_json_of_safe_strings(self) -> None:
+        # H2: the whole host.hello result must be valid JSON and every declared
+        # entry a plain, safe string. A `"`/`\\` in a future method name would
+        # emit malformed JSON and (per the monorepo parser) void the ENTIRE
+        # declaration on any non-string entry -- silently disabling the track.
+        sock = self._connect()
+        result = host.rpc(sock, 1, "host.hello")["result"]
+        # Round-trips as JSON (rpc() already parsed the raw frame; a malformed
+        # frame would have raised in recv_text before reaching here).
+        commands = json.loads(json.dumps(result))["supportedCommands"]
+        self.assertIsInstance(commands, list)
+        for entry in commands:
+            self.assertIsInstance(entry, str, f"non-string entry: {entry!r}")
+            self.assertRegex(entry, SAFE_METHOD_NAME, f"unsafe method name: {entry!r}")
 
     def test_operator_verbs_present_only_when_dispatched(self) -> None:
         # output.*/import.* are operator-only and structurally unmappable by the
