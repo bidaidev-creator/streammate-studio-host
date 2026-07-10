@@ -13,6 +13,7 @@ import unittest
 from pathlib import Path
 
 import test_host_lifecycle as host
+import test_hello_capabilities as caps
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 WORKFLOW = REPO_ROOT / ".github" / "workflows" / "macos-ci.yml"
@@ -105,6 +106,19 @@ class ProductionControlVerbTest(unittest.TestCase):
     def _assert_host_still_healthy(self, sock: socket.socket, rpc_id: int) -> None:
         health = host.rpc(sock, rpc_id, "host.health", {})["result"]
         self.assertEqual(health["status"], "ready")
+
+    def test_hello_supported_commands_match_dispatch_table(self) -> None:
+        # Chunk 36.6: host.hello declares supportedCommands derived from the
+        # command table. This test runs in BOTH the scaffold ctest lane and the
+        # HAS_LIBOBS packaged-app smoke lane against the same source-derived
+        # table, so the two builds declare a contract-identical set + order
+        # (36.2 scaffold-parity discipline).
+        _, sock = self._connect()
+        declared = host.rpc(sock, 480, "host.hello")["result"].get("supportedCommands")
+        self.assertIsInstance(declared, list)
+        for entry in declared:
+            self.assertIsInstance(entry, str, f"non-string entry: {entry!r}")
+        self.assertEqual(declared, caps.dispatch_table_commands())
 
     def test_scaffold_contract_shape_parity_for_each_new_verb(self) -> None:
         _, sock = self._connect()

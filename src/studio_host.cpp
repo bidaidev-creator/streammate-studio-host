@@ -3269,6 +3269,7 @@ class ControlServer {
 public:
   ControlServer(Options options, EngineLifecycle &engine, StateFile &state) : options_(std::move(options)), engine_(engine), state_(state) {
     output_.set_launch_allow_live_egress(options_.allow_live_egress);
+    build_command_table();
   }
 
   int run() {
@@ -3363,31 +3364,101 @@ private:
     }
   }
 
+  // Chunk 36.6 (Spec 36 D36-2 / Capability 6): dispatch is driven by a single
+  // command table. host.hello serializes supportedCommands from exactly these
+  // method names (see hello_result), and handle_message dispatches by matching
+  // against them, so the declared capability set can never drift from what the
+  // host actually implements -- and a verb it cannot perform can never be
+  // declared.
   void handle_message(int fd, const std::string &payload) {
     std::string id = extract_json_id(payload);
     std::string method = extract_json_string(payload, "method");
-    if (method == "host.hello") {
-      send_text_frame(fd, rpc_result(id, "{\"hostId\":\"studio-host-1\",\"version\":\"" + std::string(kVersion) +
-                                      "\",\"heartbeatMs\":" + std::to_string(kHeartbeatMs) + "}"));
-    } else if (method == "host.health") {
+    for (const auto &entry : command_table_) {
+      if (method == entry.method) {
+        entry.handler(fd, id, payload);
+        return;
+      }
+    }
+    send_text_frame(fd, rpc_error(id, -32601, "method not found"));
+  }
+
+  // host.hello result, including supportedCommands derived from the command
+  // table. The array is a plain JSON array of strings (the monorepo parser
+  // voids the whole declaration on any non-string entry).
+  std::string hello_result() const {
+    return "{\"hostId\":\"studio-host-1\",\"version\":\"" + std::string(kVersion) +
+           "\",\"heartbeatMs\":" + std::to_string(kHeartbeatMs) +
+           ",\"supportedCommands\":" + supported_commands_json_ + "}";
+  }
+
+  // A safe method name is an ASCII identifier: alpha-led, then alnum/dot
+  // (uppercase is expected -- setProgram, refreshBrowser, exerciseTccPrompts).
+  // build_command_table validates every entry against this before serializing,
+  // so no name can carry a '"' or '\\' that would emit malformed JSON -- and any
+  // malformed/non-string entry would void the WHOLE declaration in the monorepo
+  // parser, silently disabling the native-host track.
+  static bool is_safe_method_name(const char *name) {
+    if (name == nullptr || *name == '\0') return false;
+    auto is_alpha = [](char c) { return (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z'); };
+    if (!is_alpha(name[0])) return false;
+    for (const char *p = name + 1; *p != '\0'; ++p) {
+      char c = *p;
+      if (!(is_alpha(c) || (c >= '0' && c <= '9') || c == '.')) return false;
+    }
+    return true;
+  }
+
+  std::string build_supported_commands_json() const {
+    std::string out = "[";
+    for (std::size_t i = 0; i < command_table_.size(); ++i) {
+      if (i) out += ",";
+      // Names are validated against is_safe_method_name at construction, so
+      // they are safe to emit verbatim as JSON strings.
+      out += "\"";
+      out += command_table_[i].method;
+      out += "\"";
+    }
+    out += "]";
+    return out;
+  }
+
+  void build_command_table() {
+    command_table_.clear();
+    auto add = [this](const char *method, CommandHandler handler) {
+      command_table_.push_back({method, std::move(handler)});
+    };
+    // >>> STUDIO_HOST_COMMAND_TABLE (single source of truth for both dispatch
+    // and host.hello's supportedCommands; do not hand-list these anywhere else)
+    add("host.hello", [this](int fd, const std::string &id, const std::string &) {
+      send_text_frame(fd, rpc_result(id, hello_result()));
+    });
+    add("host.health", [this](int fd, const std::string &id, const std::string &) {
       send_text_frame(fd, rpc_result(id, "{\"status\":\"ready\",\"engineStarted\":" + std::string(engine_.started() ? "true" : "false") +
                                       ",\"heartbeatMs\":" + std::to_string(kHeartbeatMs) +
                                       ",\"nativeOverlaySourceCount\":" + std::to_string(native_overlays_.count()) + "}"));
-    } else if (method == "host.exerciseTccPrompts") {
+    });
+    add("host.exerciseTccPrompts", [this](int fd, const std::string &id, const std::string &payload) {
       send_renderer_result(fd, id, importer_.exercise_tcc_prompts(payload));
-    } else if (method == "scene.load") {
+    });
+    add("scene.load", [this](int fd, const std::string &id, const std::string &payload) {
       send_renderer_result(fd, id, renderer_.load_scene(payload));
-    } else if (method == "scene.setProgram") {
+    });
+    add("scene.setProgram", [this](int fd, const std::string &id, const std::string &payload) {
       send_renderer_result(fd, id, renderer_.set_program(payload));
-    } else if (method == "scene.list") {
+    });
+    add("scene.list", [this](int fd, const std::string &id, const std::string &payload) {
       send_renderer_result(fd, id, renderer_.list_scenes(payload));
-    } else if (method == "scene.itemTransform") {
+    });
+    add("scene.itemTransform", [this](int fd, const std::string &id, const std::string &payload) {
       send_renderer_result(fd, id, renderer_.item_transform(payload));
-    } else if (method == "sceneItem.setVisible") {
+    });
+    add("sceneItem.setVisible", [this](int fd, const std::string &id, const std::string &payload) {
       send_renderer_result(fd, id, renderer_.set_item_visible(payload));
-    } else if (method == "sceneItem.setOrder") {
+    });
+    add("sceneItem.setOrder", [this](int fd, const std::string &id, const std::string &payload) {
       send_renderer_result(fd, id, renderer_.set_item_order(payload));
-    } else if (method == "source.remove") {
+    });
+    add("source.remove", [this](int fd, const std::string &id, const std::string &payload) {
       // Explicit opt-in Phase B native overlay sources are routed to their own
       // manager; every other id stays on the scaffold browser-source path.
       std::string source_id = extract_json_string(payload, "sourceId");
@@ -3396,7 +3467,8 @@ private:
       } else {
         send_renderer_result(fd, id, renderer_.remove_source(payload));
       }
-    } else if (method == "source.create") {
+    });
+    add("source.create", [this](int fd, const std::string &id, const std::string &payload) {
       // kind "native-overlay" is the explicit opt-in surface (Spec 34 Capability
       // 2); the default browser create path is untouched (ADR-0003 stands).
       if (extract_json_string(payload, "kind") == "native-overlay") {
@@ -3404,65 +3476,96 @@ private:
       } else {
         send_renderer_result(fd, id, renderer_.create_source(payload));
       }
-    } else if (method == "source.update") {
+    });
+    add("source.update", [this](int fd, const std::string &id, const std::string &payload) {
       std::string source_id = extract_json_string(payload, "sourceId");
       if (native_overlays_.has(source_id)) {
         send_renderer_result(fd, id, native_overlays_.apply(payload));
       } else {
         send_renderer_result(fd, id, renderer_.update_source(payload));
       }
-    } else if (method == "source.mute") {
+    });
+    add("source.mute", [this](int fd, const std::string &id, const std::string &payload) {
       send_renderer_result(fd, id, renderer_.mute_source(payload));
-    } else if (method == "filter.list") {
+    });
+    add("filter.list", [this](int fd, const std::string &id, const std::string &payload) {
       send_renderer_result(fd, id, renderer_.list_filters(payload));
-    } else if (method == "filter.setEnabled") {
+    });
+    add("filter.setEnabled", [this](int fd, const std::string &id, const std::string &payload) {
       send_renderer_result(fd, id, renderer_.set_filter_enabled(payload));
-    } else if (method == "filter.setSettings") {
+    });
+    add("filter.setSettings", [this](int fd, const std::string &id, const std::string &payload) {
       send_renderer_result(fd, id, renderer_.set_filter_settings(payload));
-    } else if (method == "audio.setVolume") {
+    });
+    add("audio.setVolume", [this](int fd, const std::string &id, const std::string &payload) {
       send_renderer_result(fd, id, renderer_.set_audio_volume(payload));
-    } else if (method == "media.control") {
+    });
+    add("media.control", [this](int fd, const std::string &id, const std::string &payload) {
       send_renderer_result(fd, id, renderer_.media_control(payload));
-    } else if (method == "source.refreshBrowser") {
+    });
+    add("source.refreshBrowser", [this](int fd, const std::string &id, const std::string &payload) {
       send_renderer_result(fd, id, renderer_.refresh_browser(payload));
-    } else if (method == "scene.captureFrame") {
+    });
+    add("scene.captureFrame", [this](int fd, const std::string &id, const std::string &payload) {
       send_renderer_result(fd, id, renderer_.capture_frame(payload));
-    } else if (method == "import.scan") {
+    });
+    add("import.scan", [this](int fd, const std::string &id, const std::string &payload) {
       send_renderer_result(fd, id, importer_.scan(payload));
-    } else if (method == "import.load") {
+    });
+    add("import.load", [this](int fd, const std::string &id, const std::string &payload) {
       send_renderer_result(fd, id, importer_.load(payload));
-    } else if (method == "import.report") {
+    });
+    add("import.report", [this](int fd, const std::string &id, const std::string &payload) {
       send_renderer_result(fd, id, importer_.report(payload));
-    } else if (method == "output.configure") {
+    });
+    add("output.configure", [this](int fd, const std::string &id, const std::string &payload) {
       send_output_result(fd, id, output_.configure(payload));
-    } else if (method == "output.start") {
+    });
+    add("output.start", [this](int fd, const std::string &id, const std::string &payload) {
       send_output_result(fd, id, output_.start(payload));
-    } else if (method == "output.stop") {
+    });
+    add("output.stop", [this](int fd, const std::string &id, const std::string &payload) {
       send_output_result(fd, id, output_.stop(payload));
-    } else if (method == "output.status") {
+    });
+    add("output.status", [this](int fd, const std::string &id, const std::string &payload) {
       send_output_result(fd, id, output_.status(payload));
-    } else if (method == "stats.subscribe") {
+    });
+    add("stats.subscribe", [this](int fd, const std::string &id, const std::string &payload) {
       send_output_result(fd, id, output_.subscribe(payload));
-    } else if (method == "record.start") {
+    });
+    add("record.start", [this](int fd, const std::string &id, const std::string &payload) {
       send_record_result(fd, id, record_replay_.start_record(payload));
-    } else if (method == "record.stop") {
+    });
+    add("record.stop", [this](int fd, const std::string &id, const std::string &payload) {
       send_record_result(fd, id, record_replay_.stop_record(payload));
-    } else if (method == "record.status") {
+    });
+    add("record.status", [this](int fd, const std::string &id, const std::string &payload) {
       send_record_result(fd, id, record_replay_.record_status(payload));
-    } else if (method == "replay.start") {
+    });
+    add("replay.start", [this](int fd, const std::string &id, const std::string &payload) {
       send_record_result(fd, id, record_replay_.start_replay(payload));
-    } else if (method == "replay.save") {
+    });
+    add("replay.save", [this](int fd, const std::string &id, const std::string &payload) {
       send_record_result(fd, id, record_replay_.save_replay(payload));
-    } else if (method == "replay.stop") {
+    });
+    add("replay.stop", [this](int fd, const std::string &id, const std::string &payload) {
       send_record_result(fd, id, record_replay_.stop_replay(payload));
-    } else if (method == "replay.status") {
+    });
+    add("replay.status", [this](int fd, const std::string &id, const std::string &payload) {
       send_record_result(fd, id, record_replay_.replay_status(payload));
-    } else if (method == "host.shutdown") {
+    });
+    add("host.shutdown", [this](int fd, const std::string &id, const std::string &) {
       send_text_frame(fd, rpc_result(id, "{\"ok\":true}"));
       g_stop = 1;
-    } else {
-      send_text_frame(fd, rpc_error(id, -32601, "method not found"));
+    });
+    // <<< STUDIO_HOST_COMMAND_TABLE
+    for (const auto &entry : command_table_) {
+      if (!is_safe_method_name(entry.method)) {
+        throw std::runtime_error(std::string("unsafe command method name in dispatch table: ") +
+                                 (entry.method ? entry.method : "(null)"));
+      }
     }
+    supported_commands_json_ = build_supported_commands_json();
   }
 
   void send_renderer_result(int fd, const std::string &id, const std::string &result) {
@@ -3493,6 +3596,12 @@ private:
     if (auto event = record_replay_.take_event()) send_text_frame(fd, *event);
   }
 
+  using CommandHandler = std::function<void(int fd, const std::string &id, const std::string &payload)>;
+  struct CommandEntry {
+    const char *method;
+    CommandHandler handler;
+  };
+
   Options options_;
   EngineLifecycle &engine_;
   StateFile &state_;
@@ -3502,6 +3611,8 @@ private:
   OutputController output_;
   RecordReplayController record_replay_;
   int port_ = 0;
+  std::vector<CommandEntry> command_table_;
+  std::string supported_commands_json_ = "[]";
 };
 
 } // namespace
