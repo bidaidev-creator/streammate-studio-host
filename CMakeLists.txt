@@ -137,6 +137,12 @@ if(BUILD_TESTING)
     NAME production-control-verbs
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_production_control_verbs.py $<TARGET_FILE:studio-host>
   )
+  # Chunk 36.6: host.hello declares supportedCommands derived from the dispatch
+  # table (capability truth, D36-2 / Capability 6).
+  add_test(
+    NAME hello-capabilities
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_hello_capabilities.py $<TARGET_FILE:studio-host>
+  )
   add_test(
     NAME macos-packaging
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_macos_packaging.py
