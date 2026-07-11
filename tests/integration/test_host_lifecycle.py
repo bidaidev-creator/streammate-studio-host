@@ -907,6 +907,14 @@ class StudioHostLifecycleTest(unittest.TestCase):
             [{"filterId": "color-correction", "label": "Color Correction", "enabled": True}],
         )
 
+        # Exact key sets: an accidental future leak (opacity, urlStatus, url, ...) must fail here.
+        self.assertEqual(
+            set(source),
+            {"sourceId", "sceneId", "kind", "visible", "muted", "volumeDb", "position", "filters"},
+        )
+        self.assertEqual(set(source["filters"][0]), {"filterId", "label", "enabled"})
+        self.assertEqual(set(by_id["scene-a"]), {"sceneId", "program", "label"})
+
         dumped = json.dumps(listed)
         self.assertNotIn("scene-list-secret", dumped)
         self.assertNotIn("\"url\"", dumped)
