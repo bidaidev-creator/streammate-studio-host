@@ -847,6 +847,68 @@ class StudioHostLifecycleTest(unittest.TestCase):
         self.assertTrue(reindexed["scene-a"]["program"])
         self.assertFalse(reindexed["scene-b"]["program"])
 
+    def test_scene_list_reports_source_state(self) -> None:
+        process, port, _ = start_host()
+        self.addCleanup(stop_process, process)
+        sock = websocket_connect(port)
+        self.addCleanup(sock.close)
+
+        rpc(sock, 300, "scene.load", {"sceneId": "scene-a", "width": 64, "height": 36})
+        rpc(sock, 301, "scene.load", {"sceneId": "scene-b", "width": 64, "height": 36})
+        rpc(sock, 302, "scene.setProgram", {"sceneId": "scene-b"})
+
+        secret_url = overlay_url_with_secret("scene-list-secret")
+        rpc(
+            sock,
+            303,
+            "source.create",
+            {
+                "sceneId": "scene-a",
+                "sourceId": "src-1",
+                "kind": "browser",
+                "url": secret_url,
+                "width": 64,
+                "height": 36,
+            },
+        )
+        rpc(sock, 304, "sceneItem.setVisible", {"sceneId": "scene-a", "itemId": "src-1", "visible": False})
+        rpc(sock, 305, "source.mute", {"sourceId": "src-1", "muted": True})
+        rpc(sock, 306, "audio.setVolume", {"sourceId": "src-1", "volumeDb": -12.5})
+        rpc(
+            sock,
+            307,
+            "sceneItem.setOrder",
+            {"sceneId": "scene-a", "itemId": "src-1", "position": 0, "idempotencyToken": "order-token-1"},
+        )
+
+        listed = rpc(sock, 308, "scene.list", {})["result"]
+        self.assertTrue(listed["ok"])
+        self.assertEqual(listed["programSceneId"], "scene-b")
+        by_id = {scene["sceneId"]: scene for scene in listed["scenes"]}
+        self.assertEqual(set(by_id), {"scene-a", "scene-b"})
+        self.assertFalse(by_id["scene-a"]["program"])
+        self.assertTrue(by_id["scene-b"]["program"])
+        self.assertEqual(by_id["scene-a"]["label"], "scene-a")
+        self.assertEqual(by_id["scene-b"]["label"], "scene-b")
+
+        self.assertEqual(len(listed["sources"]), 1)
+        source = listed["sources"][0]
+        self.assertEqual(source["sourceId"], "src-1")
+        self.assertEqual(source["sceneId"], "scene-a")
+        self.assertEqual(source["kind"], "browser")
+        self.assertFalse(source["visible"])
+        self.assertTrue(source["muted"])
+        self.assertAlmostEqual(source["volumeDb"], -12.5, places=3)
+        self.assertIsInstance(source["position"], int)
+        self.assertEqual(
+            source["filters"],
+            [{"filterId": "color-correction", "label": "Color Correction", "enabled": True}],
+        )
+
+        dumped = json.dumps(listed)
+        self.assertNotIn("scene-list-secret", dumped)
+        self.assertNotIn("\"url\"", dumped)
+
     def test_scene_item_transform_is_observable_in_capture_and_state(self) -> None:
         process, port, _ = start_host()
         self.addCleanup(stop_process, process)
