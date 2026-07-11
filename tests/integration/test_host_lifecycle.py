@@ -872,8 +872,10 @@ class StudioHostLifecycleTest(unittest.TestCase):
             },
         )
         rpc(sock, 304, "sceneItem.setVisible", {"sceneId": "scene-a", "itemId": "src-1", "visible": False})
-        rpc(sock, 305, "source.mute", {"sourceId": "src-1", "muted": True})
+        # audio.setVolume derives muted from the fader value (OBS bottom-of-fader
+        # silence rule), so it must run before the explicit source.mute call.
         rpc(sock, 306, "audio.setVolume", {"sourceId": "src-1", "volumeDb": -12.5})
+        rpc(sock, 305, "source.mute", {"sourceId": "src-1", "muted": True})
         rpc(
             sock,
             307,
