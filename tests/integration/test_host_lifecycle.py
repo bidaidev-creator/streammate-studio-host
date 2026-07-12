@@ -963,6 +963,25 @@ class StudioHostLifecycleTest(unittest.TestCase):
         self.assertTrue(listed["ok"])
         self.assertIn(control_source_id, [source["sourceId"] for source in listed["sources"]])
 
+        # The JSON-RPC id is spliced into every response too: a smuggled control
+        # byte inside a STRING id must be re-escaped, not echoed verbatim.
+        raw_list = '{"jsonrpc":"2.0","id":"rpc-\x01id","method":"scene.list"}'.encode("utf-8")
+        send_raw_text_frame(sock, raw_list)
+        while True:
+            listed_ctl = recv_text(sock)
+            if listed_ctl.get("id") == "rpc-\x01id":
+                break
+        self.assertTrue(listed_ctl["result"]["ok"])
+
+        # A non-scalar garbage id token degrades to null rather than raw splicing.
+        raw_bad_id = '{"jsonrpc":"2.0","id":bogus\x02token,"method":"scene.list"}'.encode("utf-8")
+        send_raw_text_frame(sock, raw_bad_id)
+        while True:
+            listed_bad = recv_text(sock)
+            if listed_bad.get("id") is None and "result" in listed_bad:
+                break
+        self.assertTrue(listed_bad["result"]["ok"])
+
     def test_scene_item_transform_is_observable_in_capture_and_state(self) -> None:
         process, port, _ = start_host()
         self.addCleanup(stop_process, process)
