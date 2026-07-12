@@ -80,7 +80,7 @@ std::string json_escape(const std::string &input) {
     case '\t': out << "\\t"; break;
     default:
       if (c < 0x20) {
-        // Zero-padded four-hex-digit escape (""), never the malformed "\u1".
+        // Zero-padded four-hex-digit escape (backslash-u0001 style), never the malformed short form.
         out << "\\u" << std::hex << std::uppercase << std::setw(4) << std::setfill('0')
             << static_cast<int>(c) << std::dec;
       } else {
@@ -495,10 +495,20 @@ std::string extract_json_id(const std::string &json) {
   if (json[start] == '"') {
     auto end = json.find('"', start + 1);
     if (end == std::string::npos) return "null";
-    return json.substr(start, end - start + 1);
+    // Re-escape the raw token: a smuggled control byte inside a string id must
+    // not make the response frame unparseable (same threat as json_escape).
+    return "\"" + json_escape(json.substr(start + 1, end - start - 1)) + "\"";
   }
   auto end = json.find_first_of(",}\r\n", start);
-  return json.substr(start, end == std::string::npos ? std::string::npos : end - start);
+  std::string token = json.substr(start, end == std::string::npos ? std::string::npos : end - start);
+  while (!token.empty() && (token.back() == ' ' || token.back() == '\t')) token.pop_back();
+  // Non-string ids are spliced back verbatim only when they are a safe JSON
+  // scalar token; anything else degrades to null rather than raw bytes.
+  if (token == "null" || token == "true" || token == "false" ||
+      (!token.empty() && token.find_first_not_of("0123456789+-.eE") == std::string::npos)) {
+    return token;
+  }
+  return "null";
 }
 
 std::optional<int> extract_json_int(const std::string &json, const std::string &key) {
