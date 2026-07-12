@@ -981,6 +981,10 @@ public:
            ",\"pngBase64\":\"" + base64(png.data(), png.size()) + "\"}";
   }
 
+  // scene.list intentionally answers from the authoritative in-memory model
+  // (scaffold scenes_/sources_/filters_), matching the filter.list precedent
+  // above; no libobs reads. Additive sources[] deliberately omits url/opacity
+  // to preserve the source_result() redaction invariant.
   std::string list_scenes(const std::string &) const {
     std::string scenes_json;
     bool first = true;
@@ -989,9 +993,32 @@ public:
       first = false;
       bool is_program = entry.first == program_scene_id_;
       scenes_json += "{\"sceneId\":\"" + json_escape(entry.first) + "\",\"program\":" +
-                     std::string(is_program ? "true" : "false") + "}";
+                     std::string(is_program ? "true" : "false") + ",\"label\":\"" + json_escape(entry.first) + "\"}";
     }
-    return "{\"ok\":true,\"programSceneId\":\"" + json_escape(program_scene_id_) + "\",\"scenes\":[" + scenes_json + "]}";
+    std::string sources_json;
+    first = true;
+    for (const auto &entry : sources_) {
+      if (!first) sources_json += ",";
+      first = false;
+      const SourceModel &source = entry.second;
+      sources_json += "{\"sourceId\":\"" + json_escape(source.id) + "\",\"sceneId\":\"" + json_escape(source.scene_id) +
+                       "\",\"kind\":\"" + json_escape(source.kind) + "\",\"visible\":" +
+                       std::string(source.visible ? "true" : "false") + ",\"muted\":" +
+                       std::string(source.muted ? "true" : "false") + ",\"volumeDb\":" + json_number(source.volume_db) +
+                       ",\"position\":" + std::to_string(source.position) + ",\"filters\":[";
+      auto filters_it = filters_.find(source.id);
+      if (filters_it != filters_.end()) {
+        for (size_t i = 0; i < filters_it->second.size(); ++i) {
+          const FilterModel &filter = filters_it->second[i];
+          if (i) sources_json += ",";
+          sources_json += "{\"filterId\":\"" + json_escape(filter.id) + "\",\"label\":\"" + json_escape(filter.label) +
+                           "\",\"enabled\":" + std::string(filter.enabled ? "true" : "false") + "}";
+        }
+      }
+      sources_json += "]}";
+    }
+    return "{\"ok\":true,\"programSceneId\":\"" + json_escape(program_scene_id_) + "\",\"scenes\":[" + scenes_json +
+           "],\"sources\":[" + sources_json + "]}";
   }
 
   std::string item_transform(const std::string &request) {
