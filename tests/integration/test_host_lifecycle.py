@@ -967,7 +967,9 @@ class StudioHostLifecycleTest(unittest.TestCase):
         # byte inside a STRING id must be re-escaped, not echoed verbatim.
         raw_list = '{"jsonrpc":"2.0","id":"rpc-\x01id","method":"scene.list"}'.encode("utf-8")
         send_raw_text_frame(sock, raw_list)
+        deadline = time.time() + 15
         while True:
+            self.assertLess(time.time(), deadline, "no matching response (listed_ctl); host heartbeats keep the socket alive")
             listed_ctl = recv_text(sock)
             if listed_ctl.get("id") == "rpc-\x01id":
                 break
@@ -976,11 +978,37 @@ class StudioHostLifecycleTest(unittest.TestCase):
         # A non-scalar garbage id token degrades to null rather than raw splicing.
         raw_bad_id = '{"jsonrpc":"2.0","id":bogus\x02token,"method":"scene.list"}'.encode("utf-8")
         send_raw_text_frame(sock, raw_bad_id)
+        deadline = time.time() + 15
         while True:
+            self.assertLess(time.time(), deadline, "no matching response (listed_bad); host heartbeats keep the socket alive")
             listed_bad = recv_text(sock)
             if listed_bad.get("id") is None and "result" in listed_bad:
                 break
         self.assertTrue(listed_bad["result"]["ok"])
+
+        # Valid escaped string ids must round-trip exactly: no double escaping,
+        # no truncation at an escaped quote.
+        raw_escaped_id = '{"jsonrpc":"2.0","id":"a\\nb \\"q\\"","method":"scene.list"}'.encode("utf-8")
+        send_raw_text_frame(sock, raw_escaped_id)
+        deadline = time.time() + 15
+        while True:
+            self.assertLess(time.time(), deadline, "no matching response (listed_esc); host heartbeats keep the socket alive")
+            listed_esc = recv_text(sock)
+            if listed_esc.get("id") == 'a\nb "q"':
+                break
+        self.assertTrue(listed_esc["result"]["ok"])
+
+        # An allowlisted-charset but malformed number token (1e) is not valid
+        # JSON and must degrade to null, not be spliced verbatim.
+        raw_bad_number = '{"jsonrpc":"2.0","id":1e,"method":"scene.list"}'.encode("utf-8")
+        send_raw_text_frame(sock, raw_bad_number)
+        deadline = time.time() + 15
+        while True:
+            self.assertLess(time.time(), deadline, "no matching response (listed_badnum); host heartbeats keep the socket alive")
+            listed_badnum = recv_text(sock)
+            if listed_badnum.get("id") is None and "result" in listed_badnum:
+                break
+        self.assertTrue(listed_badnum["result"]["ok"])
 
     def test_scene_item_transform_is_observable_in_capture_and_state(self) -> None:
         process, port, _ = start_host()
