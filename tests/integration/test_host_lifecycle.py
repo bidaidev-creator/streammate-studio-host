@@ -129,6 +129,20 @@ def send_text(sock: socket.socket, payload: dict) -> None:
     sock.sendall(header + mask + masked)
 
 
+def send_raw_text_frame(sock: socket.socket, raw: bytes) -> None:
+    # Byte-verbatim variant of send_text: lets a test smuggle raw control bytes
+    # that json.dumps would escape (the host substring parser copies them as-is).
+    mask = os.urandom(4)
+    if len(raw) < 126:
+        header = bytes([0x81, 0x80 | len(raw)])
+    elif len(raw) <= 0xFFFF:
+        header = bytes([0x81, 0x80 | 126]) + struct.pack("!H", len(raw))
+    else:
+        raise AssertionError("test payload too large")
+    masked = bytes(byte ^ mask[index % 4] for index, byte in enumerate(raw))
+    sock.sendall(header + mask + masked)
+
+
 def rpc(sock: socket.socket, rpc_id: int, method: str, params: dict | None = None) -> dict:
     request: dict = {"jsonrpc": "2.0", "id": rpc_id, "method": method}
     if params is not None:
@@ -918,6 +932,83 @@ class StudioHostLifecycleTest(unittest.TestCase):
         dumped = json.dumps(listed)
         self.assertNotIn("scene-list-secret", dumped)
         self.assertNotIn("\"url\"", dumped)
+
+    def test_scene_list_escapes_raw_control_characters(self) -> None:
+        # json_escape must zero-pad generic \u escapes to four hex digits. A raw
+        # control byte smuggled into an id by a token-authenticated caller (the
+        # substring parser copies payload bytes verbatim, no \u decoding) must not
+        # make any later response frame unparseable JSON — one poisoned id would
+        # otherwise disable every scene.list read for the session.
+        process, port, _ = start_host()
+        self.addCleanup(stop_process, process)
+        sock = websocket_connect(port)
+        self.addCleanup(sock.close)
+
+        rpc(sock, 330, "scene.load", {"sceneId": "scene-ctl", "width": 64, "height": 36})
+        control_source_id = "src-\x01ctl"
+        raw_create = (
+            '{"jsonrpc":"2.0","id":331,"method":"source.create","params":{'
+            '"sceneId":"scene-ctl","sourceId":"src-\x01ctl","kind":"browser",'
+            '"url":"https://station.localhost/overlay?show=test","width":64,"height":36}}'
+        ).encode("utf-8")
+        send_raw_text_frame(sock, raw_create)
+        while True:
+            created = recv_text(sock)
+            if created.get("id") == 331:
+                break
+        self.assertTrue(created["result"]["ok"])
+        self.assertEqual(created["result"]["sourceId"], control_source_id)
+
+        listed = rpc(sock, 332, "scene.list", {})["result"]
+        self.assertTrue(listed["ok"])
+        self.assertIn(control_source_id, [source["sourceId"] for source in listed["sources"]])
+
+        # The JSON-RPC id is spliced into every response too: a smuggled control
+        # byte inside a STRING id must be re-escaped, not echoed verbatim.
+        raw_list = '{"jsonrpc":"2.0","id":"rpc-\x01id","method":"scene.list"}'.encode("utf-8")
+        send_raw_text_frame(sock, raw_list)
+        deadline = time.time() + 15
+        while True:
+            self.assertLess(time.time(), deadline, "no matching response (listed_ctl); host heartbeats keep the socket alive")
+            listed_ctl = recv_text(sock)
+            if listed_ctl.get("id") == "rpc-\x01id":
+                break
+        self.assertTrue(listed_ctl["result"]["ok"])
+
+        # A non-scalar garbage id token degrades to null rather than raw splicing.
+        raw_bad_id = '{"jsonrpc":"2.0","id":bogus\x02token,"method":"scene.list"}'.encode("utf-8")
+        send_raw_text_frame(sock, raw_bad_id)
+        deadline = time.time() + 15
+        while True:
+            self.assertLess(time.time(), deadline, "no matching response (listed_bad); host heartbeats keep the socket alive")
+            listed_bad = recv_text(sock)
+            if listed_bad.get("id") is None and "result" in listed_bad:
+                break
+        self.assertTrue(listed_bad["result"]["ok"])
+
+        # Valid escaped string ids must round-trip exactly: no double escaping,
+        # no truncation at an escaped quote.
+        raw_escaped_id = '{"jsonrpc":"2.0","id":"a\\nb \\"q\\"","method":"scene.list"}'.encode("utf-8")
+        send_raw_text_frame(sock, raw_escaped_id)
+        deadline = time.time() + 15
+        while True:
+            self.assertLess(time.time(), deadline, "no matching response (listed_esc); host heartbeats keep the socket alive")
+            listed_esc = recv_text(sock)
+            if listed_esc.get("id") == 'a\nb "q"':
+                break
+        self.assertTrue(listed_esc["result"]["ok"])
+
+        # An allowlisted-charset but malformed number token (1e) is not valid
+        # JSON and must degrade to null, not be spliced verbatim.
+        raw_bad_number = '{"jsonrpc":"2.0","id":1e,"method":"scene.list"}'.encode("utf-8")
+        send_raw_text_frame(sock, raw_bad_number)
+        deadline = time.time() + 15
+        while True:
+            self.assertLess(time.time(), deadline, "no matching response (listed_badnum); host heartbeats keep the socket alive")
+            listed_badnum = recv_text(sock)
+            if listed_badnum.get("id") is None and "result" in listed_badnum:
+                break
+        self.assertTrue(listed_badnum["result"]["ok"])
 
     def test_scene_item_transform_is_observable_in_capture_and_state(self) -> None:
         process, port, _ = start_host()
