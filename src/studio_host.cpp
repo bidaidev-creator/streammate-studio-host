@@ -485,6 +485,69 @@ std::string extract_json_string(const std::string &json, const std::string &key)
   return out;
 }
 
+bool is_json_number_token(const std::string &token) {
+  size_t pos = 0;
+  const auto digit = [&](size_t at) {
+    return at < token.size() && token[at] >= '0' && token[at] <= '9';
+  };
+  if (pos < token.size() && token[pos] == '-') ++pos;
+  if (!digit(pos)) return false;
+  if (token[pos] == '0') {
+    ++pos;
+  } else {
+    while (digit(pos)) ++pos;
+  }
+  if (pos < token.size() && token[pos] == '.') {
+    ++pos;
+    if (!digit(pos)) return false;
+    while (digit(pos)) ++pos;
+  }
+  if (pos < token.size() && (token[pos] == 'e' || token[pos] == 'E')) {
+    ++pos;
+    if (pos < token.size() && (token[pos] == '+' || token[pos] == '-')) ++pos;
+    if (!digit(pos)) return false;
+    while (digit(pos)) ++pos;
+  }
+  return pos == token.size();
+}
+
+// Re-emit a raw string-id token (escapes still encoded) so that valid escapes
+// round-trip untouched while raw control bytes and lone backslashes are
+// re-escaped — a smuggled byte must never make the response unparseable.
+std::string sanitize_json_string_token(const std::string &raw) {
+  std::string out;
+  const auto is_hex = [](char c) {
+    return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
+  };
+  for (size_t i = 0; i < raw.size(); ++i) {
+    unsigned char c = static_cast<unsigned char>(raw[i]);
+    if (c == '\\') {
+      if (i + 1 < raw.size()) {
+        char next = raw[i + 1];
+        if (next == '"' || next == '\\' || next == '/' || next == 'b' || next == 'f' ||
+            next == 'n' || next == 'r' || next == 't') {
+          out.push_back('\\');
+          out.push_back(next);
+          ++i;
+          continue;
+        }
+        if (next == 'u' && i + 5 < raw.size() && is_hex(raw[i + 2]) && is_hex(raw[i + 3]) &&
+            is_hex(raw[i + 4]) && is_hex(raw[i + 5])) {
+          out += raw.substr(i, 6);
+          i += 5;
+          continue;
+        }
+      }
+      out += "\\\\";
+      continue;
+    }
+    // Quotes cannot appear unescaped (extraction stops there); everything else
+    // funnels through json_escape so control bytes get the padded \uXXXX form.
+    out += json_escape(std::string(1, static_cast<char>(c)));
+  }
+  return out;
+}
+
 std::string extract_json_id(const std::string &json) {
   auto marker = json.find("\"id\"");
   if (marker == std::string::npos) return "null";
@@ -493,19 +556,37 @@ std::string extract_json_id(const std::string &json) {
   auto start = json.find_first_not_of(" \t\r\n", colon + 1);
   if (start == std::string::npos) return "null";
   if (json[start] == '"') {
-    auto end = json.find('"', start + 1);
-    if (end == std::string::npos) return "null";
-    // Re-escape the raw token: a smuggled control byte inside a string id must
-    // not make the response frame unparseable (same threat as json_escape).
-    return "\"" + json_escape(json.substr(start + 1, end - start - 1)) + "\"";
+    // Escape-aware scan to the closing quote (an escaped \" is not the end).
+    std::string inner;
+    bool escape = false;
+    bool closed = false;
+    for (size_t pos = start + 1; pos < json.size(); ++pos) {
+      char c = json[pos];
+      if (escape) {
+        inner.push_back(c);
+        escape = false;
+        continue;
+      }
+      if (c == '\\') {
+        inner.push_back(c);
+        escape = true;
+        continue;
+      }
+      if (c == '"') {
+        closed = true;
+        break;
+      }
+      inner.push_back(c);
+    }
+    if (!closed) return "null";
+    return "\"" + sanitize_json_string_token(inner) + "\"";
   }
   auto end = json.find_first_of(",}\r\n", start);
   std::string token = json.substr(start, end == std::string::npos ? std::string::npos : end - start);
   while (!token.empty() && (token.back() == ' ' || token.back() == '\t')) token.pop_back();
-  // Non-string ids are spliced back verbatim only when they are a safe JSON
+  // Non-string ids are spliced back verbatim only when they are a valid JSON
   // scalar token; anything else degrades to null rather than raw bytes.
-  if (token == "null" || token == "true" || token == "false" ||
-      (!token.empty() && token.find_first_not_of("0123456789+-.eE") == std::string::npos)) {
+  if (token == "null" || token == "true" || token == "false" || is_json_number_token(token)) {
     return token;
   }
   return "null";
