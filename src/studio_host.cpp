@@ -80,7 +80,9 @@ std::string json_escape(const std::string &input) {
     case '\t': out << "\\t"; break;
     default:
       if (c < 0x20) {
-        out << "\\u" << std::hex << std::uppercase << static_cast<int>(c);
+        // Zero-padded four-hex-digit escape (""), never the malformed "\u1".
+        out << "\\u" << std::hex << std::uppercase << std::setw(4) << std::setfill('0')
+            << static_cast<int>(c) << std::dec;
       } else {
         out << c;
       }
