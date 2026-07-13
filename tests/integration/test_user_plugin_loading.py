@@ -236,8 +236,12 @@ class UserPluginStaticContractTest(unittest.TestCase):
 
     def test_cmake_declares_test_plugin_module_targets(self) -> None:
         cmake = self._cmake()
+        # The three test modules are declared through one foreach over MODULE
+        # bundles; each name must be in the list and the loop must build a
+        # BUNDLE_EXTENSION plugin MODULE library.
         for target in ("streammate-test-source", "streammate-test-filter", "streammate-test-noop"):
-            self.assertRegex(cmake, rf"add_library\({re.escape(target)}\s+MODULE")
+            self.assertIn(target, cmake)
+        self.assertRegex(cmake, r"add_library\(\$\{test_module\}\s+MODULE")
         self.assertIn("user-plugin-module-smoke", cmake)
 
     def test_module_sources_register_pinned_type_ids(self) -> None:
