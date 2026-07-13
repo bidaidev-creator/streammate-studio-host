@@ -53,7 +53,29 @@ EXEMPT_IDS = {
     # "group" is a scene-collection construct (obs_group_from_source), not a
     # registered source info id.
     "group",
+    # Registered by the obs-browser plugin (plugins/obs-browser is a NESTED
+    # submodule not populated by fork-guard; ground truth: obs-browser
+    # browser-source.cpp .id = "browser_source" at the pin's obs-browser rev).
+    "browser_source",
 }
+
+VERSIONED_ID = re.compile(r"^(?P<base>.+)_v(?P<version>[0-9]+)$")
+
+
+def id_exists_in_tree(pinned_id: str, haystack: str) -> bool:
+    """True when the id is registered in the pinned tree.
+
+    Encodes the obs versioned-id convention: a struct with .id = "<base>" and
+    .version = N registers the effective lookup id "<base>_vN", which never
+    appears as a string literal. For such ids the BASE id must exist as a
+    literal (and the _v suffix is accepted as the upstream convention).
+    """
+    if f'"{pinned_id}"' in haystack:
+        return True
+    versioned = VERSIONED_ID.match(pinned_id)
+    if versioned is not None:
+        return f'"{versioned.group("base")}"' in haystack
+    return False
 
 
 def extract_set(function_name: str) -> list[str]:
@@ -125,7 +147,7 @@ class UpstreamPinSetDerivationTest(unittest.TestCase):
             for pinned_id in extract_set(function_name):
                 if pinned_id in EXEMPT_IDS:
                     continue
-                if f'"{pinned_id}"' not in self.haystack:
+                if not id_exists_in_tree(pinned_id, self.haystack):
                     missing.append(f"{function_name}: {pinned_id}")
         self.assertEqual(
             missing,
@@ -135,7 +157,7 @@ class UpstreamPinSetDerivationTest(unittest.TestCase):
         )
 
     def test_exempt_ids_stay_minimal_and_reviewed(self) -> None:
-        self.assertEqual(EXEMPT_IDS, {"group"})
+        self.assertEqual(EXEMPT_IDS, {"group", "browser_source"})
 
     def test_m3_handoff_omissions_are_pinned(self) -> None:
         device_backed = set(extract_set("device_backed_source_ids"))
