@@ -143,6 +143,12 @@ if(BUILD_TESTING)
     NAME hello-capabilities
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_hello_capabilities.py $<TARGET_FILE:studio-host>
   )
+  # Chunk NIF-H1: user plugin discovery + static probe (manifest-driven
+  # inventory; sha256 + Mach-O arch read from header bytes; no loading).
+  add_test(
+    NAME plugin-discovery
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_plugin_discovery.py $<TARGET_FILE:studio-host>
+  )
   add_test(
     NAME macos-packaging
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_macos_packaging.py
