@@ -2849,7 +2849,11 @@ const std::set<std::string> &upstream_source_ids() {
       "display_capture", "window_capture", "sck_audio_capture",  "syphon-input",          "decklink-input",
       "audio_line",      "wasapi_input_capture", "wasapi_output_capture", "dshow_input",  "game_capture",
       "monitor_capture", "jack_output_capture",  "pulse_input_capture",   "pulse_output_capture",
-      "v4l2_input",      "xcomposite_input",     "xshm_input",            "alsa_input_capture"};
+      "v4l2_input",      "xcomposite_input",     "xshm_input",            "alsa_input_capture",
+      // Renamed/versioned upstream ids at the 32.x pin (macOS capture rename,
+      // versioned text/color sources): upstream surface, never placeholders.
+      "macos-avcapture", "macos-avcapture-fast", "text_ft2_source_v2", "text_gdiplus_v2",
+      "color_source_v2", "color_source_v3",      "slideshow_v2"};
   return ids;
 }
 
@@ -4134,9 +4138,34 @@ public:
     try {
       const std::string digest_before = config_tree_digest(*config);
       const CustodyAnalysis analysis = analyze_custody(*config, json);
+      // Redact credential-class values in EVERY scene-collection copy — a
+      // config dir can hold several collections and none may carry secrets
+      // into the workspace.
       std::map<std::string, std::string> overrides;
-      if (!analysis.redactions.empty()) {
-        overrides[std::filesystem::relative(*collection, *config).generic_string()] = apply_redactions(json, analysis.redactions);
+      std::error_code scenes_ec;
+      const std::filesystem::path scenes_dir = *config / "basic" / "scenes";
+      for (std::filesystem::directory_iterator it(scenes_dir, scenes_ec), end; it != end; ++it) {
+        if (!it->is_regular_file() || it->path().extension() != ".json") continue;
+        if (std::filesystem::is_symlink(it->symlink_status())) continue;
+        std::string body;
+        try {
+          body = read_text_file(it->path());
+        } catch (...) {
+          continue;
+        }
+        std::vector<CustodyRedaction> redactions;
+        for (const auto &entry : parse_obs_source_entries(body)) {
+          if (entry.settings_raw.empty()) continue;
+          for (const auto &field : parse_settings_fields(entry.settings_raw)) {
+            if (credential_settings_keys().count(field.key) > 0 && field.is_string) {
+              redactions.push_back({"source:" + entry.label, field.key, entry.settings_offset + field.value_offset,
+                                    field.value_length});
+            }
+          }
+        }
+        if (!redactions.empty()) {
+          overrides[std::filesystem::relative(it->path(), *config).generic_string()] = apply_redactions(body, redactions);
+        }
       }
       std::filesystem::remove_all(temp);
       copy_config_without_service_json(*config, temp, overrides.empty() ? nullptr : &overrides);

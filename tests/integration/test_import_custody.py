@@ -221,6 +221,50 @@ class ImportCustodyTest(unittest.TestCase):
         self.assertEqual(migration[0]["label"], "Future Plugin")
         self.assertTrue(any("plugin_settings_version" in note for note in migration[0].get("notes", [])))
 
+    def test_second_collection_credentials_also_redacted(self) -> None:
+        # A config dir can hold several scene collections; the workspace copy
+        # of EVERY collection file must be credential-redacted, not just the
+        # loaded one.
+        second = json.dumps(
+            {
+                "name": "Custody Side",
+                "sources": [
+                    {
+                        "name": "Side Plugin",
+                        "id": "streammate_test_source",
+                        "settings": {"password": CRED_VALUE},
+                    }
+                ],
+            }
+        )
+        (self.obs_dir / "basic" / "scenes" / "custody-side.json").write_text(second, encoding="utf-8")
+        self.load("custody-main")
+        side_copy = (self.workspace("custody-main") / "basic/scenes/custody-side.json").read_text()
+        self.assertNotIn(CRED_VALUE, side_copy)
+        self.assertIn(REDACTION_SENTINEL, side_copy)
+        # Source stays untouched.
+        self.assertIn(CRED_VALUE, (self.obs_dir / "basic/scenes/custody-side.json").read_text())
+
+    def test_versioned_upstream_ids_never_degrade_missing_plugin(self) -> None:
+        # Renamed/versioned upstream module ids at the OBS 32.x pin (macOS
+        # capture rename, versioned text/color sources) are upstream capability
+        # surface, never third-party placeholders.
+        body = json.dumps(
+            {
+                "name": "Upstream Versions",
+                "sources": [
+                    {"name": "New Cam", "id": "macos-avcapture", "settings": {}},
+                    {"name": "Fast Cam", "id": "macos-avcapture-fast", "settings": {}},
+                    {"name": "New Text", "id": "text_ft2_source_v2", "settings": {}},
+                    {"name": "Color V3", "id": "color_source_v3", "settings": {}},
+                ],
+            }
+        )
+        build_config(self.obs_dir, "custody-upstream", body)
+        result = self.load("custody-upstream")
+        report = json.dumps(result["report"])
+        self.assertNotIn("missing_plugin", report)
+
     def test_import_map_byte_deterministic(self) -> None:
         self.load()
         first = (self.workspace() / "streammate-import-map.json").read_bytes()
