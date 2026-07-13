@@ -327,6 +327,7 @@ def expected_import_report(service_key_action: str = "requires-consent") -> dict
             {"id": "source:Color Backdrop", "kind": "source", "label": "Color Backdrop", "state": "mapped", "reason": "mapped_native", "moduleName": "color_source"},
             {"id": "source:ID First Color", "kind": "source", "label": "ID First Color", "state": "mapped", "reason": "mapped_native", "moduleName": "color_source"},
             {"id": "source:Station Overlay", "kind": "source", "label": "Station Overlay", "state": "mapped", "reason": "mapped_native", "moduleName": "browser_source"},
+            {"id": "filter:Station Overlay:LUT", "kind": "filter", "label": "Station Overlay / LUT", "state": "mapped", "reason": "mapped_native", "moduleName": "color_filter_v2", "notes": ["Native filter chain: applied via the host filter verbs."]},
             {"id": "source:Headline", "kind": "source", "label": "Headline", "state": "mapped", "reason": "mapped_native", "moduleName": "text_ft2_source"},
             {"id": "source:BRB Image", "kind": "source", "label": "BRB Image", "state": "mapped", "reason": "mapped_native", "moduleName": "image_source"},
             {"id": "source:Media Clip", "kind": "source", "label": "Media Clip", "state": "mapped", "reason": "mapped_native", "moduleName": "ffmpeg_source"},
@@ -339,9 +340,7 @@ def expected_import_report(service_key_action: str = "requires-consent") -> dict
             {"id": "source:Missing Plugin Source", "kind": "source", "label": "Missing Plugin Source", "state": "degraded", "reason": "missing_plugin", "moduleName": "third_party_camera_fx", "notes": ["Replaced with placeholder source because obs-third-party-fx is not bundled upstream."]},
             {"id": "source:Unplugged Camera", "kind": "source", "label": "Unplugged Camera", "state": "degraded", "reason": "missing_device", "moduleName": "av_capture_input", "tccClass": "camera", "notes": ["Original device identifier was absent from the fixture."]},
         ],
-        "unresolved": [
-            {"id": "filter:Station Overlay:LUT", "kind": "filter", "label": "Station Overlay / LUT", "state": "unresolved", "reason": "unsupported_frontend_feature", "moduleName": "color_filter_v2", "notes": ["OBS frontend filter is not imported by the native host scaffold."]},
-        ],
+        "unresolved": [],
         "profile": {
             "mappedEncoder": "x264",
             "mappedOutput": "rtmp",

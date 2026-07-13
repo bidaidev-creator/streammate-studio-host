@@ -179,6 +179,11 @@ if(BUILD_TESTING)
     NAME import-custody
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_import_custody.py $<TARGET_FILE:studio-host>
   )
+  # NIF-M3: remaining OBS import parity slices (exhaustive report accounting).
+  add_test(
+    NAME import-parity
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_import_parity.py $<TARGET_FILE:studio-host>
+  )
   add_test(
     NAME production-control-verbs
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_production_control_verbs.py $<TARGET_FILE:studio-host>
