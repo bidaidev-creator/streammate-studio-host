@@ -28,6 +28,7 @@ from pathlib import Path
 import test_host_lifecycle as host
 
 HOST_BIN = host.HOST_BIN
+IS_MACOS = sys.platform == "darwin"
 
 # The host's launch-refusal convention: parse_args throws, main() logs
 # host.exited and returns kUsageExit. (This repo's "exit-code-2 semantics".)
@@ -35,6 +36,43 @@ USAGE_EXIT = 64
 
 CPU_TYPE_X86_64 = 0x01000007
 CPU_TYPE_ARM64 = 0x0100000C
+
+
+def recv_raw_text(sock, timeout: float = 7.0) -> str:
+    """Like host.recv_text but returns the raw frame payload text, so tests
+    can assert FRAME-LEVEL determinism (byte-identical JSON, not merely equal
+    parsed dicts)."""
+    sock.settimeout(timeout)
+    first = sock.recv(2)
+    if len(first) != 2:
+        raise AssertionError("short websocket frame")
+    opcode = first[0] & 0x0F
+    length = first[1] & 0x7F
+    if length == 126:
+        length = struct.unpack("!H", sock.recv(2))[0]
+    elif length == 127:
+        ext = b""
+        while len(ext) < 8:
+            ext += sock.recv(8 - len(ext))
+        length = struct.unpack("!Q", ext)[0]
+    payload = b""
+    while len(payload) < length:
+        payload += sock.recv(length - len(payload))
+    if opcode != 1:
+        return recv_raw_text(sock, timeout)
+    return payload.decode("utf-8")
+
+
+def rpc_raw(sock, rpc_id: int, method: str, params: dict) -> str:
+    host.send_text(sock, {"jsonrpc": "2.0", "id": rpc_id, "method": method, "params": params})
+    while True:
+        raw = recv_raw_text(sock)
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            continue
+        if parsed.get("id") == rpc_id:
+            return raw
 
 
 def thin_macho64(cputype: int) -> bytes:
@@ -101,10 +139,13 @@ class PluginDiscoveryTest(unittest.TestCase):
         self.root0.mkdir()
         self.root1.mkdir()
 
-        # root0: a REAL Mach-O (the host binary itself) in a CFBundle layout,
-        # an excluded fabricated arm64 bundle, a nested legacy universal
-        # module, and an unsafe-named bundle that must be skipped.
-        self.alpha_bin = build_bundle(self.root0, "alpha", HOST_BIN.read_bytes())
+        # root0: a REAL Mach-O (the host binary itself, macOS only -- on other
+        # platforms the host binary is not Mach-O, so a fabricated thin arm64
+        # header stands in) in a CFBundle layout, an excluded fabricated arm64
+        # bundle, a nested legacy universal module, and an unsafe-named bundle
+        # that must be skipped.
+        alpha_bytes = HOST_BIN.read_bytes() if IS_MACOS else thin_macho64(CPU_TYPE_ARM64)
+        self.alpha_bin = build_bundle(self.root0, "alpha", alpha_bytes)
         self.excluded_bin = build_bundle(self.root0, "excluded-mod", thin_macho64(CPU_TYPE_ARM64))
         self.legacy_bin = build_legacy(
             self.root0, "legacy-mod", fat_macho([CPU_TYPE_X86_64, CPU_TYPE_ARM64]), subdir="nested"
@@ -156,19 +197,20 @@ class PluginDiscoveryTest(unittest.TestCase):
         before1 = tree_digest(self.root1)
 
         sock = self._connect("--user-plugins-manifest", str(self.manifest))
-        first = host.rpc(sock, 1, "plugins.discover", {})["result"]
-        second = host.rpc(sock, 2, "plugins.discover", {})["result"]
-
-        # Deterministic: byte-identical result across calls.
-        self.assertEqual(first, second)
+        # Deterministic at FRAME level: the same request (same id) twice must
+        # produce byte-identical raw JSON text, not merely equal parsed dicts.
+        raw_first = rpc_raw(sock, 7, "plugins.discover", {})
+        raw_second = rpc_raw(sock, 7, "plugins.discover", {})
+        self.assertEqual(raw_first, raw_second)
+        first = json.loads(raw_first)["result"]
 
         self.assertIs(first["ok"], True)
         self.assertIn(first["mode"], ("scaffold", "libobs"))
         self.assertEqual(
             first["roots"],
             [
-                {"rootRef": "root:0", "candidateCount": 3},
-                {"rootRef": "root:1", "candidateCount": 2},
+                {"rootRef": "root:0", "candidateCount": 3, "truncated": False},
+                {"rootRef": "root:1", "candidateCount": 2, "truncated": False},
             ],
         )
 
@@ -200,9 +242,12 @@ class PluginDiscoveryTest(unittest.TestCase):
         self.assertEqual(alpha["fileName"], "alpha.plugin/Contents/MacOS/alpha")
         self.assertEqual(alpha["lifecycle"], "discovered")
         self.assertEqual(alpha["sha256"], sha256_of(self.alpha_bin))
-        # The host binary is a real Mach-O; arch must be non-empty and known.
-        self.assertTrue(alpha["arch"])
-        self.assertTrue(set(alpha["arch"]) <= {"arm64", "x86_64"})
+        if IS_MACOS:
+            # The host binary is a real Mach-O; arch must be non-empty and known.
+            self.assertTrue(alpha["arch"])
+            self.assertTrue(set(alpha["arch"]) <= {"arm64", "x86_64"})
+        else:
+            self.assertEqual(alpha["arch"], ["arm64"])
 
         excluded = by_key[("module:excluded-mod", "root:0")]
         self.assertEqual(excluded["lifecycle"], "excluded")
@@ -232,6 +277,120 @@ class PluginDiscoveryTest(unittest.TestCase):
         # READ-ONLY: enumeration left the roots byte-for-byte identical.
         self.assertEqual(tree_digest(self.root0), before0)
         self.assertEqual(tree_digest(self.root1), before1)
+
+    # -- hardening: symlink confinement, walk bounds, Mach-O strictness ----
+
+    def test_symlink_escape_is_refused_without_disclosure(self) -> None:
+        # A candidate binary that is a symlink (here: escaping the root) must
+        # never be read or hashed -- its record says symlink-refused, and the
+        # outside file's bytes are never disclosed (no sha256 anywhere).
+        outside = self.base / "outside-secret.bin"
+        outside.write_bytes(b"OUTSIDE-SECRET-" + thin_macho64(CPU_TYPE_ARM64))
+        outside_sha = hashlib.sha256(outside.read_bytes()).hexdigest()
+
+        root = self.base / "symroot"
+        macos = root / "sneaky.plugin" / "Contents" / "MacOS"
+        macos.mkdir(parents=True)
+        (macos / "sneaky").symlink_to(outside)
+
+        manifest = self.base / "symlink-manifest.json"
+        manifest.write_text(json.dumps({"version": 1, "roots": [{"binaryDir": str(root)}]}))
+
+        sock = self._connect("--user-plugins-manifest", str(manifest))
+        raw = rpc_raw(sock, 1, "plugins.discover", {})
+        result = json.loads(raw)["result"]
+
+        self.assertEqual(
+            result["roots"], [{"rootRef": "root:0", "candidateCount": 1, "truncated": False}]
+        )
+        record = result["modules"][0]
+        self.assertEqual(record["moduleRef"], "module:sneaky")
+        self.assertEqual(record["lifecycle"], "discovered")
+        self.assertEqual(record["reasonDetail"], "symlink-refused")
+        self.assertIsNone(record["sha256"])
+        self.assertEqual(record["arch"], [])
+        self.assertEqual(record["observed"], {"arch": False, "dependencies": False})
+        # Non-disclosure: neither the hash nor the path of the outside file
+        # appears anywhere in the raw response.
+        self.assertNotIn(outside_sha, raw)
+        self.assertNotIn(str(outside), raw)
+
+    def test_truncated_macho_headers_report_unreadable(self) -> None:
+        # Strictness: arch facts must come only from fully-read structures.
+        root = self.base / "shortroot"
+        root.mkdir()
+        # FAT table claiming 2 entries but truncated mid-second-entry (only
+        # the second entry's cputype word is present, not the full fat_arch).
+        cut_fat = (
+            struct.pack(">II", 0xCAFEBABE, 2)
+            + struct.pack(">5I", CPU_TYPE_X86_64, 0, 4096, 32, 12)
+            + struct.pack(">I", CPU_TYPE_ARM64)
+        )
+        fat_bin = build_bundle(root, "cut-fat", cut_fat)
+        # Thin file shorter than a complete mach_header_64 (magic + cputype
+        # only -- 8 of 32 bytes).
+        cut_thin = struct.pack("<II", 0xFEEDFACF, CPU_TYPE_ARM64)
+        thin_bin = build_bundle(root, "cut-thin", cut_thin)
+
+        manifest = self.base / "short-manifest.json"
+        manifest.write_text(json.dumps({"version": 1, "roots": [{"binaryDir": str(root)}]}))
+
+        sock = self._connect("--user-plugins-manifest", str(manifest))
+        result = host.rpc(sock, 1, "plugins.discover", {})["result"]
+        by_ref = {m["moduleRef"]: m for m in result["modules"]}
+        for module_ref, path in (
+            ("module:cut-fat", fat_bin),
+            ("module:cut-thin", thin_bin),
+        ):
+            record = by_ref[module_ref]
+            self.assertEqual(record["reasonDetail"], "unreadable-macho-header")
+            self.assertEqual(record["arch"], [])
+            self.assertEqual(record["observed"], {"arch": False, "dependencies": False})
+            # The file itself is readable and small: it is still hashed.
+            self.assertEqual(record["sha256"], sha256_of(path))
+
+    def test_depth_cap_truncates_root_scan(self) -> None:
+        # Walk bounds: a module binary buried deeper than the depth cap is not
+        # reached, and the root is flagged truncated (deterministically).
+        root = self.base / "deeproot"
+        deep = root / "deep-mod" / "bin"
+        for i in range(10):
+            deep = deep / f"d{i}"
+        deep.mkdir(parents=True)
+        (deep / "deep-mod.so").write_bytes(thin_macho64(CPU_TYPE_ARM64))
+
+        manifest = self.base / "deep-manifest.json"
+        manifest.write_text(json.dumps({"version": 1, "roots": [{"binaryDir": str(root)}]}))
+
+        sock = self._connect("--user-plugins-manifest", str(manifest))
+        result = host.rpc(sock, 1, "plugins.discover", {})["result"]
+        self.assertEqual(
+            result["roots"], [{"rootRef": "root:0", "candidateCount": 0, "truncated": True}]
+        )
+        self.assertEqual(result["modules"], [])
+
+    def test_unicode_escaped_manifest_path_resolves(self) -> None:
+        # A Station-side JSON serializer may \uXXXX-escape non-ASCII path
+        # bytes; the manifest scanner must decode them to real UTF-8.
+        root = self.base / "root-café"
+        build_bundle(root, "uni-mod", thin_macho64(CPU_TYPE_ARM64))
+
+        manifest = self.base / "unicode-manifest.json"
+        manifest_text = json.dumps(
+            {"version": 1, "roots": [{"binaryDir": str(root)}]}, ensure_ascii=True
+        )
+        self.assertIn("\\u00e9", manifest_text)  # really escaped on disk
+        manifest.write_text(manifest_text)
+
+        sock = self._connect("--user-plugins-manifest", str(manifest))
+        result = host.rpc(sock, 1, "plugins.discover", {})["result"]
+        self.assertEqual(
+            result["roots"], [{"rootRef": "root:0", "candidateCount": 1, "truncated": False}]
+        )
+        record = result["modules"][0]
+        self.assertEqual(record["moduleRef"], "module:uni-mod")
+        self.assertEqual(record["lifecycle"], "discovered")
+        self.assertEqual(record["arch"], ["arm64"])
 
     def test_no_manifest_keeps_current_behavior_and_empty_inventory(self) -> None:
         sock = self._connect()

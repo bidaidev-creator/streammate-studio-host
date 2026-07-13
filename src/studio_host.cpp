@@ -151,17 +151,25 @@ public:
         case 'r': out.push_back('\r'); break;
         case 't': out.push_back('\t'); break;
         case 'u': {
-          if (pos_ + 4 > text_.size()) return std::nullopt;
-          unsigned value = 0;
-          for (int i = 0; i < 4; ++i) {
-            int digit = hex_digit_value(text_[pos_++]);
-            if (digit < 0) return std::nullopt;
-            value = (value << 4) | static_cast<unsigned>(digit);
+          // Full \uXXXX decoding to UTF-8 including surrogate pairs: a
+          // Station-side JSON serializer may escape non-ASCII path bytes.
+          // Unpaired/reversed surrogates are rejected (fail-closed launch
+          // validation, unlike the wire parser's U+FFFD replacement).
+          auto code_unit = hex4();
+          if (!code_unit) return std::nullopt;
+          unsigned codepoint = *code_unit;
+          if (codepoint >= 0xD800 && codepoint <= 0xDBFF) {
+            if (pos_ + 2 > text_.size() || text_[pos_] != '\\' || text_[pos_ + 1] != 'u') {
+              return std::nullopt;
+            }
+            pos_ += 2;
+            auto low = hex4();
+            if (!low || *low < 0xDC00 || *low > 0xDFFF) return std::nullopt;
+            codepoint = 0x10000 + ((codepoint - 0xD800) << 10) + (*low - 0xDC00);
+          } else if (codepoint >= 0xDC00 && codepoint <= 0xDFFF) {
+            return std::nullopt; // lone low surrogate
           }
-          // Manifest paths and module refs are ASCII by contract; a non-ASCII
-          // escape degrades to '?' (the absolute-path / module: prefix
-          // validation still applies) rather than growing a UTF-8 encoder.
-          out.push_back(value < 0x80 ? static_cast<char>(value) : '?');
+          append_utf8(out, codepoint);
           break;
         }
         default:
@@ -176,24 +184,62 @@ public:
     return std::nullopt;
   }
 
+  // Strict JSON number grammar: -?(0|[1-9][0-9]*)(\.[0-9]+)?([eE][+-]?[0-9]+)?
+  // Rejects leading zeros ("01") and operator smuggling ("1+2") -- anything
+  // left over after the grammar trips the caller's ','/'}' expectation.
+  bool number() {
+    ws();
+    const std::size_t start = pos_;
+    const auto digit = [&] {
+      return pos_ < text_.size() && std::isdigit(static_cast<unsigned char>(text_[pos_]));
+    };
+    if (pos_ < text_.size() && text_[pos_] == '-') ++pos_;
+    if (!digit()) {
+      pos_ = start;
+      return false;
+    }
+    if (text_[pos_] == '0') {
+      ++pos_;
+      if (digit()) { // leading zero: 01 is not a JSON number
+        pos_ = start;
+        return false;
+      }
+    } else {
+      while (digit()) ++pos_;
+    }
+    if (pos_ < text_.size() && text_[pos_] == '.') {
+      ++pos_;
+      if (!digit()) {
+        pos_ = start;
+        return false;
+      }
+      while (digit()) ++pos_;
+    }
+    if (pos_ < text_.size() && (text_[pos_] == 'e' || text_[pos_] == 'E')) {
+      ++pos_;
+      if (pos_ < text_.size() && (text_[pos_] == '+' || text_[pos_] == '-')) ++pos_;
+      if (!digit()) {
+        pos_ = start;
+        return false;
+      }
+      while (digit()) ++pos_;
+    }
+    return true;
+  }
+
   std::optional<long> integer() {
     ws();
-    std::size_t start = pos_;
-    if (pos_ < text_.size() && text_[pos_] == '-') ++pos_;
-    std::size_t digits_start = pos_;
-    while (pos_ < text_.size() && std::isdigit(static_cast<unsigned char>(text_[pos_]))) ++pos_;
-    if (pos_ == digits_start) {
-      pos_ = start;
-      return std::nullopt;
-    }
-    // Reject 1.5 / 1e3 masquerading as an integer.
-    if (pos_ < text_.size() && (text_[pos_] == '.' || text_[pos_] == 'e' || text_[pos_] == 'E')) {
-      pos_ = start;
+    const std::size_t start = pos_;
+    if (!number()) return std::nullopt;
+    const std::string token = text_.substr(start, pos_ - start);
+    if (token.find_first_of(".eE") != std::string::npos) {
+      pos_ = start; // a valid number but not an integer; caller may skip it
       return std::nullopt;
     }
     try {
-      return std::stol(text_.substr(start, pos_ - start));
+      return std::stol(token);
     } catch (...) {
+      pos_ = start;
       return std::nullopt;
     }
   }
@@ -221,16 +267,7 @@ public:
       }
     }
     if (literal("true") || literal("false") || literal("null")) return true;
-    if (c == '-' || std::isdigit(static_cast<unsigned char>(c))) {
-      if (c == '-') ++pos_;
-      if (pos_ >= text_.size() || !std::isdigit(static_cast<unsigned char>(text_[pos_]))) return false;
-      while (pos_ < text_.size() &&
-             (std::isdigit(static_cast<unsigned char>(text_[pos_])) || text_[pos_] == '.' ||
-              text_[pos_] == 'e' || text_[pos_] == 'E' || text_[pos_] == '+' || text_[pos_] == '-')) {
-        ++pos_;
-      }
-      return true;
-    }
+    if (c == '-' || std::isdigit(static_cast<unsigned char>(c))) return number();
     return false;
   }
 
@@ -240,6 +277,35 @@ private:
     if (c >= 'a' && c <= 'f') return 10 + c - 'a';
     if (c >= 'A' && c <= 'F') return 10 + c - 'A';
     return -1;
+  }
+
+  std::optional<unsigned> hex4() {
+    if (pos_ + 4 > text_.size()) return std::nullopt;
+    unsigned value = 0;
+    for (int i = 0; i < 4; ++i) {
+      int digit = hex_digit_value(text_[pos_++]);
+      if (digit < 0) return std::nullopt;
+      value = (value << 4) | static_cast<unsigned>(digit);
+    }
+    return value;
+  }
+
+  static void append_utf8(std::string &out, unsigned codepoint) {
+    if (codepoint < 0x80) {
+      out.push_back(static_cast<char>(codepoint));
+    } else if (codepoint < 0x800) {
+      out.push_back(static_cast<char>(0xC0 | (codepoint >> 6)));
+      out.push_back(static_cast<char>(0x80 | (codepoint & 0x3F)));
+    } else if (codepoint < 0x10000) {
+      out.push_back(static_cast<char>(0xE0 | (codepoint >> 12)));
+      out.push_back(static_cast<char>(0x80 | ((codepoint >> 6) & 0x3F)));
+      out.push_back(static_cast<char>(0x80 | (codepoint & 0x3F)));
+    } else {
+      out.push_back(static_cast<char>(0xF0 | (codepoint >> 18)));
+      out.push_back(static_cast<char>(0x80 | ((codepoint >> 12) & 0x3F)));
+      out.push_back(static_cast<char>(0x80 | ((codepoint >> 6) & 0x3F)));
+      out.push_back(static_cast<char>(0x80 | (codepoint & 0x3F)));
+    }
   }
 
   const std::string &text_;
@@ -2219,33 +2285,57 @@ std::string json_array_join(const std::vector<std::string> &items) {
 // leaves the manifest roots byte-for-byte identical.
 // ---------------------------------------------------------------------------
 
-// Compact SHA-256 (FIPS 180-4) over a whole buffer. The repo had no C++
-// hashing utility (packaging hashes via shasum in shell), and the scaffold
-// lane must not grow a CommonCrypto/libobs dependency for this.
-std::string sha256_hex(const std::vector<unsigned char> &data) {
-  static constexpr uint32_t kRound[64] = {
-      0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
-      0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
-      0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
-      0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
-      0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
-      0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
-      0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
-      0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2};
-  uint32_t h[8] = {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
-                   0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19};
+// Compact streaming SHA-256 (FIPS 180-4). The repo had no C++ hashing utility
+// (packaging hashes via shasum in shell), and the scaffold lane must not grow
+// a CommonCrypto/libobs dependency for this. Streaming so binaries are hashed
+// in bounded chunks, never buffered whole.
+class Sha256Stream {
+public:
+  void update(const unsigned char *data, std::size_t len) {
+    total_ += len;
+    while (len > 0) {
+      const std::size_t take = std::min(len, std::size_t(64) - buffered_);
+      std::memcpy(buffer_ + buffered_, data, take);
+      buffered_ += take;
+      data += take;
+      len -= take;
+      if (buffered_ == 64) {
+        process_block(buffer_);
+        buffered_ = 0;
+      }
+    }
+  }
 
-  const uint64_t bit_len = static_cast<uint64_t>(data.size()) * 8;
-  std::vector<unsigned char> msg(data);
-  msg.push_back(0x80);
-  while (msg.size() % 64 != 56) msg.push_back(0x00);
-  for (int shift = 56; shift >= 0; shift -= 8) msg.push_back(static_cast<unsigned char>(bit_len >> shift));
+  std::string finish_hex() {
+    const uint64_t bit_len = total_ * 8;
+    const unsigned char pad = 0x80;
+    update(&pad, 1);
+    const unsigned char zero = 0x00;
+    while (buffered_ != 56) update(&zero, 1);
+    unsigned char length_bytes[8];
+    for (int i = 0; i < 8; ++i) length_bytes[i] = static_cast<unsigned char>(bit_len >> (56 - 8 * i));
+    update(length_bytes, 8); // ends exactly on a block boundary
+    std::ostringstream out;
+    out << std::hex << std::setfill('0');
+    for (uint32_t word : h_) out << std::setw(8) << word;
+    return out.str();
+  }
 
-  const auto rotr = [](uint32_t value, int bits) { return (value >> bits) | (value << (32 - bits)); };
-  for (size_t offset = 0; offset < msg.size(); offset += 64) {
+private:
+  void process_block(const unsigned char *block) {
+    static constexpr uint32_t kRound[64] = {
+        0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+        0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+        0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+        0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+        0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+        0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+        0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+        0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2};
+    const auto rotr = [](uint32_t value, int bits) { return (value >> bits) | (value << (32 - bits)); };
     uint32_t w[64];
     for (int i = 0; i < 16; ++i) {
-      const unsigned char *p = msg.data() + offset + 4 * i;
+      const unsigned char *p = block + 4 * i;
       w[i] = (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | uint32_t(p[3]);
     }
     for (int i = 16; i < 64; ++i) {
@@ -2253,7 +2343,7 @@ std::string sha256_hex(const std::vector<unsigned char> &data) {
       uint32_t s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
       w[i] = w[i - 16] + s0 + w[i - 7] + s1;
     }
-    uint32_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4], f = h[5], g = h[6], hh = h[7];
+    uint32_t a = h_[0], b = h_[1], c = h_[2], d = h_[3], e = h_[4], f = h_[5], g = h_[6], hh = h_[7];
     for (int i = 0; i < 64; ++i) {
       uint32_t s1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
       uint32_t ch = (e & f) ^ (~e & g);
@@ -2264,15 +2354,16 @@ std::string sha256_hex(const std::vector<unsigned char> &data) {
       hh = g; g = f; f = e; e = d + temp1;
       d = c; c = b; b = a; a = temp1 + temp2;
     }
-    h[0] += a; h[1] += b; h[2] += c; h[3] += d;
-    h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
+    h_[0] += a; h_[1] += b; h_[2] += c; h_[3] += d;
+    h_[4] += e; h_[5] += f; h_[6] += g; h_[7] += hh;
   }
 
-  std::ostringstream out;
-  out << std::hex << std::setfill('0');
-  for (uint32_t word : h) out << std::setw(8) << word;
-  return out.str();
-}
+  uint32_t h_[8] = {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+                    0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19};
+  unsigned char buffer_[64] = {};
+  std::size_t buffered_ = 0;
+  uint64_t total_ = 0;
+};
 
 // Mach-O magic / cputype constants: taken from <mach-o/loader.h> +
 // <mach-o/fat.h> on Apple, mirrored literally elsewhere so the byte parser
@@ -2313,7 +2404,10 @@ std::string cpu_type_label(uint32_t cputype) {
 // Reads architectures straight from the Mach-O header bytes: thin
 // MH_MAGIC_64/MH_CIGAM_64 (cputype at offset 4, byte-swapped for CIGAM) and
 // universal FAT_MAGIC[/64]/FAT_CIGAM[/64] (one cputype per fat_arch entry).
-// nullopt = the bytes are not a Mach-O image.
+// STRICT: arch facts come only from fully-read structures -- the complete
+// thin mach_header (28 bytes) / mach_header_64 (32 bytes), and for FAT every
+// one of nfat fat_arch (20B) / fat_arch_64 (32B) entries entirely within the
+// read window. nullopt = not a (completely readable) Mach-O image.
 std::optional<std::vector<std::string>> parse_macho_archs(const std::vector<unsigned char> &bytes) {
   if (bytes.size() < 8) return std::nullopt;
   const uint32_t magic_le = read_u32_at(bytes.data(), false);
@@ -2321,11 +2415,13 @@ std::optional<std::vector<std::string>> parse_macho_archs(const std::vector<unsi
 
   // Thin image: the header is in the image's own endianness; a CIGAM read
   // means the file was written byte-swapped relative to us.
-  if (magic_le == kMhMagic64 || magic_le == kMhMagic32) {
-    return std::vector<std::string>{cpu_type_label(read_u32_at(bytes.data() + 4, false))};
-  }
-  if (magic_le == kMhCigam64 || magic_le == kMhCigam32) {
-    return std::vector<std::string>{cpu_type_label(read_u32_at(bytes.data() + 4, true))};
+  const bool thin64 = (magic_le == kMhMagic64 || magic_le == kMhCigam64);
+  const bool thin32 = (magic_le == kMhMagic32 || magic_le == kMhCigam32);
+  if (thin64 || thin32) {
+    const std::size_t header_size = thin64 ? 32 : 28; // mach_header_64 : mach_header
+    if (bytes.size() < header_size) return std::nullopt;
+    const bool swapped = (magic_le == kMhCigam64 || magic_le == kMhCigam32);
+    return std::vector<std::string>{cpu_type_label(read_u32_at(bytes.data() + 4, swapped))};
   }
 
   // Universal image: fat headers are big-endian on disk (FAT_MAGIC read
@@ -2345,30 +2441,138 @@ std::optional<std::vector<std::string>> parse_macho_archs(const std::vector<unsi
   const uint32_t nfat = read_u32_at(bytes.data() + 4, fat_big_endian);
   if (nfat == 0 || nfat > 128) return std::nullopt;
   const size_t entry_size = fat64 ? 32 : 20; // sizeof(fat_arch_64) : sizeof(fat_arch)
+  // The whole arch table must be inside the window before ANY entry counts.
+  if (8 + static_cast<size_t>(nfat) * entry_size > bytes.size()) return std::nullopt;
   std::vector<std::string> archs;
   for (uint32_t i = 0; i < nfat; ++i) {
     const size_t offset = 8 + static_cast<size_t>(i) * entry_size;
-    if (offset + 4 > bytes.size()) return std::nullopt;
     std::string label = cpu_type_label(read_u32_at(bytes.data() + offset, fat_big_endian));
     if (std::find(archs.begin(), archs.end(), label) == archs.end()) archs.push_back(label);
   }
   return archs;
 }
 
-std::optional<std::vector<unsigned char>> read_file_bytes(const std::filesystem::path &path) {
+// Walk/probe bounds -- every root scan and binary read is explicitly capped.
+constexpr int kMaxScanDepth = 8;                                     // dirs below the root
+constexpr std::size_t kMaxVisitedEntriesPerRoot = 4096;              // dir entries inspected
+constexpr std::size_t kMaxCandidatesPerRoot = 256;                   // records per root
+constexpr std::uintmax_t kMaxHashedBinaryBytes = 512ull * 1024 * 1024; // sha256 size ceiling
+constexpr std::size_t kMachoHeaderWindowBytes = 64 * 1024;           // arch probe window
+constexpr std::size_t kHashChunkBytes = 1024 * 1024;                 // streaming read unit
+
+struct UserPluginBinaryProbe {
+  bool readable = false;
+  bool too_large = false;              // over the sha256 ceiling
+  std::string sha256;                  // empty => null on the wire
+  std::vector<unsigned char> header;   // first kMachoHeaderWindowBytes only
+};
+
+// Reads a candidate binary with bounded memory: the Mach-O parse sees only a
+// 64 KiB header window, and hashing streams 1 MiB chunks through the SHA-256
+// context. Files over the ceiling are NOT hashed (header window still read).
+UserPluginBinaryProbe probe_user_plugin_binary(const std::filesystem::path &path) {
+  UserPluginBinaryProbe probe;
+  std::error_code ec;
+  const std::uintmax_t size = std::filesystem::file_size(path, ec);
+  if (ec) return probe;
   std::ifstream in(path, std::ios::binary);
-  if (!in) return std::nullopt;
-  std::ostringstream buffer;
-  buffer << in.rdbuf();
-  if (in.bad()) return std::nullopt;
-  const std::string &contents = buffer.str();
-  return std::vector<unsigned char>(contents.begin(), contents.end());
+  if (!in) return probe;
+
+  if (size > kMaxHashedBinaryBytes) {
+    probe.too_large = true;
+    probe.header.resize(kMachoHeaderWindowBytes);
+    in.read(reinterpret_cast<char *>(probe.header.data()),
+            static_cast<std::streamsize>(probe.header.size()));
+    probe.header.resize(static_cast<std::size_t>(in.gcount()));
+    probe.readable = !in.bad();
+    return probe;
+  }
+
+  Sha256Stream hasher;
+  std::vector<unsigned char> chunk(kHashChunkBytes);
+  while (in) {
+    in.read(reinterpret_cast<char *>(chunk.data()), static_cast<std::streamsize>(chunk.size()));
+    const std::streamsize got = in.gcount();
+    if (got <= 0) break;
+    hasher.update(chunk.data(), static_cast<std::size_t>(got));
+    if (probe.header.size() < kMachoHeaderWindowBytes) {
+      const std::size_t take =
+          std::min(static_cast<std::size_t>(got), kMachoHeaderWindowBytes - probe.header.size());
+      probe.header.insert(probe.header.end(), chunk.data(), chunk.data() + take);
+    }
+  }
+  if (in.bad()) return probe;
+  probe.readable = true;
+  probe.sha256 = hasher.finish_hex();
+  return probe;
 }
 
 struct UserPluginCandidate {
   std::string name;              // protocol-safe module name
   std::filesystem::path binary;  // absolute path to the module binary
   std::string relative;          // binary path relative to its manifest root
+  bool confined = false;         // not a symlink AND canonical path stays in the root
+};
+
+// Symlink confinement: a candidate binary must itself be a real regular file
+// (never a symlink) and its fully-resolved canonical path must stay inside
+// the canonical root -- otherwise it is never opened, read, or hashed.
+bool user_plugin_binary_confined(const std::filesystem::path &binary,
+                                 const std::filesystem::path &canonical_root) {
+  std::error_code ec;
+  const auto status = std::filesystem::symlink_status(binary, ec);
+  if (ec || status.type() != std::filesystem::file_type::regular) return false;
+  const auto canonical = std::filesystem::canonical(binary, ec); // resolves parent components too
+  if (ec) return false;
+  const std::string relative = canonical.lexically_relative(canonical_root).generic_string();
+  if (relative.empty() || relative == "..") return false;
+  return relative.compare(0, 3, "../") != 0 && relative != ".";
+}
+
+// Sorted directory listing via error_code (never throws; unreadable => empty).
+std::vector<std::filesystem::path> list_directory_sorted(const std::filesystem::path &dir) {
+  std::vector<std::filesystem::path> out;
+  std::error_code ec;
+  std::filesystem::directory_iterator it(dir, ec), end;
+  while (!ec && it != end) {
+    out.push_back(it->path());
+    it.increment(ec);
+  }
+  std::sort(out.begin(), out.end());
+  return out;
+}
+
+// Bounded manual walk of a legacy <name>/bin tree (sorted at every level so
+// truncation is deterministic). Directory symlinks are never followed; file
+// symlinks still surface as matches so confinement can refuse them loudly.
+void walk_legacy_bin_dir(const std::filesystem::path &dir, int depth, const std::string &so_name,
+                         const std::string &dylib_name, std::vector<std::filesystem::path> &matches,
+                         std::size_t &visited, bool &truncated) {
+  if (depth > kMaxScanDepth) {
+    truncated = true;
+    return;
+  }
+  for (const auto &entry : list_directory_sorted(dir)) {
+    if (++visited > kMaxVisitedEntriesPerRoot) {
+      truncated = true;
+      return;
+    }
+    std::error_code ec;
+    const auto status = std::filesystem::symlink_status(entry, ec);
+    if (ec) continue;
+    if (std::filesystem::is_regular_file(status) || std::filesystem::is_symlink(status)) {
+      const std::string file_name = entry.filename().string();
+      if (file_name == so_name || file_name == dylib_name) matches.push_back(entry);
+    } else if (std::filesystem::is_directory(status)) {
+      walk_legacy_bin_dir(entry, depth + 1, so_name, dylib_name, matches, visited, truncated);
+      if (truncated) return;
+    }
+  }
+}
+
+struct UserPluginRootScan {
+  std::vector<UserPluginCandidate> candidates;
+  bool truncated = false; // a walk bound was hit; the scan stopped deterministically
 };
 
 struct UserPluginRecord {
@@ -2386,6 +2590,7 @@ struct UserPluginRecord {
 struct UserPluginRootSummary {
   std::string root_ref;
   int candidate_count = 0;
+  bool truncated = false;
 };
 
 struct UserPluginInventory {
@@ -2398,54 +2603,63 @@ struct UserPluginInventory {
 // deterministic):
 //   (a) <root>/<name>.plugin CFBundle -> Contents/MacOS/<name>
 //   (b) legacy <root>/<name>/bin/**/<name>.{so,dylib} (first match in sorted
-//       path order)
+//       path order; walk bounded by depth/entry caps)
 // Names that are not protocol-safe ids cannot form a valid "module:<id>" ref
-// and are skipped. A missing/unreadable root yields zero candidates.
-std::vector<UserPluginCandidate> enumerate_user_plugin_root(const std::filesystem::path &root) {
-  std::vector<UserPluginCandidate> out;
+// and are skipped. A missing/unreadable root yields zero candidates. Every
+// candidate carries a confinement verdict; unconfined binaries are never
+// opened downstream.
+UserPluginRootScan scan_user_plugin_root(const std::filesystem::path &root) {
+  UserPluginRootScan scan;
   std::error_code ec;
-  std::filesystem::directory_iterator dir(root, ec);
-  if (ec) return out;
-  std::vector<std::filesystem::path> entries;
-  for (const auto &entry : dir) entries.push_back(entry.path());
-  std::sort(entries.begin(), entries.end());
+  const std::filesystem::path canonical_root = std::filesystem::canonical(root, ec);
+  if (ec) return scan;
 
+  std::size_t visited = 0;
   constexpr const char *kBundleSuffix = ".plugin";
   constexpr std::size_t kBundleSuffixLen = 7;
-  for (const auto &path : entries) {
+  for (const auto &path : list_directory_sorted(root)) {
+    if (++visited > kMaxVisitedEntriesPerRoot) {
+      scan.truncated = true;
+      break;
+    }
     std::error_code entry_ec;
     if (!std::filesystem::is_directory(path, entry_ec) || entry_ec) continue;
     const std::string entry_name = path.filename().string();
 
+    std::optional<UserPluginCandidate> candidate;
     if (entry_name.size() > kBundleSuffixLen && entry_name.ends_with(kBundleSuffix)) {
       const std::string name = entry_name.substr(0, entry_name.size() - kBundleSuffixLen);
       if (!is_safe_protocol_id(name)) continue;
       std::filesystem::path binary = path / "Contents" / "MacOS" / name;
+      // is_regular_file follows symlinks on purpose: a symlinked binary must
+      // become a candidate so confinement can refuse it with a visible record.
       if (std::filesystem::is_regular_file(binary, entry_ec) && !entry_ec) {
-        out.push_back({name, binary, entry_name + "/Contents/MacOS/" + name});
+        candidate = UserPluginCandidate{name, binary, entry_name + "/Contents/MacOS/" + name, false};
       }
-      continue;
+    } else {
+      const std::string &name = entry_name;
+      if (!is_safe_protocol_id(name)) continue;
+      std::filesystem::path bin_dir = path / "bin";
+      if (!std::filesystem::is_directory(bin_dir, entry_ec) || entry_ec) continue;
+      std::vector<std::filesystem::path> matches;
+      walk_legacy_bin_dir(bin_dir, 3, name + ".so", name + ".dylib", matches, visited,
+                          scan.truncated); // bin sits 2 levels below the root; entries start at 3
+      if (scan.truncated) break;
+      if (!matches.empty()) {
+        const std::filesystem::path &binary = matches.front(); // already sorted per level
+        candidate = UserPluginCandidate{name, binary, binary.lexically_relative(root).generic_string(),
+                                        false};
+      }
     }
-
-    const std::string &name = entry_name;
-    if (!is_safe_protocol_id(name)) continue;
-    std::filesystem::path bin_dir = path / "bin";
-    if (!std::filesystem::is_directory(bin_dir, entry_ec) || entry_ec) continue;
-    std::vector<std::filesystem::path> matches;
-    std::filesystem::recursive_directory_iterator files(bin_dir, entry_ec);
-    if (entry_ec) continue;
-    for (const auto &file : files) {
-      std::error_code file_ec;
-      if (!file.is_regular_file(file_ec) || file_ec) continue;
-      const std::string file_name = file.path().filename().string();
-      if (file_name == name + ".so" || file_name == name + ".dylib") matches.push_back(file.path());
+    if (!candidate) continue;
+    if (scan.candidates.size() >= kMaxCandidatesPerRoot) {
+      scan.truncated = true;
+      break;
     }
-    if (matches.empty()) continue;
-    std::sort(matches.begin(), matches.end());
-    const std::filesystem::path &binary = matches.front();
-    out.push_back({name, binary, binary.lexically_relative(root).generic_string()});
+    candidate->confined = user_plugin_binary_confined(candidate->binary, canonical_root);
+    scan.candidates.push_back(std::move(*candidate));
   }
-  return out;
+  return scan;
 }
 
 UserPluginInventory build_user_plugin_inventory(const user_plugins::Manifest &manifest) {
@@ -2455,30 +2669,37 @@ UserPluginInventory build_user_plugin_inventory(const user_plugins::Manifest &ma
 
   for (std::size_t index = 0; index < manifest.roots.size(); ++index) {
     const std::string root_ref = "root:" + std::to_string(index);
-    std::vector<UserPluginCandidate> candidates;
+    UserPluginRootScan scan;
     try {
-      candidates = enumerate_user_plugin_root(manifest.roots[index].binary_dir);
+      scan = scan_user_plugin_root(manifest.roots[index].binary_dir);
     } catch (const std::filesystem::filesystem_error &) {
-      candidates.clear(); // a root racing with deletion degrades to empty
+      scan = {}; // a root racing with deletion degrades to empty
     }
-    inventory.roots.push_back({root_ref, static_cast<int>(candidates.size())});
+    inventory.roots.push_back({root_ref, static_cast<int>(scan.candidates.size()), scan.truncated});
 
-    for (const auto &candidate : candidates) {
+    for (const auto &candidate : scan.candidates) {
       UserPluginRecord record;
       record.module_ref = "module:" + candidate.name;
       record.label = candidate.name;
       record.file_name = candidate.relative;
       record.root_ref = root_ref;
-      if (auto bytes = read_file_bytes(candidate.binary)) {
-        record.sha256 = sha256_hex(*bytes);
-        if (auto archs = parse_macho_archs(*bytes)) {
+      // Reason precedence (one category per record): symlink-refused >
+      // unreadable-binary > binary-too-large > unreadable-macho-header.
+      if (!candidate.confined) {
+        // Never opened: no bytes disclosed, no hash, no arch.
+        record.reason_detail = "symlink-refused";
+      } else if (UserPluginBinaryProbe probe = probe_user_plugin_binary(candidate.binary);
+                 !probe.readable) {
+        record.reason_detail = "unreadable-binary";
+      } else {
+        record.sha256 = probe.sha256; // empty (=> null) when over the size ceiling
+        if (probe.too_large) record.reason_detail = "binary-too-large";
+        if (auto archs = parse_macho_archs(probe.header)) {
           record.archs = *archs;
           record.observed_arch = true; // read from the header bytes, honestly
-        } else {
+        } else if (record.reason_detail.empty()) {
           record.reason_detail = "unreadable-macho-header";
         }
-      } else {
-        record.reason_detail = "unreadable-binary";
       }
       // Exclusion wins over duplicate detection; only non-excluded records
       // participate in first-root-wins tracking.
@@ -2503,8 +2724,9 @@ std::string user_plugin_record_json(const UserPluginRecord &record) {
          "\",\"fileName\":\"" + json_escape(record.file_name) +
          "\",\"rootRef\":\"" + json_escape(record.root_ref) +
          "\",\"moduleClass\":\"user\"" +
-         ",\"sha256\":\"" + json_escape(record.sha256) +
-         "\",\"arch\":" + json_string_array(record.archs) +
+         ",\"sha256\":" +
+         (record.sha256.empty() ? std::string("null") : "\"" + json_escape(record.sha256) + "\"") +
+         ",\"arch\":" + json_string_array(record.archs) +
          ",\"lifecycle\":\"" + json_escape(record.lifecycle) +
          "\",\"state\":null,\"observed\":{\"arch\":" + (record.observed_arch ? "true" : "false") +
          ",\"dependencies\":false},\"reasonDetail\":" +
@@ -2521,7 +2743,8 @@ std::string user_plugins_discover_json(const std::optional<user_plugins::Manifes
     for (std::size_t i = 0; i < inventory.roots.size(); ++i) {
       if (i) roots_json += ",";
       roots_json += "{\"rootRef\":\"" + json_escape(inventory.roots[i].root_ref) +
-                    "\",\"candidateCount\":" + std::to_string(inventory.roots[i].candidate_count) + "}";
+                    "\",\"candidateCount\":" + std::to_string(inventory.roots[i].candidate_count) +
+                    ",\"truncated\":" + (inventory.roots[i].truncated ? "true" : "false") + "}";
     }
     for (std::size_t i = 0; i < inventory.modules.size(); ++i) {
       if (i) modules_json += ",";
