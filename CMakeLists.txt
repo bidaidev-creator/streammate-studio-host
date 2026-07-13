@@ -194,6 +194,13 @@ if(BUILD_TESTING)
     NAME user-plugin-loading
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_user_plugin_loading.py $<TARGET_FILE:studio-host>
   )
+  # NIF-V1: vertical-slice verbs over loaded user plugins (plugin-kind
+  # source.create + source.captureFrame + mapped_plugin import
+  # classification); scaffold lane proves the refusal/honesty contracts.
+  add_test(
+    NAME plugin-slice-verbs
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_plugin_slice_verbs.py $<TARGET_FILE:studio-host>
+  )
   add_test(
     NAME macos-packaging
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_macos_packaging.py

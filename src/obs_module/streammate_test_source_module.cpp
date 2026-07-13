@@ -21,6 +21,7 @@
 #include <vector>
 
 #include <obs-module.h>
+#include <util/platform.h>
 
 OBS_DECLARE_MODULE()
 
@@ -48,7 +49,10 @@ bool emit_frame(TestSource *ctx) {
   frame.linesize[0] = kSide * 4u;
   frame.data[0] = reinterpret_cast<uint8_t *>(pixels.data());
   frame.full_range = true;
-  frame.timestamp = 0;
+  // Monotonic timestamps: libobs's buffered async path never promotes
+  // duplicate-timestamp frames to cur_async_frame, so a constant 0 makes
+  // obs_source_get_frame starve even while frames are being queued.
+  frame.timestamp = os_gettime_ns();
   obs_source_output_video(ctx->source, &frame);
   ctx->delivered.fetch_add(1, std::memory_order_relaxed);
   return true;
@@ -89,6 +93,11 @@ void source_update(void *data, obs_data_t *settings) {
   apply_settings(static_cast<TestSource *>(data), settings);
 }
 
+// NIF-V1: auto-emit one deterministic frame per compositor tick so a packaged
+// host can observe the pattern via source.captureFrame without calling the
+// emit_test_frame proc (which remains for the smoke's settings echo).
+void source_tick(void *data, float) { emit_frame(static_cast<TestSource *>(data)); }
+
 struct obs_source_info make_source_info() {
   struct obs_source_info info;
   std::memset(&info, 0, sizeof(info));
@@ -99,6 +108,7 @@ struct obs_source_info make_source_info() {
   info.create = source_create;
   info.destroy = source_destroy;
   info.update = source_update;
+  info.video_tick = source_tick;
   return info;
 }
 

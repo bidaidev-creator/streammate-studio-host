@@ -29,7 +29,9 @@ and runs in CI against the packaged app with the real in-tree test plugins.
 """
 from __future__ import annotations
 
+import hashlib
 import json
+import struct
 import os
 import platform
 import re
@@ -252,7 +254,23 @@ class UserPluginLoadingPlanTest(unittest.TestCase):
         # Mono contract (StudioPluginModuleRecord.fileName): bare bundle or
         # library file name, never a relative path with separators.
         build_legacy(self.root1, "legacy-mod", thin_macho64(HOST_CPU), subdir="nested")
-        process, port, _ = host.start_host("--user-plugins-manifest", str(self.manifest))
+        # The OBS fixture and STREAMMATE_HOME ride the env-only launch
+        # contract (mirrors the Station harness: no config path in payloads).
+        color = 0xFFFF8020
+        obs_dir = host.write_obs_fixture(self.base)
+        scenes_path = obs_dir / "basic" / "scenes" / "fixture-main.json"
+        scenes = json.loads(scenes_path.read_text(encoding="utf-8"))
+        scenes["sources"].append({"name": "Slice Plugin Source", "id": "streammate_test_source",
+                                  "settings": {"color": color}})
+        scenes["sources"].append({"name": "Slice Plugin Filter", "id": "streammate_test_filter"})
+        scenes_path.write_text(json.dumps(scenes, indent=2) + "\n", encoding="utf-8")
+        home_dir = self.base / "streammate-home"
+        home_dir.mkdir(parents=True, exist_ok=True)
+
+        process, port, _ = host.start_host(
+            "--user-plugins-manifest", str(self.manifest),
+            env={"STREAMMATE_HOME": str(home_dir), "STREAMMATE_OBS_CONFIG_DIR": str(obs_dir)},
+        )
         self.addCleanup(host.stop_process, process)
         sock = host.websocket_connect(port)
         self.addCleanup(sock.close)
@@ -367,6 +385,106 @@ class UserPluginLoadingLibobsTest(unittest.TestCase):
 
         self.manifest = self.base / "manifest.json"
         write_manifest(self.manifest, [{"binaryDir": str(self.root)}], None, [])
+
+    def test_vertical_slice_verbs_end_to_end(self) -> None:
+        """NIF-V1: plugin-kind instantiation, real frame capture, generic
+        production actions, and mapped_plugin import classification against
+        the packaged HAS_LIBOBS host."""
+        # The OBS fixture and STREAMMATE_HOME ride the env-only launch
+        # contract (mirrors the Station harness: no config path in payloads).
+        color = 0xFFFF8020
+        obs_dir = host.write_obs_fixture(self.base)
+        scenes_path = obs_dir / "basic" / "scenes" / "fixture-main.json"
+        scenes = json.loads(scenes_path.read_text(encoding="utf-8"))
+        scenes["sources"].append({"name": "Slice Plugin Source", "id": "streammate_test_source",
+                                  "settings": {"color": color}})
+        scenes["sources"].append({"name": "Slice Plugin Filter", "id": "streammate_test_filter"})
+        scenes_path.write_text(json.dumps(scenes, indent=2) + "\n", encoding="utf-8")
+        home_dir = self.base / "streammate-home"
+        home_dir.mkdir(parents=True, exist_ok=True)
+
+        process, port, _ = host.start_host(
+            "--user-plugins-manifest", str(self.manifest),
+            env={"STREAMMATE_HOME": str(home_dir), "STREAMMATE_OBS_CONFIG_DIR": str(obs_dir)},
+        )
+        self.addCleanup(host.stop_process, process)
+        sock = host.websocket_connect(port)
+        self.addCleanup(sock.close)
+
+        loaded = host.rpc(sock, 9401, "scene.load", {"sceneId": "slice", "width": 128, "height": 72})
+        self.assertTrue(loaded["result"]["ok"])
+        set_program = host.rpc(sock, 9402, "scene.setProgram", {"sceneId": "slice"})
+        self.assertTrue(set_program["result"]["ok"])
+
+        # Instantiate the plugin source WITH settings and the plugin filter
+        # attached — no placeholder path exists for plugin kinds.
+        created = host.rpc(
+            sock,
+            9403,
+            "source.create",
+            {
+                "sceneId": "slice",
+                "sourceId": "slice-src",
+                "kind": "streammate_test_source",
+                "settings": {"color": color},
+                "pluginFilterKind": "streammate_test_filter",
+                "filterId": "slice-filter",
+            },
+        )
+        self.assertTrue(created["result"]["ok"])
+        self.assertEqual(created["result"]["kind"], "streammate_test_source")
+
+        # Real async frame: deterministic pattern derived from the settings.
+        cap1 = host.rpc(sock, 9404, "source.captureFrame", {"sourceId": "slice-src"})
+        self.assertIn("result", cap1, msg=f"captureFrame errored: {json.dumps(cap1)}")
+        self.assertTrue(cap1["result"]["ok"])
+        self.assertEqual(cap1["result"]["renderer"], "libobs-async-frame")
+        self.assertEqual(cap1["result"]["format"], "bgra")
+        self.assertEqual(cap1["result"]["width"], 8)
+        self.assertEqual(cap1["result"]["height"], 8)
+        self.assertIs(cap1["result"]["nonZeroBytes"], True)
+        expected = hashlib.sha256(struct.pack("<I", color) * 64).hexdigest()
+        self.assertEqual(cap1["result"]["frameSha256"], expected)
+
+        cap2 = host.rpc(sock, 9405, "source.captureFrame", {"sourceId": "slice-src"})
+        self.assertEqual(cap2["result"]["frameSha256"], cap1["result"]["frameSha256"])
+
+        # The attached plugin filter is listed and toggles (generic production
+        # action on the plugin-backed filter).
+        filters = host.rpc(sock, 9406, "filter.list", {"sourceId": "slice-src"})
+        filter_ids = [f["filterId"] for f in filters["result"]["filters"]]
+        self.assertIn("slice-filter", filter_ids)
+        toggled = host.rpc(sock, 9407, "filter.setEnabled",
+                           {"sourceId": "slice-src", "filterId": "slice-filter", "enabled": False})
+        self.assertTrue(toggled["result"]["ok"])
+        retoggled = host.rpc(sock, 9408, "filter.setEnabled",
+                             {"sourceId": "slice-src", "filterId": "slice-filter", "enabled": True})
+        self.assertTrue(retoggled["result"]["ok"])
+
+        # Generic production action on the plugin-backed source.
+        hidden = host.rpc(sock, 9409, "sceneItem.setVisible",
+                          {"sceneId": "slice", "itemId": "slice-src", "visible": False})
+        self.assertTrue(hidden["result"]["ok"])
+        shown = host.rpc(sock, 9410, "sceneItem.setVisible",
+                         {"sceneId": "slice", "itemId": "slice-src", "visible": True})
+        self.assertTrue(shown["result"]["ok"])
+
+        # Import classification: a collection whose source type is registered
+        # by a LOADED user plugin maps as mapped_plugin (no placeholder).
+        scan = host.rpc(sock, 9411, "import.scan", {})
+        self.assertIn("result", scan, msg=f"import.scan errored: {json.dumps(scan)}")
+        collection_id = scan["result"]["collections"][0]["collectionId"]
+        loaded_report = host.rpc(sock, 9412, "import.load", {"collectionId": collection_id})
+        self.assertIn("result", loaded_report, msg=f"import.load errored: {json.dumps(loaded_report)}")
+        report = loaded_report["result"]["report"]
+        mapped_by_module = {item.get("moduleName"): item for item in report["mapped"]}
+        self.assertIn("streammate_test_source", mapped_by_module)
+        self.assertEqual(mapped_by_module["streammate_test_source"]["reason"], "mapped_plugin")
+        self.assertIn("streammate_test_filter", mapped_by_module)
+        self.assertEqual(mapped_by_module["streammate_test_filter"]["reason"], "mapped_plugin")
+        for bucket in ("degraded", "unresolved"):
+            for item in report[bucket]:
+                self.assertNotIn(item.get("moduleName"), ("streammate_test_source", "streammate_test_filter"))
 
     def test_real_loading_end_to_end(self) -> None:
         before = tree_digest(self.root)
