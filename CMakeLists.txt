@@ -201,6 +201,13 @@ if(BUILD_TESTING)
     NAME plugin-slice-verbs
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_plugin_slice_verbs.py $<TARGET_FILE:studio-host>
   )
+  # NIF-H3: bounded plugin failure containment — durable crash/hang
+  # attribution sentinel, retry grammar, watchdog deadline; scaffold lane
+  # proves the lane-agnostic suspicion/refusal/determinism contracts.
+  add_test(
+    NAME plugin-crash-containment
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_plugin_crash_containment.py $<TARGET_FILE:studio-host>
+  )
   add_test(
     NAME macos-packaging
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_macos_packaging.py
