@@ -872,8 +872,9 @@ Options parse_args(int argc, char **argv) {
 // payload; empty in the scaffold lane (nothing loads there) so every
 // consumer's plugin path is inert without libobs.
 struct UserPluginTypeMaps {
-  std::map<std::string, std::string> sources; // type id -> module label
-  std::map<std::string, std::string> filters; // type id -> module label
+  std::map<std::string, std::string> sources;     // type id -> module label
+  std::map<std::string, std::string> filters;     // type id -> module label
+  std::map<std::string, std::string> transitions; // type id -> module label (NIF-M3)
 };
 
 // Defined after Sha256Stream below; declared here for RendererState's
@@ -2598,6 +2599,13 @@ struct ObsSourceEntry {
   // for custody analysis only; never re-serialized.
   std::string settings_raw;
   size_t settings_offset = std::string::npos;
+  // NIF-M3: structural classification captured by the parser (array context):
+  // filters ride their parent source's `filters` array, transitions the
+  // top-level `transitions` array, scripts the `modules.scripts-tool` array.
+  bool is_filter = false;
+  bool is_transition = false;
+  bool is_script = false;
+  std::string parent_label; // owning source label for nested filters
 };
 
 std::optional<uint32_t> json_hex_value(char c) {
@@ -2857,6 +2865,75 @@ const std::set<std::string> &upstream_source_ids() {
   return ids;
 }
 
+// NIF-M3: upstream FILTER type ids at the 32.x pin (obs-filters + coreaudio
+// audio filters). Filters carrying these ids ride the native filter chain
+// (host filter verbs) and map mapped_native; anything else is plugin surface.
+const std::set<std::string> &upstream_filter_ids() {
+  static const std::set<std::string> ids = {
+      "color_filter",         "color_filter_v2",       "color_key_filter",     "color_key_filter_v2",
+      "chroma_key_filter",    "chroma_key_filter_v2",  "mask_filter",          "mask_filter_v2",
+      "crop_filter",          "gain_filter",           "sharpness_filter",     "sharpness_filter_v2",
+      "scale_filter",         "scroll_filter",         "gpu_delay",            "luma_key_filter",
+      "luma_key_filter_v2",   "noise_gate_filter",     "noise_suppress_filter","compressor_filter",
+      "limiter_filter",       "expander_filter",       "upward_compressor_filter",
+      "invert_polarity_filter","async_delay_filter",   "hdr_tonemap_filter",
+      "clut_filter",          "vst_filter",
+      // codex F1: registered by the pinned obs-filters module (eq-filter.c).
+      // (opus N1: premultiplied_alpha_filter removed — it is a game-capture
+      // setting key, not a registered filter id at the 32.x pin.)
+      "basic_eq_filter"};
+  return ids;
+}
+
+// NIF-M3: upstream TRANSITION type ids at the 32.x pin (obs-transitions).
+const std::set<std::string> &upstream_transition_ids() {
+  static const std::set<std::string> ids = {
+      "cut_transition",  "fade_transition", "swipe_transition", "slide_transition",
+      "fade_to_color_transition", "wipe_transition", "obs_stinger_transition"};
+  return ids;
+}
+
+// NIF-M3: upstream ids that map natively without further gating.
+const std::set<std::string> &mapped_native_source_ids() {
+  static const std::set<std::string> ids = {
+      "color_source",  "color_source_v2", "color_source_v3", "browser_source", "text_ft2_source",
+      "text_ft2_source_v2", "text_gdiplus", "text_gdiplus_v2", "image_source", "ffmpeg_source",
+      "slideshow",     "slideshow_v2",    "group",           "coreaudio_output_capture"};
+  return ids;
+}
+
+// NIF-M3: upstream capture ids that defer the screen permission gate.
+const std::set<std::string> &screen_permission_source_ids() {
+  static const std::set<std::string> ids = {"screen_capture", "display_capture", "window_capture",
+                                            "sck_audio_capture"};
+  return ids;
+}
+
+// NIF-M3: upstream ids that are camera-permission surface (macOS capture
+// rename rides the same TCC gate as av_capture_input).
+const std::set<std::string> &camera_permission_source_ids() {
+  static const std::set<std::string> ids = {"av_capture_input", "macos-avcapture", "macos-avcapture-fast"};
+  return ids;
+}
+
+// NIF-M3: device-backed upstream ids — the original hardware is not present
+// at import time on this machine.
+const std::set<std::string> &device_backed_source_ids() {
+  // opus N2 verified: audio_line IS a registered libobs source id at the pin
+  // (external/obs-studio/libobs/obs.c, .id = "audio_line") — it stays.
+  static const std::set<std::string> ids = {"syphon-input", "decklink-input", "audio_line"};
+  return ids;
+}
+
+// NIF-M3: upstream ids that target another platform (unavailable on macOS).
+const std::set<std::string> &other_platform_source_ids() {
+  static const std::set<std::string> ids = {
+      "wasapi_input_capture", "wasapi_output_capture", "dshow_input",        "game_capture",
+      "monitor_capture",      "jack_output_capture",   "pulse_input_capture","pulse_output_capture",
+      "v4l2_input",           "xcomposite_input",      "xshm_input",         "alsa_input_capture"};
+  return ids;
+}
+
 // Credential-class settings keys (per the existing service-exclusion rules):
 // values are redacted in the WORKSPACE COPY and recorded by key name only.
 const std::set<std::string> &credential_settings_keys() {
@@ -2887,13 +2964,56 @@ std::vector<ObsSourceEntry> parse_obs_source_entries(const std::string &json) {
     std::string settings_raw;
     size_t settings_offset = std::string::npos;
     size_t entry_index = std::string::npos;
+    // NIF-M3: structural context inherited from the enclosing array.
+    bool is_filter = false;
+    bool is_transition = false;
+    bool is_script = false;
+    std::string parent_label;
+    size_t parent_depth = std::string::npos;
+  };
+  // NIF-M3: enclosing-array context — the key that opened the array plus the
+  // label of the object that owned that key ("" when unnamed). Anonymous
+  // arrays push an empty key so every ']' pops symmetrically. Relies on
+  // obs_save_source key order (name precedes filters), like the rest of this
+  // fixture-grade walker.
+  struct ArrayContext {
+    std::string key;
+    std::string owner_label;
+    size_t owner_depth = std::string::npos;
   };
   std::vector<ObjectFields> stack;
+  std::vector<ArrayContext> arrays;
   std::vector<ObsSourceEntry> entries;
+  // NIF-M3 (codex F4): (entry index, owner stack depth) for filter entries
+  // emitted before their parent's name was parsed.
+  std::vector<std::pair<size_t, size_t>> pending_filter_parents;
   for (size_t pos = 0; pos < json.size();) {
     const char c = json[pos];
     if (c == '{') {
-      stack.push_back({"", "", false});
+      ObjectFields fields;
+      if (!arrays.empty()) {
+        const ArrayContext &context = arrays.back();
+        if (context.key == "filters") {
+          fields.is_filter = true;
+          fields.parent_label = context.owner_label;
+          fields.parent_depth = context.owner_depth;
+        } else if (context.key == "transitions") {
+          fields.is_transition = true;
+        } else if (context.key == "scripts-tool") {
+          fields.is_script = true;
+        }
+      }
+      stack.push_back(std::move(fields));
+      ++pos;
+      continue;
+    }
+    if (c == '[') {
+      arrays.push_back({"", "", std::string::npos});
+      ++pos;
+      continue;
+    }
+    if (c == ']') {
+      if (!arrays.empty()) arrays.pop_back();
       ++pos;
       continue;
     }
@@ -2905,6 +3025,17 @@ std::vector<ObsSourceEntry> parse_obs_source_entries(const std::string &json) {
             entries[closing.entry_index].settings_raw.empty()) {
           entries[closing.entry_index].settings_raw = closing.settings_raw;
           entries[closing.entry_index].settings_offset = closing.settings_offset;
+        }
+        // NIF-M3 (codex F4): JSON key order is not a contract — a "filters"
+        // array may precede the parent's "name". Patch child filter entries
+        // whose parent label was unknown when they were emitted.
+        if (!closing.name.empty()) {
+          const size_t owner_depth = stack.size() - 1;
+          for (auto &pending : pending_filter_parents) {
+            if (pending.second == owner_depth && entries[pending.first].parent_label.empty()) {
+              entries[pending.first].parent_label = closing.name;
+            }
+          }
         }
         stack.pop_back();
       }
@@ -2940,6 +3071,14 @@ std::vector<ObsSourceEntry> parse_obs_source_entries(const std::string &json) {
       }
       continue;
     }
+    // NIF-M3: a key opening an array records the enclosing-array context and
+    // consumes the bracket (the generic '[' branch never sees it).
+    if (json[pos] == '[') {
+      arrays.push_back({*key, stack.empty() ? "" : stack.back().name,
+                        stack.empty() ? std::string::npos : stack.size() - 1});
+      ++pos;
+      continue;
+    }
     if (json[pos] != '"') continue;
     auto value = parse_json_string_token(json, pos);
     if (!value || stack.empty()) continue;
@@ -2949,12 +3088,30 @@ std::vector<ObsSourceEntry> parse_obs_source_entries(const std::string &json) {
       current.name = *value;
     } else if (*key == "id") {
       current.id = *value;
+    } else if (*key == "path" && current.is_script && !current.emitted) {
+      // NIF-M3 / Q-137: script entries carry a path, not name/id. Inventory
+      // them by file name only (never the directory portion). Scripts bypass
+      // the adjacent-entry dedup: two scripts may share a basename (codex F5).
+      std::string base = *value;
+      const size_t slash = base.find_last_of("/\\");
+      if (slash != std::string::npos) base = base.substr(slash + 1);
+      ObsSourceEntry entry;
+      entry.label = base;
+      entry.is_script = true;
+      entries.push_back(entry);
+      current.emitted = true;
     }
     if (!current.emitted && !current.name.empty() && !current.id.empty()) {
       ObsSourceEntry entry{current.name, current.id};
+      entry.is_filter = current.is_filter;
+      entry.is_transition = current.is_transition;
+      entry.parent_label = current.parent_label;
       if (entries.empty() || entries.back().label != entry.label || entries.back().module != entry.module) {
         entries.push_back(entry);
         current.entry_index = entries.size() - 1;
+        if (current.is_filter && entry.parent_label.empty() && current.parent_depth != std::string::npos) {
+          pending_filter_parents.emplace_back(entries.size() - 1, current.parent_depth);
+        }
         if (!current.settings_raw.empty()) {
           entries.back().settings_raw = current.settings_raw;
           entries.back().settings_offset = current.settings_offset;
@@ -3973,12 +4130,14 @@ std::string build_user_plugins_boot_report_json(
 #if STREAMMATE_HAS_LIBOBS
   load_user_plugin_candidates(plan, bundle_plugins_dir, containment);
   if (out_types) {
-    // kRegisteredTypeKinds order: sources=0, filters=1. Only LOADED modules
-    // contribute (a failed init's partial registrations are never credited).
+    // kRegisteredTypeKinds order: sources=0, filters=1, transitions=2. Only
+    // LOADED modules contribute (a failed init's partial registrations are
+    // never credited).
     for (const auto &record : plan.inventory.modules) {
       if (record.lifecycle != "loaded" || !record.has_registered_types) continue;
       for (const auto &type_id : record.registered_types[0]) out_types->sources[type_id] = record.label;
       for (const auto &type_id : record.registered_types[1]) out_types->filters[type_id] = record.label;
+      for (const auto &type_id : record.registered_types[2]) out_types->transitions[type_id] = record.label;
     }
   }
 #else
@@ -4498,7 +4657,9 @@ private:
     if (marker && *marker != 1.0) return PluginDisposition::migration;
     if (loaded_source) return PluginDisposition::mapped_source;
     if (loaded_filter) return PluginDisposition::mapped_filter;
-    if (entry.module.find("filter") != std::string::npos) return PluginDisposition::none; // frontend-filter path
+    // NIF-M3: nested filters classify structurally in build_report (entry.is_filter);
+    // a non-upstream, non-loaded TOP-LEVEL module degrades missing regardless
+    // of whether its id happens to contain "filter".
     return PluginDisposition::missing;
   }
 
@@ -4764,7 +4925,31 @@ private:
                         const std::string &digest_before, const std::string &digest_after) const {
     std::vector<std::string> placeholders;
     for (const auto &entry : parse_obs_source_entries(json)) {
-      if (entry.module == "third_party_camera_fx" || plugin_disposition(entry) == PluginDisposition::missing) {
+      // NIF-M3: mirror build_report exactly — placeholder records exist only
+      // for items the report degrades missing_plugin, under the same ids.
+      if (entry.is_script) continue;
+      if (entry.is_transition) {
+        const bool loaded = user_plugin_types_ && user_plugin_types_->transitions.count(entry.module) > 0;
+        if (upstream_transition_ids().count(entry.module) == 0 && !loaded) {
+          placeholders.push_back("{\"sourceId\":\"transition:" + json_escape(entry.label) + "\",\"label\":\"" +
+                                 json_escape(entry.label) + "\",\"reason\":\"missing_plugin\"}");
+        }
+        continue;
+      }
+      if (entry.is_filter) {
+        const bool loaded = user_plugin_types_ && user_plugin_types_->filters.count(entry.module) > 0;
+        if (upstream_filter_ids().count(entry.module) == 0 && !loaded) {
+          placeholders.push_back("{\"sourceId\":\"filter:" + json_escape(entry.parent_label) + ":" + json_escape(entry.label) +
+                                 "\",\"label\":\"" + json_escape(entry.parent_label) + " / " + json_escape(entry.label) +
+                                 "\",\"reason\":\"missing_plugin\"}");
+        }
+        continue;
+      }
+      const PluginDisposition disposition = plugin_disposition(entry);
+      // codex F6: a migration-marked source reports settings_migration_required
+      // — the map must not claim a missing-plugin placeholder for it.
+      if (disposition == PluginDisposition::missing ||
+          (entry.module == "third_party_camera_fx" && disposition != PluginDisposition::migration)) {
         placeholders.push_back("{\"sourceId\":\"source:" + json_escape(entry.label) + "\",\"label\":\"" + json_escape(entry.label) +
                                "\",\"reason\":\"missing_plugin\"}");
       }
@@ -4802,13 +4987,65 @@ private:
     std::vector<std::string> mapped;
     std::vector<std::string> degraded;
     std::vector<std::string> unresolved;
+    std::map<std::string, int> script_label_counts;
     for (const auto &entry : parse_obs_source_entries(json)) {
       const std::string source_id = "source:" + entry.label;
+      // NIF-M3 / Q-137: Lua/Python scripts are inventoried and deferred —
+      // precise class, never a silent drop.
+      if (entry.is_script) {
+        // codex F5: duplicate basenames get a deterministic ordinal suffix so
+        // report ids stay unique without disclosing directory portions.
+        std::string script_id = "script:" + entry.label;
+        const int seen = ++script_label_counts[entry.label];
+        if (seen > 1) script_id += "-" + std::to_string(seen);
+        unresolved.push_back(report_item(script_id, "source", entry.label, "unresolved",
+                                         "unsupported_plugin_class", "", "",
+                                         {"Lua/Python scripts are inventoried and deferred (Q-137)."}));
+        continue;
+      }
+      // NIF-M3: transitions are first-class accounted items.
+      if (entry.is_transition) {
+        const std::string transition_id = "transition:" + entry.label;
+        if (upstream_transition_ids().count(entry.module) > 0) {
+          mapped.push_back(report_item(transition_id, "transition", entry.label, "mapped", "mapped_native", entry.module));
+        } else if (user_plugin_types_ && user_plugin_types_->transitions.count(entry.module) > 0) {
+          mapped.push_back(report_item(transition_id, "transition", entry.label, "mapped", "mapped_plugin", entry.module, "",
+                                       {"Backed by loaded user plugin " + user_plugin_types_->transitions.at(entry.module) + "."}));
+        } else {
+          degraded.push_back(report_item(transition_id, "transition", entry.label, "degraded", "missing_plugin", entry.module, "",
+                                         {"Replaced with placeholder transition because module " + entry.module +
+                                          " is not loaded by the native host."}));
+        }
+        continue;
+      }
+      // NIF-M3 (codex F5): nested filters classify by their own module id —
+      // upstream filter chain, loaded plugin filter, or missing plugin —
+      // never the generic unsupported_frontend_feature.
+      if (entry.is_filter) {
+        const std::string filter_id = "filter:" + entry.parent_label + ":" + entry.label;
+        const std::string filter_label = entry.parent_label + " / " + entry.label;
+        if (upstream_filter_ids().count(entry.module) > 0) {
+          mapped.push_back(report_item(filter_id, "filter", filter_label, "mapped", "mapped_native", entry.module, "",
+                                       {"Native filter chain: applied via the host filter verbs."}));
+        } else if (user_plugin_types_ && user_plugin_types_->filters.count(entry.module) > 0) {
+          mapped.push_back(report_item(filter_id, "filter", filter_label, "mapped", "mapped_plugin", entry.module, "",
+                                       {"Backed by loaded user plugin " + user_plugin_types_->filters.at(entry.module) + "."}));
+        } else {
+          degraded.push_back(report_item(filter_id, "filter", filter_label, "degraded", "missing_plugin", entry.module, "",
+                                         {"Replaced with placeholder filter because module " + entry.module +
+                                          " is not loaded by the native host."}));
+        }
+        continue;
+      }
       const PluginDisposition disposition = plugin_disposition(entry);
       if (entry.module == "scene") {
         mapped.push_back(report_item("scene:" + entry.label, "scene", entry.label, "mapped", "mapped_native"));
-      } else if (entry.module == "color_source" || entry.module == "browser_source" || entry.module == "text_ft2_source" ||
-                 entry.module == "text_gdiplus" || entry.module == "image_source" || entry.module == "ffmpeg_source") {
+      } else if (entry.module == "group") {
+        // NIF-M3: OBS groups import as nested scene containers (recorded
+        // Q-103 drift point closed). moduleName "group" lets the corpus
+        // normalizer recover the `group-<slug>` id convention.
+        mapped.push_back(report_item(source_id, "source", entry.label, "mapped", "mapped_native", entry.module));
+      } else if (mapped_native_source_ids().count(entry.module) > 0) {
         mapped.push_back(report_item(source_id, "source", entry.label, "mapped", "mapped_native", entry.module));
       } else if (disposition == PluginDisposition::migration) {
         // NIF-M2: seeded settings-version signal — the plugin-family source
@@ -4828,7 +5065,7 @@ private:
       } else if (user_plugin_types_ && user_plugin_types_->filters.count(entry.module) > 0) {
         mapped.push_back(report_item("filter:" + entry.label, "filter", entry.label, "mapped", "mapped_plugin", entry.module, "",
                                      {"Backed by loaded user plugin " + user_plugin_types_->filters.at(entry.module) + "."}));
-      } else if (entry.module == "av_capture_input") {
+      } else if (camera_permission_source_ids().count(entry.module) > 0) {
         if (entry.label.find("Unplugged") != std::string::npos) {
           degraded.push_back(report_item(source_id, "source", entry.label, "degraded", "missing_device", entry.module, "camera",
                                          {"Original device identifier was absent from the fixture."}));
@@ -4839,16 +5076,22 @@ private:
       } else if (entry.module == "coreaudio_input_capture") {
         degraded.push_back(report_item(source_id, "source", entry.label, "degraded", "permission_required", entry.module, "microphone",
                                        {"Native import defers microphone permission until explicit operator approval."}));
-      } else if (entry.module == "screen_capture") {
+      } else if (screen_permission_source_ids().count(entry.module) > 0) {
         degraded.push_back(report_item(source_id, "source", entry.label, "degraded", "permission_required", entry.module, "screen",
                                        {"Native import defers screen permission until explicit operator approval."}));
+      } else if (device_backed_source_ids().count(entry.module) > 0) {
+        // NIF-M3: device-backed upstream ids — precise reason, actionable note.
+        degraded.push_back(report_item(source_id, "source", entry.label, "degraded", "missing_device", entry.module, "",
+                                       {"Device-backed source; the original device was not present at import."}));
+      } else if (other_platform_source_ids().count(entry.module) > 0) {
+        degraded.push_back(report_item(source_id, "source", entry.label, "degraded", "missing_device", entry.module, "",
+                                       {"Module " + entry.module + " targets another platform and is unavailable on macOS."}));
+      } else if (entry.module == "vlc_source") {
+        degraded.push_back(report_item(source_id, "source", entry.label, "degraded", "dependency_missing", entry.module, "",
+                                       {"VLC libraries are not bundled with the native host."}));
       } else if (entry.module == "third_party_camera_fx") {
         degraded.push_back(report_item(source_id, "source", entry.label, "degraded", "missing_plugin", entry.module, "",
                                        {"Replaced with placeholder source because obs-third-party-fx is not bundled upstream."}));
-      } else if (entry.module.find("filter") != std::string::npos) {
-        unresolved.push_back(report_item("filter:Station Overlay:" + entry.label, "filter", "Station Overlay / " + entry.label, "unresolved",
-                                         "unsupported_frontend_feature", entry.module, "",
-                                         {"OBS frontend filter is not imported by the native host scaffold."}));
       } else if (disposition == PluginDisposition::missing) {
         // NIF-M2: generalized missing_plugin — a non-upstream module with no
         // loaded user plugin degrades to a placeholder with the module named.
@@ -4856,6 +5099,11 @@ private:
         degraded.push_back(report_item(source_id, "source", entry.label, "degraded", "missing_plugin", entry.module, "",
                                        {"Replaced with placeholder source because module " + entry.module +
                                         " is not loaded by the native host."}));
+      } else if (!entry.module.empty()) {
+        // NIF-M3: defensive exhaustiveness — an upstream id with no explicit
+        // branch above is still accounted, never silently dropped.
+        degraded.push_back(report_item(source_id, "source", entry.label, "degraded", "unsupported_frontend_feature", entry.module, "",
+                                       {"Native import support for this upstream module is pending."}));
       }
     }
 
