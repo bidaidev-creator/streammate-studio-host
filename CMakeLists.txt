@@ -174,6 +174,11 @@ if(BUILD_TESTING)
     NAME import-hardening
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_import_hardening.py $<TARGET_FILE:studio-host>
   )
+  # NIF-M2: plugin settings/data/assets custody in the import workspace.
+  add_test(
+    NAME import-custody
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_import_custody.py $<TARGET_FILE:studio-host>
+  )
   add_test(
     NAME production-control-verbs
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_production_control_verbs.py $<TARGET_FILE:studio-host>
