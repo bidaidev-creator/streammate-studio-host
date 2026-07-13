@@ -342,9 +342,13 @@ inline ParseOutcome parse_manifest_text(const std::string &text) {
 
   if (!scan.consume('{')) return fail("malformed-json");
   if (!scan.consume('}')) {
+    // Duplicate keys are interop-ambiguous (last-wins vs append) at every
+    // object level of the schema: refuse them fail-closed.
+    std::set<std::string> seen_keys;
     while (true) {
       auto key = scan.string();
       if (!key) return fail("malformed-json");
+      if (!seen_keys.insert(*key).second) return fail("duplicate-key");
       if (!scan.consume(':')) return fail("malformed-json");
 
       if (*key == "version") {
@@ -365,9 +369,11 @@ inline ParseOutcome parse_manifest_text(const std::string &text) {
             Root root;
             bool saw_binary_dir = false;
             if (!scan.consume('}')) {
+              std::set<std::string> seen_root_keys;
               while (true) {
                 auto root_key = scan.string();
                 if (!root_key) return fail("malformed-json");
+                if (!seen_root_keys.insert(*root_key).second) return fail("duplicate-key");
                 if (!scan.consume(':')) return fail("malformed-json");
                 if (*root_key == "binaryDir") {
                   auto value = scan.string();
@@ -453,15 +459,26 @@ inline ParseOutcome parse_manifest_text(const std::string &text) {
 // Launch-time gate: any failure throws with "invalid --user-plugins-manifest:
 // <reason-code>" -- main() catches it, logs, and returns kUsageExit. The raw
 // path is intentionally NEVER part of the message.
+// Manifest byte ceiling: manifests are tiny; consistent with the repo's
+// bounded-input posture (kMaxSceneCollectionBytes).
+constexpr std::uintmax_t kMaxManifestBytes = 1024 * 1024;
+
 inline Manifest load_or_throw(const std::string &path) {
   const std::string prefix = "invalid --user-plugins-manifest: ";
   if (!is_absolute_manifest_path(path)) throw std::runtime_error(prefix + "not-absolute-path");
+  std::error_code ec;
+  const std::uintmax_t size = std::filesystem::file_size(path, ec);
+  if (ec) throw std::runtime_error(prefix + "unreadable-file");
+  if (size > kMaxManifestBytes) throw std::runtime_error(prefix + "manifest-too-large");
   std::ifstream in(path, std::ios::binary);
   if (!in) throw std::runtime_error(prefix + "unreadable-file");
   std::ostringstream buffer;
   buffer << in.rdbuf();
   if (in.bad()) throw std::runtime_error(prefix + "unreadable-file");
-  ParseOutcome outcome = parse_manifest_text(buffer.str());
+  const std::string text = buffer.str();
+  // Re-checked on the actual bytes read (covers a file racing the size stat).
+  if (text.size() > kMaxManifestBytes) throw std::runtime_error(prefix + "manifest-too-large");
+  ParseOutcome outcome = parse_manifest_text(text);
   if (!outcome.manifest) throw std::runtime_error(prefix + outcome.reason_code);
   return std::move(*outcome.manifest);
 }
@@ -2517,6 +2534,10 @@ struct UserPluginCandidate {
 // Symlink confinement: a candidate binary must itself be a real regular file
 // (never a symlink) and its fully-resolved canonical path must stay inside
 // the canonical root -- otherwise it is never opened, read, or hashed.
+// ACCEPTED BOUNDARY (review INFO, current threat model): this is a path-based
+// check, so a TOCTOU swap between verdict and open, or a hard link inside the
+// root to an outside inode, is not defended here. Future hardening direction:
+// open first, then fstat/verify on the open descriptor before reading.
 bool user_plugin_binary_confined(const std::filesystem::path &binary,
                                  const std::filesystem::path &canonical_root) {
   std::error_code ec;

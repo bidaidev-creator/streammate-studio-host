@@ -454,6 +454,24 @@ class PluginDiscoveryTest(unittest.TestCase):
         )
         self._assert_refused(str(bad_root), "invalid-roots", "xyzzy75")
 
+    def test_oversized_manifest_is_refused(self) -> None:
+        # Manifest byte ceiling (1 MiB): consistent with the repo's bounded
+        # input posture (kMaxSceneCollectionBytes); manifests are tiny.
+        big = self.base / "oversized-manifest-xyzzy77.json"
+        big.write_text(json.dumps({"version": 1, "roots": [], "pad": "a" * (1024 * 1024)}))
+        self._assert_refused(str(big), "manifest-too-large", "xyzzy77")
+
+    def test_duplicate_manifest_keys_are_refused(self) -> None:
+        # Duplicate keys are interop-ambiguous (last-wins vs append) and are
+        # refused fail-closed at any object level of the schema.
+        dup_top = self.base / "dup-top-manifest-xyzzy78.json"
+        dup_top.write_text('{"version":1,"version":1,"roots":[]}')
+        self._assert_refused(str(dup_top), "duplicate-key", "xyzzy78")
+
+        dup_root = self.base / "dup-root-manifest-xyzzy79.json"
+        dup_root.write_text('{"version":1,"roots":[{"binaryDir":"/a","binaryDir":"/b"}]}')
+        self._assert_refused(str(dup_root), "duplicate-key", "xyzzy79")
+
     def test_bad_exclude_entry_is_refused(self) -> None:
         bad_exclude = self.base / "bad-exclude-manifest-xyzzy76.json"
         bad_exclude.write_text(
