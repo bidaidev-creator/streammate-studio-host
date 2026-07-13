@@ -149,6 +149,12 @@ if(BUILD_TESTING)
     NAME plugin-discovery
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_plugin_discovery.py $<TARGET_FILE:studio-host>
   )
+  # NIF-H2: real user-plugin loading plan/report honesty (scaffold lane) +
+  # static contracts for the in-tree test plugins and the CI loading lane.
+  add_test(
+    NAME user-plugin-loading
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_user_plugin_loading.py $<TARGET_FILE:studio-host>
+  )
   add_test(
     NAME macos-packaging
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_macos_packaging.py
