@@ -265,6 +265,69 @@ class ImportCustodyTest(unittest.TestCase):
         report = json.dumps(result["report"])
         self.assertNotIn("missing_plugin", report)
 
+    def test_nested_and_array_credential_values_redacted(self) -> None:
+        # Credential-class keys at any JSON depth (nested object, array value)
+        # must be redacted, not just top-level string values.
+        body = json.dumps(
+            {
+                "name": "Nested Creds",
+                "sources": [
+                    {
+                        "name": "Nested Plugin",
+                        "id": "streammate_test_source",
+                        "settings": {
+                            "auth": {"token": CRED_VALUE},
+                            "password": {"value": CRED_VALUE},
+                            "api_key": [CRED_VALUE],
+                        },
+                    }
+                ],
+            }
+        )
+        build_config(self.obs_dir, "custody-nested", body)
+        self.load("custody-nested")
+        workspace_scene = (self.workspace("custody-nested") / "basic/scenes/custody-nested.json").read_text()
+        self.assertNotIn(CRED_VALUE, workspace_scene)
+
+    def test_malformed_collection_with_credentials_fails_closed(self) -> None:
+        # An unterminated settings object must not silently copy credentials
+        # through unredacted: import fails closed.
+        malformed = '{"name":"Bad","sources":[{"name":"X","id":"streammate_test_source","settings":{"stream_key":"' + CRED_VALUE + '"'
+        (self.obs_dir / "basic" / "scenes" / "custody-bad.json").write_text(malformed, encoding="utf-8")
+        result = self.rpc("import.load", {"collectionId": "custody-main"})
+        workspace_bad = self.workspace("custody-main") / "basic/scenes/custody-bad.json"
+        if workspace_bad.exists():
+            self.assertNotIn(CRED_VALUE, workspace_bad.read_text())
+        else:
+            self.assertFalse(result.get("ok", False))
+
+    def test_duplicate_settings_object_redacts_both(self) -> None:
+        dup = (
+            '{"name":"Dup","sources":[{"name":"D","id":"streammate_test_source",'
+            '"settings":{"color":1},"settings":{"stream_key":"' + CRED_VALUE + '"}}]}'
+        )
+        (self.obs_dir / "basic" / "scenes" / "custody-dup.json").write_text(dup, encoding="utf-8")
+        self.load("custody-main")
+        workspace_dup = self.workspace("custody-main") / "basic/scenes/custody-dup.json"
+        if workspace_dup.exists():
+            self.assertNotIn(CRED_VALUE, workspace_dup.read_text())
+
+    def test_windows_absolute_path_is_external_without_leaking_path(self) -> None:
+        body = json.dumps(
+            {
+                "name": "Win Path",
+                "sources": [
+                    {"name": "Win Media", "id": "ffmpeg_source", "settings": {"local_file": "C:\\Users\\Alice\\a.mov"}}
+                ],
+            }
+        )
+        build_config(self.obs_dir, "custody-win", body)
+        self.load("custody-win")
+        resources = {(r["sourceId"], r["settingsKey"]): r for r in self.import_map("custody-win")["resources"]}
+        win = resources[("source:Win Media", "local_file")]
+        self.assertEqual(win["status"], "external-resource")
+        self.assertNotIn("Alice", json.dumps(self.import_map("custody-win")))
+
     def test_import_map_byte_deterministic(self) -> None:
         self.load()
         first = (self.workspace() / "streammate-import-map.json").read_bytes()

@@ -4138,9 +4138,10 @@ public:
     try {
       const std::string digest_before = config_tree_digest(*config);
       const CustodyAnalysis analysis = analyze_custody(*config, json);
-      // Redact credential-class values in EVERY scene-collection copy — a
-      // config dir can hold several collections and none may carry secrets
-      // into the workspace.
+      // Redact credential-class values (any depth, any type) in EVERY
+      // scene-collection copy — a config dir can hold several collections and
+      // none may carry secrets into the workspace. Fail closed on a malformed
+      // collection that carries a credential-class key.
       std::map<std::string, std::string> overrides;
       std::error_code scenes_ec;
       const std::filesystem::path scenes_dir = *config / "basic" / "scenes";
@@ -4153,23 +4154,38 @@ public:
         } catch (...) {
           continue;
         }
-        std::vector<CustodyRedaction> redactions;
-        for (const auto &entry : parse_obs_source_entries(body)) {
-          if (entry.settings_raw.empty()) continue;
-          for (const auto &field : parse_settings_fields(entry.settings_raw)) {
-            if (credential_settings_keys().count(field.key) > 0 && field.is_string) {
-              redactions.push_back({"source:" + entry.label, field.key, entry.settings_offset + field.value_offset,
-                                    field.value_length});
-            }
+        bool has_credential_key = false;
+        for (const auto &key : credential_settings_keys()) {
+          if (body.find("\"" + key + "\"") != std::string::npos) {
+            has_credential_key = true;
+            break;
           }
         }
-        if (!redactions.empty()) {
-          overrides[std::filesystem::relative(it->path(), *config).generic_string()] = apply_redactions(body, redactions);
+        if (!has_credential_key) continue;
+        auto redacted = redact_all_credential_values(body);
+        if (!redacted) {
+          // Malformed collection carrying a credential key: refuse rather than
+          // copy potentially-unredacted secrets into the workspace.
+          std::filesystem::remove_all(temp);
+          return error(-32602, "scene collection is malformed and carries credential-class settings");
         }
+        overrides[std::filesystem::relative(it->path(), *config).generic_string()] = *redacted;
       }
       std::filesystem::remove_all(temp);
       copy_config_without_service_json(*config, temp, overrides.empty() ? nullptr : &overrides);
       const std::string digest_after = config_tree_digest(*config);
+      // Copy-only invariant (self-review F7): if the source tree changed during
+      // the copy, the workspace is a mixed snapshot — refuse it.
+      if (digest_before != digest_after) {
+        std::filesystem::remove_all(temp);
+        return error(-32603, "OBS config changed during import; retry with a stable source");
+      }
+      // Post-copy safety net: no credential-class key may map to a raw string
+      // value in any workspace scene collection (catches any redaction miss).
+      if (workspace_has_unredacted_credential(temp)) {
+        std::filesystem::remove_all(temp);
+        return error(-32603, "credential redaction incomplete; import refused");
+      }
       write_import_map(temp, json, analysis, digest_before, digest_after);
       std::filesystem::remove_all(destination);
       std::filesystem::create_directories(destination.parent_path());
@@ -4500,14 +4516,35 @@ private:
     resource.source_id = source_id;
     resource.settings_key = field.key;
     const std::string &value = field.string_value;
-    if (!value.empty() && value.front() == '/') {
+    // NIF-M2 (self-review F6): platform-neutral absolute detection (POSIX `/`,
+    // Windows drive `X:\` or `X:/`, UNC `\\`), and component-based traversal —
+    // never echo an escaping/absolute path into the map.
+    const bool posix_absolute = !value.empty() && value.front() == '/';
+    const bool windows_absolute =
+        (value.size() >= 3 && std::isalpha(static_cast<unsigned char>(value[0])) && value[1] == ':' &&
+         (value[2] == '\\' || value[2] == '/')) ||
+        (value.size() >= 2 && value[0] == '\\' && value[1] == '\\');
+    bool has_traversal = false;
+    {
+      std::string segment;
+      auto flush = [&]() {
+        if (segment == "..") has_traversal = true;
+        segment.clear();
+      };
+      for (char ch : value) {
+        if (ch == '/' || ch == '\\') flush();
+        else segment.push_back(ch);
+      }
+      flush();
+    }
+    if (posix_absolute || windows_absolute || has_traversal) {
       resource.status = "external-resource";
-      resource.remediation = "asset lives outside the OBS config directory; relink it inside the imported workspace";
+      resource.remediation = "asset lives outside the imported workspace; relink it to a path inside the workspace";
       return resource;
     }
-    if (value.empty() || value.find("..") != std::string::npos) {
+    if (value.empty()) {
       resource.status = "missing-resource";
-      resource.remediation = "asset path escapes the OBS config directory; relink it inside the imported workspace";
+      resource.remediation = "asset path is empty; relink the source to a file inside the imported workspace";
       return resource;
     }
     std::error_code ec;
@@ -4573,6 +4610,77 @@ private:
     return analysis;
   }
 
+  // NIF-M2 (self-review F2/F3): redact the value of EVERY credential-class key
+  // anywhere in the document (any nesting depth, any JSON value type), in a
+  // single string/escape-aware pass. Fail-closed: on a malformed document
+  // (unterminated string/unbalanced container) returns nullopt so the caller
+  // refuses the import rather than copying unredacted bytes.
+  static std::optional<std::string> redact_all_credential_values(const std::string &json) {
+    std::string out;
+    out.reserve(json.size() + 32);
+    const std::string sentinel = std::string("\"") + kRedactionSentinel + "\"";
+    size_t pos = 0;
+    auto skip_ws = [&](size_t &p) {
+      while (p < json.size() && std::isspace(static_cast<unsigned char>(json[p]))) ++p;
+    };
+    while (pos < json.size()) {
+      char c = json[pos];
+      if (c == '"') {
+        size_t key_start = pos;
+        auto key = parse_json_string_token(json, pos);
+        if (!key) return std::nullopt; // unterminated string => malformed
+        size_t after_key = pos;
+        skip_ws(after_key);
+        const bool is_credential = credential_settings_keys().count(*key) > 0;
+        if (is_credential && after_key < json.size() && json[after_key] == ':') {
+          size_t value_pos = after_key + 1;
+          skip_ws(value_pos);
+          if (value_pos < json.size()) {
+            size_t value_end = value_pos;
+            char v = json[value_pos];
+            if (v == '"') {
+              auto val = parse_json_string_token(json, value_end);
+              if (!val) return std::nullopt;
+            } else if (v == '{' || v == '[') {
+              const char open = v, close = v == '{' ? '}' : ']';
+              int depth = 0;
+              bool in_str = false, esc = false;
+              for (; value_end < json.size(); ++value_end) {
+                char a = json[value_end];
+                if (in_str) {
+                  if (esc) esc = false;
+                  else if (a == '\\') esc = true;
+                  else if (a == '"') in_str = false;
+                  continue;
+                }
+                if (a == '"') in_str = true;
+                else if (a == open) ++depth;
+                else if (a == close) {
+                  --depth;
+                  if (depth == 0) { ++value_end; break; }
+                }
+              }
+              if (depth != 0) return std::nullopt;
+            } else {
+              while (value_end < json.size() && json[value_end] != ',' && json[value_end] != '}' &&
+                     json[value_end] != ']' && !std::isspace(static_cast<unsigned char>(json[value_end])))
+                ++value_end;
+            }
+            out.append(json, key_start, value_pos - key_start);
+            out.append(sentinel);
+            pos = value_end;
+            continue;
+          }
+        }
+        out.append(json, key_start, pos - key_start);
+        continue;
+      }
+      out.push_back(c);
+      ++pos;
+    }
+    return out;
+  }
+
   static std::string apply_redactions(const std::string &json, std::vector<CustodyRedaction> redactions) {
     std::sort(redactions.begin(), redactions.end(),
               [](const CustodyRedaction &a, const CustodyRedaction &b) { return a.absolute_offset > b.absolute_offset; });
@@ -4619,6 +4727,48 @@ private:
       }
     }
     return digest.finish_hex();
+  }
+
+  // Post-copy safety net: any credential-class key mapping to a non-sentinel
+  // string value in a workspace scene collection means redaction missed.
+  static bool workspace_has_unredacted_credential(const std::filesystem::path &workspace) {
+    std::error_code ec;
+    const std::filesystem::path scenes = workspace / "basic" / "scenes";
+    for (std::filesystem::directory_iterator it(scenes, ec), end; it != end; ++it) {
+      if (!it->is_regular_file() || it->path().extension() != ".json") continue;
+      std::string body;
+      try {
+        body = read_text_file(it->path());
+      } catch (...) {
+        continue;
+      }
+      size_t pos = 0;
+      while (pos < body.size()) {
+        if (body[pos] != '"') {
+          ++pos;
+          continue;
+        }
+        size_t key_start = pos;
+        auto key = parse_json_string_token(body, pos);
+        if (!key) break;
+        if (credential_settings_keys().count(*key) == 0) continue;
+        size_t after = pos;
+        while (after < body.size() && std::isspace(static_cast<unsigned char>(body[after]))) ++after;
+        if (after >= body.size() || body[after] != ':') continue;
+        ++after;
+        while (after < body.size() && std::isspace(static_cast<unsigned char>(body[after]))) ++after;
+        if (after < body.size() && body[after] == '"') {
+          size_t vstart = after;
+          auto val = parse_json_string_token(body, after);
+          if (val && body.compare(vstart, std::string(kRedactionSentinel).size() + 2,
+                                  std::string("\"") + kRedactionSentinel + "\"") != 0) {
+            return true;
+          }
+        }
+        (void)key_start;
+      }
+    }
+    return false;
   }
 
   static std::string format_marker_value(double value) {
@@ -4688,7 +4838,7 @@ private:
         degraded.push_back(report_item(
             source_id, "source", entry.label, "degraded", "settings_migration_required", entry.module, "",
             {"plugin_settings_version " + format_marker_value(marker ? *marker : 0) +
-             " exceeds the supported settings schema v1; update the plugin mapping before import."}));
+             " differs from the supported settings schema v1; update the plugin mapping before import."}));
       } else if (user_plugin_types_ && user_plugin_types_->sources.count(entry.module) > 0) {
         // NIF-V1: the type is registered by a manifest-LOADED user plugin —
         // mapped, never a placeholder. Scaffold lane never reaches here
