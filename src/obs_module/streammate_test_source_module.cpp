@@ -89,6 +89,11 @@ void source_update(void *data, obs_data_t *settings) {
   apply_settings(static_cast<TestSource *>(data), settings);
 }
 
+// NIF-V1: auto-emit one deterministic frame per compositor tick so a packaged
+// host can observe the pattern via source.captureFrame without calling the
+// emit_test_frame proc (which remains for the smoke's settings echo).
+void source_tick(void *data, float) { emit_frame(static_cast<TestSource *>(data)); }
+
 struct obs_source_info make_source_info() {
   struct obs_source_info info;
   std::memset(&info, 0, sizeof(info));
@@ -99,6 +104,7 @@ struct obs_source_info make_source_info() {
   info.create = source_create;
   info.destroy = source_destroy;
   info.update = source_update;
+  info.video_tick = source_tick;
   return info;
 }
 

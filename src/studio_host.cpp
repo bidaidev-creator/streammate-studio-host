@@ -576,13 +576,28 @@ Options parse_args(int argc, char **argv) {
   return options;
 }
 
+// NIF-V1: source/filter type ids registered by manifest-LOADED user modules,
+// keyed to the owning module label. Boot-frozen alongside the plugins.report
+// payload; empty in the scaffold lane (nothing loads there) so every
+// consumer's plugin path is inert without libobs.
+struct UserPluginTypeMaps {
+  std::map<std::string, std::string> sources; // type id -> module label
+  std::map<std::string, std::string> filters; // type id -> module label
+};
+
+// Defined after Sha256Stream below; declared here for RendererState's
+// source.captureFrame frame-byte digest.
+std::string sha256_hex_of_bytes(const uint8_t *data, size_t size);
+
 // NIF-H2: boot-frozen user-plugin load report (defined with the user-plugin
 // machinery below; the libobs lane performs the real per-module loading).
 // bundle_plugins_dir feeds the duplicate_of_bundled collision set (empty in
 // the scaffold lane / non-packaged binaries).
+// NIF-V1: out_types (optional) receives the loaded-module type maps.
 std::string build_user_plugins_boot_report_json(
     const std::optional<user_plugins::Manifest> &manifest,
-    const std::filesystem::path &bundle_plugins_dir);
+    const std::filesystem::path &bundle_plugins_dir,
+    UserPluginTypeMaps *out_types = nullptr);
 
 class EngineLifecycle {
 public:
@@ -603,7 +618,7 @@ public:
     // before obs_post_load_modules(), so everything exists ahead of any
     // collection instantiation and post-load runs exactly once.
     user_plugins_report_json_ =
-        build_user_plugins_boot_report_json(user_plugins_manifest, bundle_plugins_dir());
+        build_user_plugins_boot_report_json(user_plugins_manifest, bundle_plugins_dir(), &user_plugin_types_);
     obs_post_load_modules();
 #else
     // Scaffold lane: plan facts only, labeled mode:"scaffold" (never a
@@ -616,6 +631,9 @@ public:
 
   // Boot-frozen: byte-identical for every plugins.report request this boot.
   const std::string &user_plugins_report_json() const { return user_plugins_report_json_; }
+
+  // NIF-V1: type ids registered by loaded user modules (empty in scaffold).
+  const UserPluginTypeMaps &user_plugin_types() const { return user_plugin_types_; }
 
   void shutdown() {
     if (!started_) {
@@ -702,6 +720,7 @@ private:
 
   bool started_ = false;
   std::string user_plugins_report_json_;
+  UserPluginTypeMaps user_plugin_types_;
 };
 
 class StateFile {
@@ -1264,6 +1283,15 @@ struct SceneModel {
   Rgba background{32, 48, 64, 255};
 };
 
+enum class FilterSettingKind { Number, Bool, String };
+
+struct FilterSettingValue {
+  FilterSettingKind kind = FilterSettingKind::String;
+  double number_value = 0.0;
+  bool bool_value = false;
+  std::string string_value;
+};
+
 struct SourceModel {
   std::string id;
   std::string scene_id;
@@ -1280,15 +1308,11 @@ struct SourceModel {
   double volume_db = 0.0;
   std::string media_action = "stop";
   int browser_refresh_count = 0;
-};
-
-enum class FilterSettingKind { Number, Bool, String };
-
-struct FilterSettingValue {
-  FilterSettingKind kind = FilterSettingKind::String;
-  double number_value = 0.0;
-  bool bool_value = false;
-  std::string string_value;
+  // NIF-V1: user-plugin source kinds (never placeholder-substituted).
+  bool is_plugin_kind = false;
+  std::map<std::string, FilterSettingValue> plugin_settings;
+  std::string plugin_filter_kind;
+  std::string plugin_filter_id;
 };
 
 struct FilterModel {
@@ -1301,6 +1325,9 @@ struct FilterModel {
 
 class RendererState {
 public:
+  // NIF-V1: boot-frozen loaded-plugin type maps (owned by EngineLifecycle).
+  void set_user_plugin_types(const UserPluginTypeMaps *types) { user_plugin_types_ = types; }
+
   ~RendererState() {
 #if STREAMMATE_HAS_LIBOBS
     release_obs_mirrors();
@@ -1347,7 +1374,37 @@ public:
     if (source_id.empty()) return rpc_error_result(-32602, "sourceId is required");
     std::string kind = extract_json_string(request, "kind");
     if (kind.empty()) kind = "browser";
-    if (kind != "browser") return rpc_error_result(-32602, "only browser sources are supported in phase A");
+    std::map<std::string, FilterSettingValue> plugin_settings;
+    std::string plugin_filter_kind;
+    std::string plugin_filter_id;
+    if (kind != "browser") {
+      // NIF-V1: user-plugin source kinds. The fail-closed settings gate runs
+      // FIRST so a refused key is named identically in both build lanes.
+      if (request.find("\"settings\"") != std::string::npos) {
+        auto parsed = parse_plugin_source_settings(request);
+        if (!parsed.ok) return rpc_error_result(-32602, parsed.error);
+        plugin_settings = std::move(parsed.settings);
+      }
+#if STREAMMATE_HAS_LIBOBS
+      if (!user_plugin_types_ || user_plugin_types_->sources.find(kind) == user_plugin_types_->sources.end()) {
+        return rpc_error_result(-32602, "kind is not a loaded user-plugin source type");
+      }
+      plugin_filter_kind = extract_json_string(request, "pluginFilterKind");
+      plugin_filter_id = extract_json_string(request, "filterId");
+      if (!plugin_filter_kind.empty()) {
+        if (user_plugin_types_->filters.find(plugin_filter_kind) == user_plugin_types_->filters.end()) {
+          return rpc_error_result(-32602, "pluginFilterKind is not a loaded user-plugin filter type");
+        }
+        if (plugin_filter_id.empty()) return rpc_error_result(-32602, "filterId is required with pluginFilterKind");
+      } else if (!plugin_filter_id.empty()) {
+        return rpc_error_result(-32602, "filterId requires pluginFilterKind");
+      }
+#else
+      // Scaffold lane: a plugin instance is never fabricated (honest refusal;
+      // the packaged HAS_LIBOBS lane proves the real path).
+      return rpc_error_result(-32603, "plugin source kinds require libobs");
+#endif
+    }
     SourceModel source;
     const SceneModel &scene = scenes_.at(scene_id);
     source.id = source_id;
@@ -1361,12 +1418,39 @@ public:
     source.opacity = std::clamp(extract_json_double(request, "opacity").value_or(1.0), 0.0, 1.0);
     source.muted = extract_json_bool(request, "muted").value_or(false);
     source.position = next_position(scene_id);
+    if (kind != "browser") {
+      source.is_plugin_kind = true;
+      source.plugin_settings = std::move(plugin_settings);
+      source.plugin_filter_kind = plugin_filter_kind;
+      source.plugin_filter_id = plugin_filter_id;
+    }
     sources_[source_id] = source;
-    filters_[source_id] = {default_filter()};
+    if (source.is_plugin_kind) {
+      // Plugin sources carry ONLY their explicitly-requested plugin filter;
+      // the scaffold default color-correction filter is a browser-path fact.
+      filters_[source_id] = {};
+      if (!source.plugin_filter_id.empty()) {
+        FilterModel plugin_filter;
+        plugin_filter.id = source.plugin_filter_id;
+        plugin_filter.kind = source.plugin_filter_kind;
+        plugin_filter.label = source.plugin_filter_id;
+        filters_[source_id].push_back(plugin_filter);
+      }
+    } else {
+      filters_[source_id] = {default_filter()};
+    }
 #if STREAMMATE_HAS_LIBOBS
-    mirror_source_create(sources_[source_id]);
+    if (source.is_plugin_kind) {
+      if (!mirror_plugin_source_create(sources_[source_id])) {
+        sources_.erase(source_id);
+        filters_.erase(source_id);
+        return rpc_error_result(-32603, "plugin source instantiation failed (no placeholder substituted)");
+      }
+    } else {
+      mirror_source_create(sources_[source_id]);
+    }
 #endif
-    return source_result(source, true);
+    return source_result(sources_[source_id], true);
   }
 
   std::string update_source(const std::string &request) {
@@ -1540,6 +1624,46 @@ public:
            ",\"pngBase64\":\"" + base64(png.data(), png.size()) + "\"}";
   }
 
+  // NIF-V1: real async-frame facts for one source. libobs lane only — the
+  // scaffold lane refuses honestly rather than fabricating pixels. The digest
+  // covers the first video plane (bounded), enough for deterministic
+  // pattern-source evidence without shipping frame bytes over the wire.
+  std::string capture_source_frame(const std::string &request) {
+    std::string source_id = extract_json_string(request, "sourceId");
+    auto it = sources_.find(source_id);
+    if (source_id.empty() || it == sources_.end()) return rpc_error_result(-32602, "source not found");
+#if STREAMMATE_HAS_LIBOBS
+    auto obs_it = obs_sources_.find(source_id);
+    if (obs_it == obs_sources_.end()) return rpc_error_result(-32603, "libobs source unavailable");
+    obs_source_frame *frame = nullptr;
+    for (int attempt = 0; attempt < 40 && !frame; ++attempt) {
+      frame = obs_source_get_frame(obs_it->second);
+      if (!frame) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    }
+    if (!frame) return rpc_error_result(-32603, "no async frame available from source");
+    const uint32_t width = frame->width;
+    const uint32_t height = frame->height;
+    std::string digest;
+    bool non_zero = false;
+    if (frame->data[0] && frame->linesize[0] > 0 && height > 0) {
+      size_t plane_bytes = static_cast<size_t>(frame->linesize[0]) * height;
+      constexpr size_t kMaxFrameHashBytes = 16u * 1024u * 1024u;
+      if (plane_bytes > kMaxFrameHashBytes) plane_bytes = kMaxFrameHashBytes;
+      digest = sha256_hex_of_bytes(frame->data[0], plane_bytes);
+      for (size_t i = 0; i < plane_bytes && !non_zero; ++i) non_zero = frame->data[0][i] != 0;
+    }
+    const char *format = frame->format == VIDEO_FORMAT_BGRA ? "bgra" : "other";
+    obs_source_release_frame(obs_it->second, frame);
+    if (digest.empty()) return rpc_error_result(-32603, "async frame carried no readable plane");
+    return "{\"ok\":true,\"sourceId\":\"" + json_escape(source_id) +
+           "\",\"renderer\":\"libobs-async-frame\",\"width\":" + std::to_string(width) +
+           ",\"height\":" + std::to_string(height) + ",\"format\":\"" + format +
+           "\",\"frameSha256\":\"" + digest + "\",\"nonZeroBytes\":" + (non_zero ? "true" : "false") + "}";
+#else
+    return rpc_error_result(-32603, "source frame capture requires libobs");
+#endif
+  }
+
   // scene.list intentionally answers from the authoritative in-memory model
   // (scaffold scenes_/sources_/filters_), matching the filter.list precedent
   // above; no libobs reads. Additive sources[] deliberately omits url/opacity
@@ -1701,72 +1825,97 @@ private:
            std::regex_search(value, query_key);
   }
 
-  ParsedSettings parse_filter_settings(const std::string &request) const {
+  // NIF-V1: fail-closed allowlist for user-plugin SOURCE settings. Wave 1
+  // carries exactly the in-tree test-source contract ("color"); NIF-M2's
+  // settings-custody model owns the general story. Unknown keys are refused
+  // by name so both build lanes give the same first answer.
+  static const std::set<std::string> &known_plugin_source_setting_keys() {
+    static const std::set<std::string> keys = {"color"};
+    return keys;
+  }
+
+  ParsedSettings parse_plugin_source_settings(const std::string &request) const {
     auto body = extract_json_object_body(request, "settings");
-    if (!body) return {false, "settings must be an object of known filter-settings keys", {}};
+    if (!body) return {false, "settings must be an object of known plugin-settings keys", {}};
+    // uint32 ceiling: the test-source "color" setting is a full BGRA word.
+    return parse_settings_body(*body, known_plugin_source_setting_keys(), "plugin-settings", 4294967295.0);
+  }
+
+  // Shared flat-settings scanner for filter.setSettings and NIF-V1 plugin
+  // source settings: identical grammar/limits, family-specific key allowlist
+  // and error strings (behavior for the filter family is byte-identical to
+  // the pre-NIF-V1 inline version).
+  ParsedSettings parse_settings_body(const std::string &body, const std::set<std::string> &known_keys,
+                                     const std::string &family, double max_abs_number = 1000000.0) const {
     ParsedSettings parsed;
     size_t pos = 0;
     bool first = true;
     while (true) {
-      skip_json_whitespace(*body, pos);
-      if (pos >= body->size()) break;
+      skip_json_whitespace(body, pos);
+      if (pos >= body.size()) break;
       if (!first) {
-        if ((*body)[pos] != ',') return {false, "settings entries must be separated by commas", {}};
+        if (body[pos] != ',') return {false, "settings entries must be separated by commas", {}};
         ++pos;
-        skip_json_whitespace(*body, pos);
-        if (pos >= body->size() || (*body)[pos] == ',') {
+        skip_json_whitespace(body, pos);
+        if (pos >= body.size() || body[pos] == ',') {
           return {false, "settings entries must be separated by commas", {}};
         }
-      } else if ((*body)[pos] == ',') {
+      } else if (body[pos] == ',') {
         return {false, "settings entries must be separated by commas", {}};
       }
-      auto key = parse_json_string_token(*body, pos);
+      auto key = parse_json_string_token(body, pos);
       if (!key) return {false, "settings must contain string keys", {}};
-      if (known_filter_setting_keys().find(*key) == known_filter_setting_keys().end()) {
-        return {false, "unknown filter-settings key (refused fail-closed)", {}};
+      if (known_keys.find(*key) == known_keys.end()) {
+        return {false, "unknown " + family + " key (refused fail-closed)", {}};
       }
-      skip_json_whitespace(*body, pos);
-      if (pos >= body->size() || (*body)[pos] != ':') return {false, "settings must contain key/value pairs", {}};
+      skip_json_whitespace(body, pos);
+      if (pos >= body.size() || body[pos] != ':') return {false, "settings must contain key/value pairs", {}};
       ++pos;
-      skip_json_whitespace(*body, pos);
-      if (pos >= body->size()) return {false, "settings value is required", {}};
+      skip_json_whitespace(body, pos);
+      if (pos >= body.size()) return {false, "settings value is required", {}};
 
       FilterSettingValue value;
-      if ((*body)[pos] == '"') {
-        auto string_value = parse_json_string_token(*body, pos);
+      if (body[pos] == '"') {
+        auto string_value = parse_json_string_token(body, pos);
         if (!string_value || string_value->empty() || string_value->size() > 120 || settings_string_refused(*string_value)) {
-          return {false, "filter-settings string value refused", {}};
+          return {false, family + " string value refused", {}};
         }
         value.kind = FilterSettingKind::String;
         value.string_value = *string_value;
-      } else if (body->compare(pos, 4, "true") == 0) {
+      } else if (body.compare(pos, 4, "true") == 0) {
         value.kind = FilterSettingKind::Bool;
         value.bool_value = true;
         pos += 4;
-      } else if (body->compare(pos, 5, "false") == 0) {
+      } else if (body.compare(pos, 5, "false") == 0) {
         value.kind = FilterSettingKind::Bool;
         value.bool_value = false;
         pos += 5;
       } else {
-        size_t end = body->find_first_not_of("-0123456789.eE+", pos);
+        size_t end = body.find_first_not_of("-0123456789.eE+", pos);
         try {
           value.kind = FilterSettingKind::Number;
-          value.number_value = std::stod(body->substr(pos, end == std::string::npos ? std::string::npos : end - pos));
-          if (!std::isfinite(value.number_value)) return {false, "filter-settings number must be finite", {}};
-          if (std::fabs(value.number_value) > 1000000.0) return {false, "filter-settings number is out of range", {}};
-          pos = end == std::string::npos ? body->size() : end;
+          value.number_value = std::stod(body.substr(pos, end == std::string::npos ? std::string::npos : end - pos));
+          if (!std::isfinite(value.number_value)) return {false, family + " number must be finite", {}};
+          if (std::fabs(value.number_value) > max_abs_number) return {false, family + " number is out of range", {}};
+          pos = end == std::string::npos ? body.size() : end;
         } catch (...) {
-          return {false, "filter-settings values must be primitive", {}};
+          return {false, family + " values must be primitive", {}};
         }
       }
       parsed.settings[*key] = value;
       first = false;
-      skip_json_whitespace(*body, pos);
-      if (pos < body->size() && (*body)[pos] != ',') return {false, "settings entries must be separated by commas", {}};
+      skip_json_whitespace(body, pos);
+      if (pos < body.size() && body[pos] != ',') return {false, "settings entries must be separated by commas", {}};
     }
-    if (parsed.settings.empty()) return {false, "settings must set at least one known filter-settings key", {}};
+    if (parsed.settings.empty()) return {false, "settings must set at least one known " + family + " key", {}};
     parsed.ok = true;
     return parsed;
+  }
+
+  ParsedSettings parse_filter_settings(const std::string &request) const {
+    auto body = extract_json_object_body(request, "settings");
+    if (!body) return {false, "settings must be an object of known filter-settings keys", {}};
+    return parse_settings_body(*body, known_filter_setting_keys(), "filter-settings");
   }
 
   static std::string json_number(double value) {
@@ -1932,6 +2081,59 @@ private:
     }
   }
 
+  // NIF-V1: instantiate a LOADED user-plugin source type. No fallback source
+  // is ever substituted — failure surfaces as an RPC error (the "without
+  // placeholder" invariant). Settings pass through the fail-closed allowlist
+  // parsed at the verb boundary.
+  bool mirror_plugin_source_create(const SourceModel &model) {
+    auto scene = obs_scenes_.find(model.scene_id);
+    if (scene == obs_scenes_.end()) return false;
+    release_obs_source(model.id);
+
+    obs_data_t *settings = obs_data_create();
+    if (!settings) return false;
+    for (const auto &entry : model.plugin_settings) {
+      switch (entry.second.kind) {
+      case FilterSettingKind::Number: {
+        const double value = entry.second.number_value;
+        if (value == static_cast<double>(static_cast<long long>(value))) {
+          obs_data_set_int(settings, entry.first.c_str(), static_cast<long long>(value));
+        } else {
+          obs_data_set_double(settings, entry.first.c_str(), value);
+        }
+        break;
+      }
+      case FilterSettingKind::Bool:
+        obs_data_set_bool(settings, entry.first.c_str(), entry.second.bool_value);
+        break;
+      case FilterSettingKind::String:
+        obs_data_set_string(settings, entry.first.c_str(), entry.second.string_value.c_str());
+        break;
+      }
+    }
+    obs_source_t *source = obs_source_create(model.kind.c_str(), model.id.c_str(), settings, nullptr);
+    obs_data_release(settings);
+    if (!source) return false;
+
+    obs_sources_[model.id] = source;
+    obs_sceneitem_t *item = obs_scene_add(scene->second, source);
+    if (item) obs_scene_items_[scene_item_key(model.scene_id, model.id)] = item;
+
+    if (!model.plugin_filter_kind.empty() && !model.plugin_filter_id.empty()) {
+      obs_source_t *filter =
+          obs_source_create(model.plugin_filter_kind.c_str(), model.plugin_filter_id.c_str(), nullptr, nullptr);
+      if (!filter) {
+        release_obs_source(model.id);
+        obs_sources_.erase(model.id);
+        obs_scene_items_.erase(scene_item_key(model.scene_id, model.id));
+        return false;
+      }
+      obs_source_filter_add(source, filter);
+      obs_source_release(filter);
+    }
+    return true;
+  }
+
   bool mirror_mute_source(const std::string &source_id, bool muted) {
     auto source = obs_sources_.find(source_id);
     if (source == obs_sources_.end()) return false;
@@ -2039,6 +2241,7 @@ private:
   std::map<std::string, obs_source_t *> obs_sources_;
   std::map<std::string, obs_sceneitem_t *> obs_scene_items_;
 #endif
+  const UserPluginTypeMaps *user_plugin_types_ = nullptr;
 };
 
 std::string getenv_string(const char *name) {
@@ -2414,6 +2617,14 @@ private:
   std::size_t buffered_ = 0;
   uint64_t total_ = 0;
 };
+
+// NIF-V1: one-shot digest over an in-memory byte range (frame planes).
+std::string sha256_hex_of_bytes(const uint8_t *data, size_t size) {
+  Sha256Stream stream;
+  if (data && size > 0) stream.update(data, size);
+  return stream.finish_hex();
+}
+
 
 // Mach-O magic / cputype constants: taken from <mach-o/loader.h> +
 // <mach-o/fat.h> on Apple, mirrored literally elsewhere so the byte parser
@@ -3138,15 +3349,26 @@ void load_user_plugin_candidates(UserPluginLoadPlan &plan,
 // load and post-load). Scaffold lane: plan facts only, honestly labeled.
 std::string build_user_plugins_boot_report_json(
     const std::optional<user_plugins::Manifest> &manifest,
-    const std::filesystem::path &bundle_plugins_dir) {
+    const std::filesystem::path &bundle_plugins_dir,
+    UserPluginTypeMaps *out_types) {
   if (!manifest) {
     return empty_user_plugins_report_json();
   }
   UserPluginLoadPlan plan = build_user_plugin_load_plan(*manifest);
 #if STREAMMATE_HAS_LIBOBS
   load_user_plugin_candidates(plan, bundle_plugins_dir);
+  if (out_types) {
+    // kRegisteredTypeKinds order: sources=0, filters=1. Only LOADED modules
+    // contribute (a failed init's partial registrations are never credited).
+    for (const auto &record : plan.inventory.modules) {
+      if (record.lifecycle != "loaded" || !record.has_registered_types) continue;
+      for (const auto &type_id : record.registered_types[0]) out_types->sources[type_id] = record.label;
+      for (const auto &type_id : record.registered_types[1]) out_types->filters[type_id] = record.label;
+    }
+  }
 #else
   (void)bundle_plugins_dir;
+  (void)out_types; // scaffold: nothing loads, the maps stay empty (honest).
   for (std::size_t index : plan.candidates) {
     plan.inventory.modules[index].reason_detail = "scaffold-not-loaded";
   }
@@ -3236,6 +3458,9 @@ std::string tcc_exercise_summary_json(const PromptSourceSummary &summary, const 
 
 class ObsImporter {
 public:
+  // NIF-V1: boot-frozen loaded-plugin type maps (owned by EngineLifecycle).
+  void set_user_plugin_types(const UserPluginTypeMaps *types) { user_plugin_types_ = types; }
+
   ~ObsImporter() {
 #if STREAMMATE_HAS_LIBOBS
     release_prompt_sources();
@@ -3353,6 +3578,7 @@ public:
   }
 
 private:
+  const UserPluginTypeMaps *user_plugin_types_ = nullptr;
   std::string error(int code, const std::string &message) const { return "__error__:" + std::to_string(code) + ":" + message; }
 
 #if STREAMMATE_HAS_LIBOBS
@@ -3566,6 +3792,15 @@ private:
       } else if (entry.module == "color_source" || entry.module == "browser_source" || entry.module == "text_ft2_source" ||
                  entry.module == "text_gdiplus" || entry.module == "image_source" || entry.module == "ffmpeg_source") {
         mapped.push_back(report_item(source_id, "source", entry.label, "mapped", "mapped_native", entry.module));
+      } else if (user_plugin_types_ && user_plugin_types_->sources.count(entry.module) > 0) {
+        // NIF-V1: the type is registered by a manifest-LOADED user plugin —
+        // mapped, never a placeholder. Scaffold lane never reaches here
+        // (nothing loads), preserving import honesty per lane.
+        mapped.push_back(report_item(source_id, "source", entry.label, "mapped", "mapped_plugin", entry.module, "",
+                                     {"Backed by loaded user plugin " + user_plugin_types_->sources.at(entry.module) + "."}));
+      } else if (user_plugin_types_ && user_plugin_types_->filters.count(entry.module) > 0) {
+        mapped.push_back(report_item("filter:" + entry.label, "filter", entry.label, "mapped", "mapped_plugin", entry.module, "",
+                                     {"Backed by loaded user plugin " + user_plugin_types_->filters.at(entry.module) + "."}));
       } else if (entry.module == "av_capture_input") {
         if (entry.label.find("Unplugged") != std::string::npos) {
           degraded.push_back(report_item(source_id, "source", entry.label, "degraded", "missing_device", entry.module, "camera",
@@ -4681,6 +4916,11 @@ class ControlServer {
 public:
   ControlServer(Options options, EngineLifecycle &engine, StateFile &state) : options_(std::move(options)), engine_(engine), state_(state) {
     output_.set_launch_allow_live_egress(options_.allow_live_egress);
+    // NIF-V1: renderer + importer consult the boot-frozen loaded-plugin type
+    // maps (empty in scaffold) for plugin-kind create and mapped_plugin
+    // import classification.
+    renderer_.set_user_plugin_types(&engine_.user_plugin_types());
+    importer_.set_user_plugin_types(&engine_.user_plugin_types());
     build_command_table();
   }
 
@@ -4920,6 +5160,9 @@ private:
     });
     add("scene.captureFrame", [this](int fd, const std::string &id, const std::string &payload) {
       send_renderer_result(fd, id, renderer_.capture_frame(payload));
+    });
+    add("source.captureFrame", [this](int fd, const std::string &id, const std::string &payload) {
+      send_renderer_result(fd, id, renderer_.capture_source_frame(payload));
     });
     add("import.scan", [this](int fd, const std::string &id, const std::string &payload) {
       send_renderer_result(fd, id, importer_.scan(payload));
