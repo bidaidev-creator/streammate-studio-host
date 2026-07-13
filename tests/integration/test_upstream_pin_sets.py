@@ -61,20 +61,41 @@ EXEMPT_IDS = {
 
 VERSIONED_ID = re.compile(r"^(?P<base>.+)_v(?P<version>[0-9]+)$")
 
+# Registration-site evidence: an `.id = "x"` (or `info.id = "x"` / `"id": "x"`)
+# assignment — the strong tier. Plain string-literal presence (comments,
+# UI strings, settings keys) is NOT accepted as registration evidence (codex
+# NIF-CM finding 5); ids registered through constant indirection must be
+# listed in STRING_LITERAL_EVIDENCE_IDS with their reviewed ground truth.
+REGISTRATION_SITE = re.compile(r"\.id\s*=\s*\"(?P<id>[^\"]+)\"")
+VERSION_SITE = re.compile(r"\.version\s*=\s*(?P<version>[0-9]+)")
 
-def id_exists_in_tree(pinned_id: str, haystack: str) -> bool:
-    """True when the id is registered in the pinned tree.
+STRING_LITERAL_EVIDENCE_IDS = {
+    # plugins/aja/aja-source.cpp:1070 assigns aja_source_info.id from
+    # kUIPropCaptureModule.id, whose literal lives in aja-ui-props.hpp:15.
+    "aja_source",
+}
 
-    Encodes the obs versioned-id convention: a struct with .id = "<base>" and
-    .version = N registers the effective lookup id "<base>_vN", which never
-    appears as a string literal. For such ids the BASE id must exist as a
-    literal (and the _v suffix is accepted as the upstream convention).
-    """
-    if f'"{pinned_id}"' in haystack:
+
+def build_registration_index(files: list[tuple[str, str]]) -> tuple[set[str], set[str]]:
+    """Return (registered ids, registered versioned ids `<base>_vN`)."""
+    registered: set[str] = set()
+    versioned: set[str] = set()
+    for _path, text in files:
+        ids_in_file = REGISTRATION_SITE.findall(text)
+        versions_in_file = VERSION_SITE.findall(text)
+        for found_id in ids_in_file:
+            registered.add(found_id)
+            for version in versions_in_file:
+                versioned.add(f"{found_id}_v{version}")
+    return registered, versioned
+
+
+def id_exists_in_tree(pinned_id: str, registered: set[str], versioned: set[str], haystack: str) -> bool:
+    """Registration-scoped evidence with a reviewed indirection tier."""
+    if pinned_id in registered or pinned_id in versioned:
         return True
-    versioned = VERSIONED_ID.match(pinned_id)
-    if versioned is not None:
-        return f'"{versioned.group("base")}"' in haystack
+    if pinned_id in STRING_LITERAL_EVIDENCE_IDS:
+        return f'"{pinned_id}"' in haystack
     return False
 
 
@@ -92,6 +113,21 @@ def extract_set(function_name: str) -> list[str]:
 
 def obs_tree_present() -> bool:
     return (OBS_TREE / "libobs").is_dir() and (OBS_TREE / "plugins").is_dir()
+
+
+def obs_tree_source_files() -> list[tuple[str, str]]:
+    files: list[tuple[str, str]] = []
+    for sub in ("plugins", "libobs", "UI"):
+        root = OBS_TREE / sub
+        if not root.is_dir():
+            continue
+        for suffix in ("*.c", "*.cpp", "*.h", "*.hpp", "*.m", "*.mm"):
+            for path in root.rglob(suffix):
+                try:
+                    files.append((str(path), path.read_text(encoding="utf-8", errors="replace")))
+                except OSError:
+                    continue
+    return files
 
 
 def obs_tree_id_index() -> str:
@@ -126,6 +162,7 @@ class UpstreamPinSetDerivationTest(unittest.TestCase):
                 "STREAMMATE_REQUIRE_OBS_TREE=1"
             )
         cls.haystack = obs_tree_id_index()
+        cls.registered, cls.versioned = build_registration_index(obs_tree_source_files())
 
     def test_pin_matches_submodule(self) -> None:
         pin = dict(
@@ -147,7 +184,7 @@ class UpstreamPinSetDerivationTest(unittest.TestCase):
             for pinned_id in extract_set(function_name):
                 if pinned_id in EXEMPT_IDS:
                     continue
-                if not id_exists_in_tree(pinned_id, self.haystack):
+                if not id_exists_in_tree(pinned_id, self.registered, self.versioned, self.haystack):
                     missing.append(f"{function_name}: {pinned_id}")
         self.assertEqual(
             missing,
@@ -158,6 +195,7 @@ class UpstreamPinSetDerivationTest(unittest.TestCase):
 
     def test_exempt_ids_stay_minimal_and_reviewed(self) -> None:
         self.assertEqual(EXEMPT_IDS, {"group", "browser_source"})
+        self.assertEqual(STRING_LITERAL_EVIDENCE_IDS, {"aja_source"})
 
     def test_m3_handoff_omissions_are_pinned(self) -> None:
         device_backed = set(extract_set("device_backed_source_ids"))
@@ -171,6 +209,35 @@ class UpstreamPinSetDerivationTest(unittest.TestCase):
             "pipewire-screen-capture-source",
         ):
             self.assertIn(linux_id, other_platform, f"{linux_id} missing from other_platform_source_ids")
+
+
+class RegistrationEvidencePredicateTest(unittest.TestCase):
+    """Synthetic-haystack proof that only registration-site evidence counts."""
+
+    def test_comment_only_id_is_refused(self) -> None:
+        files = [("fake.c", '/* legacy id: "ghost_source" */ const char *msg = "ghost_source";')]
+        registered, versioned = build_registration_index(files)
+        self.assertFalse(id_exists_in_tree("ghost_source", registered, versioned, files[0][1]))
+
+    def test_registration_site_id_is_accepted(self) -> None:
+        files = [("fake.c", 'struct obs_source_info x = { .id = "real_source", .version = 3 };')]
+        registered, versioned = build_registration_index(files)
+        self.assertTrue(id_exists_in_tree("real_source", registered, versioned, files[0][1]))
+
+    def test_versioned_id_requires_same_file_version_marker(self) -> None:
+        with_version = [("a.c", '.id = "real_source", .version = 3,')]
+        registered, versioned = build_registration_index(with_version)
+        self.assertTrue(id_exists_in_tree("real_source_v3", registered, versioned, with_version[0][1]))
+        without_version = [("b.c", '.id = "real_source",')]
+        registered, versioned = build_registration_index(without_version)
+        self.assertFalse(id_exists_in_tree("real_source_v3", registered, versioned, without_version[0][1]))
+        self.assertFalse(id_exists_in_tree("real_source_v999", registered, versioned, with_version[0][1]))
+
+    def test_string_literal_tier_applies_only_to_reviewed_ids(self) -> None:
+        files = [("c.c", 'const char *ui = "aja_source"; const char *other = "mystery_source";')]
+        registered, versioned = build_registration_index(files)
+        self.assertTrue(id_exists_in_tree("aja_source", registered, versioned, files[0][1]))
+        self.assertFalse(id_exists_in_tree("mystery_source", registered, versioned, files[0][1]))
 
 
 if __name__ == "__main__":
