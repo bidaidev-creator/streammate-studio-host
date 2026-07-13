@@ -227,6 +227,7 @@ jobs:
           STREAMMATE_TEST_FILTER_PLUGIN="$PWD/build/host/streammate-test-filter.plugin" \
           STREAMMATE_TEST_NOOP_PLUGIN="$PWD/build/host/streammate-test-noop.plugin" \
           STREAMMATE_DEP_MISSING_PLUGIN="$depmiss" \
+          STREAMMATE_NOEXPORTS_DYLIB="$PWD/dist/StreamMateStudioHost.app/Contents/Frameworks/libobs-opengl.dylib" \
           python3 tests/integration/test_user_plugin_loading.py \
             dist/StreamMateStudioHost.app/Contents/MacOS/studio-host
 

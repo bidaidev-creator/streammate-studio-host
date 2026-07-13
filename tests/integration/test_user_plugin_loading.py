@@ -135,10 +135,16 @@ class UserPluginLoadingPlanTest(unittest.TestCase):
         by_key = {(m["moduleRef"], m["rootRef"]): m for m in result["modules"]}
 
         alpha = by_key[("module:alpha", "root:0")]
-        self.assertEqual(alpha["lifecycle"], "loaded" if result["mode"] == "libobs" else "discovered")
         if result["mode"] == "scaffold":
+            self.assertEqual(alpha["lifecycle"], "discovered")
             self.assertIsNone(alpha["state"])
             self.assertEqual(alpha["reasonDetail"], "scaffold-not-loaded")
+            self.assertNotIn("registeredTypes", alpha)
+        else:
+            # alpha is the host EXECUTABLE staged as a bundle: the libobs lane
+            # ATTEMPTS it (it passed the static plan) and it must fail honestly
+            # as a load attempt, never silently vanish or claim types.
+            self.assertEqual(alpha["lifecycle"], "load_failed")
             self.assertNotIn("registeredTypes", alpha)
 
         beta = by_key[("module:beta", "root:0")]
@@ -308,10 +314,20 @@ class UserPluginLoadingLibobsTest(unittest.TestCase):
             self.root / "streammate-test-source.plugin" / "Contents" / "MacOS" / "streammate-test-source",
             mac_capture / "mac-capture",
         )
-        # Broken module: not a Mach-O at all.
+        # Broken module: a VALID host-arch Mach-O header (so the static plan
+        # admits it) followed by nothing loadable — the dlopen itself fails.
         broken = self.root / "broken.plugin" / "Contents" / "MacOS"
         broken.mkdir(parents=True)
-        (broken / "broken").write_bytes(b"\x00" * 64)
+        (broken / "broken").write_bytes(thin_macho64(HOST_CPU) + b"\x00" * 4096)
+
+        # Missing-exports: a real loadable dylib that is NOT an OBS module
+        # (supplied by CI; the packaged app's libobs-opengl.dylib).
+        noexports_dylib = os.environ.get("STREAMMATE_NOEXPORTS_DYLIB", "")
+        self.assertTrue(noexports_dylib and Path(noexports_dylib).is_file(),
+                        "STREAMMATE_NOEXPORTS_DYLIB must name a loadable dylib")
+        noexports = self.root / "noexports.plugin" / "Contents" / "MacOS"
+        noexports.mkdir(parents=True)
+        shutil.copy2(noexports_dylib, noexports / "noexports")
         # Wrong-arch candidate: never attempted.
         build_bundle(self.root, "otherarch", thin_macho64(OTHER_CPU))
 
@@ -349,6 +365,11 @@ class UserPluginLoadingLibobsTest(unittest.TestCase):
         broken = by_ref["module:broken"]
         self.assertEqual(broken["lifecycle"], "load_failed")
         self.assertEqual(broken["state"], "module_load_failed")
+
+        noexports = by_ref["module:noexports"]
+        self.assertEqual(noexports["lifecycle"], "load_failed")
+        self.assertEqual(noexports["state"], "module_load_failed")
+        self.assertEqual(noexports["reasonDetail"], "missing-exports")
 
         depmiss = by_ref["module:depmiss"]
         self.assertEqual(depmiss["lifecycle"], "load_failed")

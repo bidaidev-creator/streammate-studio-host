@@ -577,8 +577,11 @@ Options parse_args(int argc, char **argv) {
 
 // NIF-H2: boot-frozen user-plugin load report (defined with the user-plugin
 // machinery below; the libobs lane performs the real per-module loading).
+// bundle_plugins_dir feeds the duplicate_of_bundled collision set (empty in
+// the scaffold lane / non-packaged binaries).
 std::string build_user_plugins_boot_report_json(
-    const std::optional<user_plugins::Manifest> &manifest);
+    const std::optional<user_plugins::Manifest> &manifest,
+    const std::filesystem::path &bundle_plugins_dir);
 
 class EngineLifecycle {
 public:
@@ -598,12 +601,13 @@ public:
     // NIF-H2: user modules load PER-MODULE here — after the bundled modules,
     // before obs_post_load_modules(), so everything exists ahead of any
     // collection instantiation and post-load runs exactly once.
-    user_plugins_report_json_ = build_user_plugins_boot_report_json(user_plugins_manifest);
+    user_plugins_report_json_ =
+        build_user_plugins_boot_report_json(user_plugins_manifest, bundle_plugins_dir());
     obs_post_load_modules();
 #else
     // Scaffold lane: plan facts only, labeled mode:"scaffold" (never a
     // loading claim).
-    user_plugins_report_json_ = build_user_plugins_boot_report_json(user_plugins_manifest);
+    user_plugins_report_json_ = build_user_plugins_boot_report_json(user_plugins_manifest, {});
 #endif
     started_ = true;
     return true;
@@ -644,14 +648,24 @@ private:
 #endif
   }
 
-  static void add_bundle_module_path() {
+  // The packaged app's bundled-module directory (empty for raw builds) —
+  // also the duplicate_of_bundled collision inventory for user loading.
+  static std::filesystem::path bundle_plugins_dir() {
     auto executable = executable_path();
     if (!executable) {
-      return;
+      return {};
     }
     std::filesystem::path contents = executable->parent_path().parent_path();
     std::filesystem::path plugins = contents / "PlugIns" / "obs-plugins";
     if (!std::filesystem::is_directory(plugins)) {
+      return {};
+    }
+    return plugins;
+  }
+
+  static void add_bundle_module_path() {
+    std::filesystem::path plugins = bundle_plugins_dir();
+    if (plugins.empty()) {
       return;
     }
     std::string binary_pattern = (plugins / "%module%.plugin" / "Contents" / "MacOS").string();
@@ -2928,10 +2942,13 @@ std::array<std::set<std::string>, 6> snapshot_registered_types() {
   return out;
 }
 
-// Bundled-module stems ("mac-capture" from mac-capture.plugin etc.), collected
-// after obs_load_all_modules(): a user module colliding with one is refused
-// deterministically (duplicate_of_bundled) before any dlopen.
-std::set<std::string> bundled_module_stems() {
+// Bundled-module stems ("mac-capture" from mac-capture.plugin etc.): the
+// UNION of (a) modules libobs actually opened (obs_enum_modules) and (b) the
+// app bundle's Contents/PlugIns/obs-plugins directory listing — a bundled
+// module that failed to open/init is absent from (a) but must still shadow a
+// same-named user module (bundled wins even when broken). A user module
+// colliding with either is refused (duplicate_of_bundled) before any dlopen.
+std::set<std::string> bundled_module_stems(const std::filesystem::path &bundle_plugins_dir) {
   std::set<std::string> stems;
   obs_enum_modules(
       [](void *param, obs_module_t *module) {
@@ -2941,13 +2958,34 @@ std::set<std::string> bundled_module_stems() {
         if (!stem.empty()) static_cast<std::set<std::string> *>(param)->insert(std::move(stem));
       },
       &stems);
+  std::error_code ec;
+  if (!bundle_plugins_dir.empty() && std::filesystem::is_directory(bundle_plugins_dir, ec) && !ec) {
+    std::filesystem::directory_iterator it(bundle_plugins_dir, ec);
+    for (std::filesystem::directory_iterator end; !ec && it != end; it.increment(ec)) {
+      const std::filesystem::path entry = it->path();
+      if (entry.extension() == ".plugin") {
+        std::string stem = entry.stem().string();
+        if (!stem.empty()) stems.insert(std::move(stem));
+      }
+    }
+  }
   return stems;
 }
 
 // Sanitized dlerror classification: NEVER the raw dlerror text (it embeds
-// absolute paths). "Library not loaded"/"image not found" => a dependent
-// dylib failed to resolve; "architecture" => arch rejection at load.
+// absolute paths). "Library not loaded" appears ONLY when a dependent dylib
+// failed to resolve — a bare "image not found" also fires for a missing
+// CANDIDATE file, so it must not be treated as a dependency signal;
+// "architecture" => arch rejection at load. In the pinned libobs,
+// MODULE_FILE_NOT_FOUND is a deprecated alias of MODULE_FAILED_TO_OPEN (every
+// os_dlopen failure returns it), so ALL open failures route through here.
 void classify_failed_dlopen(const std::filesystem::path &binary, UserPluginRecord &record) {
+  std::error_code exists_ec;
+  if (!std::filesystem::exists(binary, exists_ec) || exists_ec) {
+    record.state = "module_load_failed";
+    record.reason_detail = "file-not-found";
+    return;
+  }
   void *handle = dlopen(binary.c_str(), RTLD_LAZY | RTLD_LOCAL);
   if (handle != nullptr) {
     dlclose(handle);
@@ -2957,26 +2995,25 @@ void classify_failed_dlopen(const std::filesystem::path &binary, UserPluginRecor
   }
   const char *raw = dlerror();
   const std::string text = raw != nullptr ? raw : "";
-  record.observed_dependencies = true; // the failure itself is an observed dependency fact
-  if (text.find("Library not loaded") != std::string::npos ||
-      text.find("image not found") != std::string::npos) {
+  if (text.find("Library not loaded") != std::string::npos) {
     record.state = "dependency_missing";
     record.reason_detail = "library-not-loaded";
+    record.observed_dependencies = true; // the failure itself is an observed dependency fact
   } else if (text.find("architecture") != std::string::npos) {
     record.state = "architecture_mismatch";
     record.reason_detail = "wrong-architecture";
   } else {
     record.state = "module_load_failed";
     record.reason_detail = "dlopen-failed";
-    record.observed_dependencies = false;
   }
 }
 
 // Load each plan candidate per-module. MUST run between the bundled
 // obs_load_all_modules() and obs_post_load_modules(), so every user module
 // exists before any collection instantiation and post-load runs exactly once.
-void load_user_plugin_candidates(UserPluginLoadPlan &plan) {
-  const std::set<std::string> bundled = bundled_module_stems();
+void load_user_plugin_candidates(UserPluginLoadPlan &plan,
+                                 const std::filesystem::path &bundle_plugins_dir) {
+  const std::set<std::string> bundled = bundled_module_stems(bundle_plugins_dir);
   std::array<std::set<std::string>, 6> before = snapshot_registered_types();
 
   for (std::size_t index : plan.candidates) {
@@ -2988,6 +3025,23 @@ void load_user_plugin_candidates(UserPluginLoadPlan &plan) {
       continue;
     }
 
+    // Re-verify confinement at the load boundary: discovery hashed/probed the
+    // path earlier, and path-based checks are TOCTOU-bounded (accepted at the
+    // recorded threat model — the roots are the local user's own directories
+    // and the manifest is Station-authored). Re-checking here shrinks the
+    // window from discovery-to-load down to check-to-dlopen.
+    {
+      std::error_code canon_ec;
+      const std::filesystem::path parent_root =
+          std::filesystem::canonical(source.binary.parent_path(), canon_ec);
+      if (canon_ec || !user_plugin_binary_confined(source.binary, parent_root)) {
+        record.lifecycle = "load_failed";
+        record.state = "module_load_failed";
+        record.reason_detail = "symlink-refused";
+        continue;
+      }
+    }
+
     const char *data_path = source.data_dir.empty() ? nullptr : source.data_dir.c_str();
     obs_module_t *module = nullptr;
     const int rc = obs_open_module(&module, source.binary.c_str(), data_path);
@@ -2997,6 +3051,11 @@ void load_user_plugin_candidates(UserPluginLoadPlan &plan) {
         record.lifecycle = "load_failed";
         record.state = "module_load_failed";
         record.reason_detail = "module-init-failed";
+        // The module stays in libobs's list (no public API frees an
+        // init-failed module the way the internal loader does), so ROLL the
+        // snapshot: any types it registered before failing must not be
+        // credited to the next successful module.
+        before = snapshot_registered_types();
         continue;
       }
       record.lifecycle = "loaded";
@@ -3032,11 +3091,9 @@ void load_user_plugin_candidates(UserPluginLoadPlan &plan) {
       record.reason_detail = "incompatible-module-version";
       record.observed_dependencies = true;
       break;
-    case MODULE_FILE_NOT_FOUND:
-      record.state = "module_load_failed";
-      record.reason_detail = "file-not-found";
-      break;
     default:
+      // MODULE_FAILED_TO_OPEN (== deprecated MODULE_FILE_NOT_FOUND) and
+      // MODULE_ERROR: classify via a sanitized probe dlopen.
       classify_failed_dlopen(source.binary, record);
       break;
     }
@@ -3048,14 +3105,16 @@ void load_user_plugin_candidates(UserPluginLoadPlan &plan) {
 // per-module loading (call site: EngineLifecycle::start, between bundled
 // load and post-load). Scaffold lane: plan facts only, honestly labeled.
 std::string build_user_plugins_boot_report_json(
-    const std::optional<user_plugins::Manifest> &manifest) {
+    const std::optional<user_plugins::Manifest> &manifest,
+    const std::filesystem::path &bundle_plugins_dir) {
   if (!manifest) {
     return empty_user_plugins_report_json();
   }
   UserPluginLoadPlan plan = build_user_plugin_load_plan(*manifest);
 #if STREAMMATE_HAS_LIBOBS
-  load_user_plugin_candidates(plan);
+  load_user_plugin_candidates(plan, bundle_plugins_dir);
 #else
+  (void)bundle_plugins_dir;
   for (std::size_t index : plan.candidates) {
     plan.inventory.modules[index].reason_detail = "scaffold-not-loaded";
   }
