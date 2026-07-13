@@ -39,6 +39,8 @@
 #if defined(__APPLE__)
 #include <CoreGraphics/CoreGraphics.h>
 #include <mach-o/dyld.h>
+#include <mach-o/fat.h>
+#include <mach-o/loader.h>
 #endif
 
 #if STREAMMATE_HAS_LIBOBS
@@ -55,9 +57,350 @@ constexpr int kHeartbeatMs = 5000;
 constexpr int kMaxSceneItemPosition = 1000000;
 constexpr std::uintmax_t kMaxSceneCollectionBytes = 8 * 1024 * 1024;
 constexpr const char *kWebSocketGuid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+// NIF-H1: tells plugins.discover/plugins.report consumers whether this host
+// can really load modules (the discovery inventory itself is identical in
+// both lanes -- pure filesystem + Mach-O byte parsing, no libobs).
+#if STREAMMATE_HAS_LIBOBS
+constexpr const char *kPluginHostMode = "libobs";
+#else
+constexpr const char *kPluginHostMode = "scaffold";
+#endif
 volatile std::sig_atomic_t g_stop = 0;
 
 void handle_signal(int) { g_stop = 1; }
+
+// ---------------------------------------------------------------------------
+// NIF-H1: --user-plugins-manifest launch input (schema user-plugins-manifest.v1)
+//
+//   { "version":1,
+//     "roots":[{"binaryDir":"/abs","dataDir":"/abs"|null}, ...],
+//     "selected":["module:<id>", ...]|null,
+//     "exclude":["module:<id>", ...] }
+//
+// Launch-time parsing/validation only (the static inventory itself lives with
+// the JSON emit helpers further down). Validation is fail-closed and every
+// refusal reason is a SANITIZED category code -- the raw filesystem path is
+// never interpolated into a reason string. "selected" is validated here but
+// only consumed by module loading, which lands in chunk NIF-H2.
+// ---------------------------------------------------------------------------
+namespace user_plugins {
+
+struct Root {
+  std::string binary_dir;
+  std::string data_dir; // empty => null/absent in the manifest
+};
+
+struct Manifest {
+  std::vector<Root> roots;
+  bool has_selected = false;         // "selected" present and non-null
+  std::vector<std::string> selected; // reserved for NIF-H2 loading
+  std::vector<std::string> exclude;
+};
+
+// Strict, self-contained scanner for the small v1 schema. The host's loose
+// substring extractors (extract_json_*) are deliberately NOT reused here:
+// launch validation must detect malformed JSON, not paper over it.
+class ManifestScanner {
+public:
+  explicit ManifestScanner(const std::string &text) : text_(text) {}
+
+  void ws() {
+    while (pos_ < text_.size() && std::isspace(static_cast<unsigned char>(text_[pos_]))) ++pos_;
+  }
+
+  bool eof() {
+    ws();
+    return pos_ >= text_.size();
+  }
+
+  bool consume(char c) {
+    ws();
+    if (pos_ < text_.size() && text_[pos_] == c) {
+      ++pos_;
+      return true;
+    }
+    return false;
+  }
+
+  bool literal(const char *word) {
+    ws();
+    std::size_t len = std::strlen(word);
+    if (text_.compare(pos_, len, word) == 0) {
+      pos_ += len;
+      return true;
+    }
+    return false;
+  }
+
+  std::optional<std::string> string() {
+    ws();
+    if (pos_ >= text_.size() || text_[pos_] != '"') return std::nullopt;
+    ++pos_;
+    std::string out;
+    while (pos_ < text_.size()) {
+      char c = text_[pos_++];
+      if (c == '"') return out;
+      if (c == '\\') {
+        if (pos_ >= text_.size()) return std::nullopt;
+        char escaped = text_[pos_++];
+        switch (escaped) {
+        case '"': case '\\': case '/': out.push_back(escaped); break;
+        case 'b': out.push_back('\b'); break;
+        case 'f': out.push_back('\f'); break;
+        case 'n': out.push_back('\n'); break;
+        case 'r': out.push_back('\r'); break;
+        case 't': out.push_back('\t'); break;
+        case 'u': {
+          if (pos_ + 4 > text_.size()) return std::nullopt;
+          unsigned value = 0;
+          for (int i = 0; i < 4; ++i) {
+            int digit = hex_digit_value(text_[pos_++]);
+            if (digit < 0) return std::nullopt;
+            value = (value << 4) | static_cast<unsigned>(digit);
+          }
+          // Manifest paths and module refs are ASCII by contract; a non-ASCII
+          // escape degrades to '?' (the absolute-path / module: prefix
+          // validation still applies) rather than growing a UTF-8 encoder.
+          out.push_back(value < 0x80 ? static_cast<char>(value) : '?');
+          break;
+        }
+        default:
+          return std::nullopt;
+        }
+      } else if (static_cast<unsigned char>(c) < 0x20) {
+        return std::nullopt; // raw control byte inside a JSON string
+      } else {
+        out.push_back(c);
+      }
+    }
+    return std::nullopt;
+  }
+
+  std::optional<long> integer() {
+    ws();
+    std::size_t start = pos_;
+    if (pos_ < text_.size() && text_[pos_] == '-') ++pos_;
+    std::size_t digits_start = pos_;
+    while (pos_ < text_.size() && std::isdigit(static_cast<unsigned char>(text_[pos_]))) ++pos_;
+    if (pos_ == digits_start) {
+      pos_ = start;
+      return std::nullopt;
+    }
+    // Reject 1.5 / 1e3 masquerading as an integer.
+    if (pos_ < text_.size() && (text_[pos_] == '.' || text_[pos_] == 'e' || text_[pos_] == 'E')) {
+      pos_ = start;
+      return std::nullopt;
+    }
+    try {
+      return std::stol(text_.substr(start, pos_ - start));
+    } catch (...) {
+      return std::nullopt;
+    }
+  }
+
+  // Skips one well-formed JSON value of any type (for unknown keys).
+  bool skip_value(int depth = 0) {
+    if (depth > 64) return false;
+    ws();
+    if (pos_ >= text_.size()) return false;
+    char c = text_[pos_];
+    if (c == '"') return string().has_value();
+    if (c == '{' || c == '[') {
+      const bool object = (c == '{');
+      const char close = object ? '}' : ']';
+      ++pos_;
+      if (consume(close)) return true;
+      while (true) {
+        if (object) {
+          if (!string()) return false;
+          if (!consume(':')) return false;
+        }
+        if (!skip_value(depth + 1)) return false;
+        if (consume(',')) continue;
+        return consume(close);
+      }
+    }
+    if (literal("true") || literal("false") || literal("null")) return true;
+    if (c == '-' || std::isdigit(static_cast<unsigned char>(c))) {
+      if (c == '-') ++pos_;
+      if (pos_ >= text_.size() || !std::isdigit(static_cast<unsigned char>(text_[pos_]))) return false;
+      while (pos_ < text_.size() &&
+             (std::isdigit(static_cast<unsigned char>(text_[pos_])) || text_[pos_] == '.' ||
+              text_[pos_] == 'e' || text_[pos_] == 'E' || text_[pos_] == '+' || text_[pos_] == '-')) {
+        ++pos_;
+      }
+      return true;
+    }
+    return false;
+  }
+
+private:
+  static int hex_digit_value(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return 10 + c - 'a';
+    if (c >= 'A' && c <= 'F') return 10 + c - 'A';
+    return -1;
+  }
+
+  const std::string &text_;
+  std::size_t pos_ = 0;
+};
+
+inline bool is_absolute_manifest_path(const std::string &path) {
+  return !path.empty() && path[0] == '/';
+}
+
+inline bool is_module_ref(const std::string &value) {
+  constexpr const char *kPrefix = "module:";
+  constexpr std::size_t kPrefixLen = 7;
+  return value.size() > kPrefixLen && value.compare(0, kPrefixLen, kPrefix) == 0;
+}
+
+struct ParseOutcome {
+  std::optional<Manifest> manifest; // set on success
+  std::string reason_code;          // set on failure; a category, never a path
+};
+
+inline ParseOutcome parse_manifest_text(const std::string &text) {
+  const auto fail = [](const char *code) {
+    ParseOutcome out;
+    out.reason_code = code;
+    return out;
+  };
+
+  ManifestScanner scan(text);
+  Manifest manifest;
+  bool saw_version = false;
+  bool version_ok = false;
+  bool saw_roots = false;
+
+  if (!scan.consume('{')) return fail("malformed-json");
+  if (!scan.consume('}')) {
+    while (true) {
+      auto key = scan.string();
+      if (!key) return fail("malformed-json");
+      if (!scan.consume(':')) return fail("malformed-json");
+
+      if (*key == "version") {
+        saw_version = true;
+        if (auto value = scan.integer()) {
+          version_ok = (*value == 1);
+        } else if (scan.skip_value()) {
+          version_ok = false; // well-formed but not an integer
+        } else {
+          return fail("malformed-json");
+        }
+      } else if (*key == "roots") {
+        saw_roots = true;
+        if (!scan.consume('[')) return fail("invalid-roots");
+        if (!scan.consume(']')) {
+          while (true) {
+            if (!scan.consume('{')) return fail("invalid-roots");
+            Root root;
+            bool saw_binary_dir = false;
+            if (!scan.consume('}')) {
+              while (true) {
+                auto root_key = scan.string();
+                if (!root_key) return fail("malformed-json");
+                if (!scan.consume(':')) return fail("malformed-json");
+                if (*root_key == "binaryDir") {
+                  auto value = scan.string();
+                  if (!value) return fail("invalid-roots");
+                  root.binary_dir = *value;
+                  saw_binary_dir = true;
+                } else if (*root_key == "dataDir") {
+                  if (scan.literal("null")) {
+                    root.data_dir.clear();
+                  } else {
+                    auto value = scan.string();
+                    if (!value) return fail("invalid-roots");
+                    root.data_dir = *value;
+                  }
+                } else if (!scan.skip_value()) {
+                  return fail("malformed-json");
+                }
+                if (scan.consume(',')) continue;
+                if (scan.consume('}')) break;
+                return fail("malformed-json");
+              }
+            }
+            if (!saw_binary_dir) return fail("invalid-roots");
+            manifest.roots.push_back(std::move(root));
+            if (scan.consume(',')) continue;
+            if (scan.consume(']')) break;
+            return fail("malformed-json");
+          }
+        }
+      } else if (*key == "selected") {
+        if (scan.literal("null")) {
+          manifest.has_selected = false;
+          manifest.selected.clear();
+        } else {
+          if (!scan.consume('[')) return fail("invalid-selected");
+          manifest.has_selected = true;
+          if (!scan.consume(']')) {
+            while (true) {
+              auto value = scan.string();
+              if (!value || !is_module_ref(*value)) return fail("invalid-selected");
+              manifest.selected.push_back(*value);
+              if (scan.consume(',')) continue;
+              if (scan.consume(']')) break;
+              return fail("malformed-json");
+            }
+          }
+        }
+      } else if (*key == "exclude") {
+        if (!scan.consume('[')) return fail("invalid-exclude");
+        if (!scan.consume(']')) {
+          while (true) {
+            auto value = scan.string();
+            if (!value || !is_module_ref(*value)) return fail("invalid-exclude");
+            manifest.exclude.push_back(*value);
+            if (scan.consume(',')) continue;
+            if (scan.consume(']')) break;
+            return fail("malformed-json");
+          }
+        }
+      } else if (!scan.skip_value()) {
+        return fail("malformed-json");
+      }
+
+      if (scan.consume(',')) continue;
+      if (scan.consume('}')) break;
+      return fail("malformed-json");
+    }
+  }
+  if (!scan.eof()) return fail("malformed-json");
+
+  if (!saw_version || !version_ok) return fail("unsupported-version");
+  if (!saw_roots) return fail("invalid-roots");
+  for (const auto &root : manifest.roots) {
+    if (!is_absolute_manifest_path(root.binary_dir)) return fail("invalid-roots");
+    if (!root.data_dir.empty() && !is_absolute_manifest_path(root.data_dir)) return fail("invalid-roots");
+  }
+
+  ParseOutcome out;
+  out.manifest = std::move(manifest);
+  return out;
+}
+
+// Launch-time gate: any failure throws with "invalid --user-plugins-manifest:
+// <reason-code>" -- main() catches it, logs, and returns kUsageExit. The raw
+// path is intentionally NEVER part of the message.
+inline Manifest load_or_throw(const std::string &path) {
+  const std::string prefix = "invalid --user-plugins-manifest: ";
+  if (!is_absolute_manifest_path(path)) throw std::runtime_error(prefix + "not-absolute-path");
+  std::ifstream in(path, std::ios::binary);
+  if (!in) throw std::runtime_error(prefix + "unreadable-file");
+  std::ostringstream buffer;
+  buffer << in.rdbuf();
+  if (in.bad()) throw std::runtime_error(prefix + "unreadable-file");
+  ParseOutcome outcome = parse_manifest_text(buffer.str());
+  if (!outcome.manifest) throw std::runtime_error(prefix + outcome.reason_code);
+  return std::move(*outcome.manifest);
+}
+
+} // namespace user_plugins
 
 struct Options {
   std::string host = "127.0.0.1";
@@ -65,6 +408,8 @@ struct Options {
   std::string token;
   std::string state_file;
   bool allow_live_egress = false;
+  // NIF-H1: parsed --user-plugins-manifest (absent arg = behavior unchanged).
+  std::optional<user_plugins::Manifest> user_plugins;
 };
 
 std::string json_escape(const std::string &input) {
@@ -122,6 +467,11 @@ Options parse_args(int argc, char **argv) {
       options.token = require_value("--token");
     } else if (arg == "--state-file") {
       options.state_file = require_value("--state-file");
+    } else if (arg == "--user-plugins-manifest") {
+      // NIF-H1: user plugin discovery manifest (user-plugins-manifest.v1).
+      // Validated fail-closed at launch; a bad manifest refuses startup with
+      // a sanitized reason code (never the raw path).
+      options.user_plugins = user_plugins::load_or_throw(require_value("--user-plugins-manifest"));
     } else if (arg == "--allow-live-egress") {
       // Q-122 defense-in-depth: a launch-time gate over the caller-supplied
       // allowLiveEgress JSON flag. Default off; both layers must assert before
@@ -1860,6 +2210,326 @@ std::string json_array_join(const std::vector<std::string> &items) {
   }
   out += "]";
   return out;
+}
+
+// ---------------------------------------------------------------------------
+// NIF-H1: user plugin static inventory (discovery ONLY -- no dlopen, no
+// obs_open_module; loading is chunk NIF-H2). Pure filesystem reads + Mach-O
+// header byte parsing, so it behaves identically in both lanes; enumeration
+// leaves the manifest roots byte-for-byte identical.
+// ---------------------------------------------------------------------------
+
+// Compact SHA-256 (FIPS 180-4) over a whole buffer. The repo had no C++
+// hashing utility (packaging hashes via shasum in shell), and the scaffold
+// lane must not grow a CommonCrypto/libobs dependency for this.
+std::string sha256_hex(const std::vector<unsigned char> &data) {
+  static constexpr uint32_t kRound[64] = {
+      0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+      0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+      0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+      0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+      0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+      0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+      0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+      0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2};
+  uint32_t h[8] = {0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a,
+                   0x510e527f, 0x9b05688c, 0x1f83d9ab, 0x5be0cd19};
+
+  const uint64_t bit_len = static_cast<uint64_t>(data.size()) * 8;
+  std::vector<unsigned char> msg(data);
+  msg.push_back(0x80);
+  while (msg.size() % 64 != 56) msg.push_back(0x00);
+  for (int shift = 56; shift >= 0; shift -= 8) msg.push_back(static_cast<unsigned char>(bit_len >> shift));
+
+  const auto rotr = [](uint32_t value, int bits) { return (value >> bits) | (value << (32 - bits)); };
+  for (size_t offset = 0; offset < msg.size(); offset += 64) {
+    uint32_t w[64];
+    for (int i = 0; i < 16; ++i) {
+      const unsigned char *p = msg.data() + offset + 4 * i;
+      w[i] = (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | uint32_t(p[3]);
+    }
+    for (int i = 16; i < 64; ++i) {
+      uint32_t s0 = rotr(w[i - 15], 7) ^ rotr(w[i - 15], 18) ^ (w[i - 15] >> 3);
+      uint32_t s1 = rotr(w[i - 2], 17) ^ rotr(w[i - 2], 19) ^ (w[i - 2] >> 10);
+      w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+    }
+    uint32_t a = h[0], b = h[1], c = h[2], d = h[3], e = h[4], f = h[5], g = h[6], hh = h[7];
+    for (int i = 0; i < 64; ++i) {
+      uint32_t s1 = rotr(e, 6) ^ rotr(e, 11) ^ rotr(e, 25);
+      uint32_t ch = (e & f) ^ (~e & g);
+      uint32_t temp1 = hh + s1 + ch + kRound[i] + w[i];
+      uint32_t s0 = rotr(a, 2) ^ rotr(a, 13) ^ rotr(a, 22);
+      uint32_t maj = (a & b) ^ (a & c) ^ (b & c);
+      uint32_t temp2 = s0 + maj;
+      hh = g; g = f; f = e; e = d + temp1;
+      d = c; c = b; b = a; a = temp1 + temp2;
+    }
+    h[0] += a; h[1] += b; h[2] += c; h[3] += d;
+    h[4] += e; h[5] += f; h[6] += g; h[7] += hh;
+  }
+
+  std::ostringstream out;
+  out << std::hex << std::setfill('0');
+  for (uint32_t word : h) out << std::setw(8) << word;
+  return out.str();
+}
+
+// Mach-O magic / cputype constants: taken from <mach-o/loader.h> +
+// <mach-o/fat.h> on Apple, mirrored literally elsewhere so the byte parser
+// stays buildable off-macOS.
+#if defined(__APPLE__)
+constexpr uint32_t kMhMagic64 = MH_MAGIC_64;
+constexpr uint32_t kMhCigam64 = MH_CIGAM_64;
+constexpr uint32_t kMhMagic32 = MH_MAGIC;
+constexpr uint32_t kMhCigam32 = MH_CIGAM;
+constexpr uint32_t kFatMagic = FAT_MAGIC;
+constexpr uint32_t kFatMagic64 = FAT_MAGIC_64;
+constexpr uint32_t kCpuTypeArm64 = static_cast<uint32_t>(CPU_TYPE_ARM64);
+constexpr uint32_t kCpuTypeX8664 = static_cast<uint32_t>(CPU_TYPE_X86_64);
+#else
+constexpr uint32_t kMhMagic64 = 0xfeedfacf;
+constexpr uint32_t kMhCigam64 = 0xcffaedfe;
+constexpr uint32_t kMhMagic32 = 0xfeedface;
+constexpr uint32_t kMhCigam32 = 0xcefaedfe;
+constexpr uint32_t kFatMagic = 0xcafebabe;
+constexpr uint32_t kFatMagic64 = 0xcafebabf;
+constexpr uint32_t kCpuTypeArm64 = 0x0100000c;
+constexpr uint32_t kCpuTypeX8664 = 0x01000007;
+#endif
+
+uint32_t read_u32_at(const unsigned char *p, bool big_endian) {
+  if (big_endian) {
+    return (uint32_t(p[0]) << 24) | (uint32_t(p[1]) << 16) | (uint32_t(p[2]) << 8) | uint32_t(p[3]);
+  }
+  return (uint32_t(p[3]) << 24) | (uint32_t(p[2]) << 16) | (uint32_t(p[1]) << 8) | uint32_t(p[0]);
+}
+
+std::string cpu_type_label(uint32_t cputype) {
+  if (cputype == kCpuTypeArm64) return "arm64";
+  if (cputype == kCpuTypeX8664) return "x86_64";
+  return "unknown";
+}
+
+// Reads architectures straight from the Mach-O header bytes: thin
+// MH_MAGIC_64/MH_CIGAM_64 (cputype at offset 4, byte-swapped for CIGAM) and
+// universal FAT_MAGIC[/64]/FAT_CIGAM[/64] (one cputype per fat_arch entry).
+// nullopt = the bytes are not a Mach-O image.
+std::optional<std::vector<std::string>> parse_macho_archs(const std::vector<unsigned char> &bytes) {
+  if (bytes.size() < 8) return std::nullopt;
+  const uint32_t magic_le = read_u32_at(bytes.data(), false);
+  const uint32_t magic_be = read_u32_at(bytes.data(), true);
+
+  // Thin image: the header is in the image's own endianness; a CIGAM read
+  // means the file was written byte-swapped relative to us.
+  if (magic_le == kMhMagic64 || magic_le == kMhMagic32) {
+    return std::vector<std::string>{cpu_type_label(read_u32_at(bytes.data() + 4, false))};
+  }
+  if (magic_le == kMhCigam64 || magic_le == kMhCigam32) {
+    return std::vector<std::string>{cpu_type_label(read_u32_at(bytes.data() + 4, true))};
+  }
+
+  // Universal image: fat headers are big-endian on disk (FAT_MAGIC read
+  // big-endian); tolerate the byte-swapped variant as well.
+  bool fat_big_endian;
+  uint32_t fat_magic;
+  if (magic_be == kFatMagic || magic_be == kFatMagic64) {
+    fat_big_endian = true;
+    fat_magic = magic_be;
+  } else if (magic_le == kFatMagic || magic_le == kFatMagic64) {
+    fat_big_endian = false;
+    fat_magic = magic_le;
+  } else {
+    return std::nullopt;
+  }
+  const bool fat64 = (fat_magic == kFatMagic64);
+  const uint32_t nfat = read_u32_at(bytes.data() + 4, fat_big_endian);
+  if (nfat == 0 || nfat > 128) return std::nullopt;
+  const size_t entry_size = fat64 ? 32 : 20; // sizeof(fat_arch_64) : sizeof(fat_arch)
+  std::vector<std::string> archs;
+  for (uint32_t i = 0; i < nfat; ++i) {
+    const size_t offset = 8 + static_cast<size_t>(i) * entry_size;
+    if (offset + 4 > bytes.size()) return std::nullopt;
+    std::string label = cpu_type_label(read_u32_at(bytes.data() + offset, fat_big_endian));
+    if (std::find(archs.begin(), archs.end(), label) == archs.end()) archs.push_back(label);
+  }
+  return archs;
+}
+
+std::optional<std::vector<unsigned char>> read_file_bytes(const std::filesystem::path &path) {
+  std::ifstream in(path, std::ios::binary);
+  if (!in) return std::nullopt;
+  std::ostringstream buffer;
+  buffer << in.rdbuf();
+  if (in.bad()) return std::nullopt;
+  const std::string &contents = buffer.str();
+  return std::vector<unsigned char>(contents.begin(), contents.end());
+}
+
+struct UserPluginCandidate {
+  std::string name;              // protocol-safe module name
+  std::filesystem::path binary;  // absolute path to the module binary
+  std::string relative;          // binary path relative to its manifest root
+};
+
+struct UserPluginRecord {
+  std::string module_ref;
+  std::string label;
+  std::string file_name;
+  std::string root_ref;
+  std::string sha256;
+  std::vector<std::string> archs;
+  bool observed_arch = false;
+  std::string lifecycle;
+  std::string reason_detail; // empty => null on the wire
+};
+
+struct UserPluginRootSummary {
+  std::string root_ref;
+  int candidate_count = 0;
+};
+
+struct UserPluginInventory {
+  std::vector<UserPluginRootSummary> roots;
+  std::vector<UserPluginRecord> modules;
+};
+
+// Enumerates one manifest root across BOTH macOS layouts, in sorted entry
+// order (directory iteration order is unspecified, and the inventory must be
+// deterministic):
+//   (a) <root>/<name>.plugin CFBundle -> Contents/MacOS/<name>
+//   (b) legacy <root>/<name>/bin/**/<name>.{so,dylib} (first match in sorted
+//       path order)
+// Names that are not protocol-safe ids cannot form a valid "module:<id>" ref
+// and are skipped. A missing/unreadable root yields zero candidates.
+std::vector<UserPluginCandidate> enumerate_user_plugin_root(const std::filesystem::path &root) {
+  std::vector<UserPluginCandidate> out;
+  std::error_code ec;
+  std::filesystem::directory_iterator dir(root, ec);
+  if (ec) return out;
+  std::vector<std::filesystem::path> entries;
+  for (const auto &entry : dir) entries.push_back(entry.path());
+  std::sort(entries.begin(), entries.end());
+
+  constexpr const char *kBundleSuffix = ".plugin";
+  constexpr std::size_t kBundleSuffixLen = 7;
+  for (const auto &path : entries) {
+    std::error_code entry_ec;
+    if (!std::filesystem::is_directory(path, entry_ec) || entry_ec) continue;
+    const std::string entry_name = path.filename().string();
+
+    if (entry_name.size() > kBundleSuffixLen && entry_name.ends_with(kBundleSuffix)) {
+      const std::string name = entry_name.substr(0, entry_name.size() - kBundleSuffixLen);
+      if (!is_safe_protocol_id(name)) continue;
+      std::filesystem::path binary = path / "Contents" / "MacOS" / name;
+      if (std::filesystem::is_regular_file(binary, entry_ec) && !entry_ec) {
+        out.push_back({name, binary, entry_name + "/Contents/MacOS/" + name});
+      }
+      continue;
+    }
+
+    const std::string &name = entry_name;
+    if (!is_safe_protocol_id(name)) continue;
+    std::filesystem::path bin_dir = path / "bin";
+    if (!std::filesystem::is_directory(bin_dir, entry_ec) || entry_ec) continue;
+    std::vector<std::filesystem::path> matches;
+    std::filesystem::recursive_directory_iterator files(bin_dir, entry_ec);
+    if (entry_ec) continue;
+    for (const auto &file : files) {
+      std::error_code file_ec;
+      if (!file.is_regular_file(file_ec) || file_ec) continue;
+      const std::string file_name = file.path().filename().string();
+      if (file_name == name + ".so" || file_name == name + ".dylib") matches.push_back(file.path());
+    }
+    if (matches.empty()) continue;
+    std::sort(matches.begin(), matches.end());
+    const std::filesystem::path &binary = matches.front();
+    out.push_back({name, binary, binary.lexically_relative(root).generic_string()});
+  }
+  return out;
+}
+
+UserPluginInventory build_user_plugin_inventory(const user_plugins::Manifest &manifest) {
+  UserPluginInventory inventory;
+  const std::set<std::string> excluded(manifest.exclude.begin(), manifest.exclude.end());
+  std::set<std::string> seen;
+
+  for (std::size_t index = 0; index < manifest.roots.size(); ++index) {
+    const std::string root_ref = "root:" + std::to_string(index);
+    std::vector<UserPluginCandidate> candidates;
+    try {
+      candidates = enumerate_user_plugin_root(manifest.roots[index].binary_dir);
+    } catch (const std::filesystem::filesystem_error &) {
+      candidates.clear(); // a root racing with deletion degrades to empty
+    }
+    inventory.roots.push_back({root_ref, static_cast<int>(candidates.size())});
+
+    for (const auto &candidate : candidates) {
+      UserPluginRecord record;
+      record.module_ref = "module:" + candidate.name;
+      record.label = candidate.name;
+      record.file_name = candidate.relative;
+      record.root_ref = root_ref;
+      if (auto bytes = read_file_bytes(candidate.binary)) {
+        record.sha256 = sha256_hex(*bytes);
+        if (auto archs = parse_macho_archs(*bytes)) {
+          record.archs = *archs;
+          record.observed_arch = true; // read from the header bytes, honestly
+        } else {
+          record.reason_detail = "unreadable-macho-header";
+        }
+      } else {
+        record.reason_detail = "unreadable-binary";
+      }
+      // Exclusion wins over duplicate detection; only non-excluded records
+      // participate in first-root-wins tracking.
+      if (excluded.count(record.module_ref)) {
+        record.lifecycle = "excluded";
+      } else if (!seen.insert(record.module_ref).second) {
+        record.lifecycle = "duplicate_in_roots";
+      } else {
+        record.lifecycle = "discovered";
+      }
+      inventory.modules.push_back(std::move(record));
+    }
+  }
+  return inventory;
+}
+
+std::string user_plugin_record_json(const UserPluginRecord &record) {
+  // "state" stays null and observed.dependencies stays false until NIF-H2:
+  // nothing has been loaded and dependencies were NOT probed in this chunk.
+  return "{\"moduleRef\":\"" + json_escape(record.module_ref) +
+         "\",\"label\":\"" + json_escape(record.label) +
+         "\",\"fileName\":\"" + json_escape(record.file_name) +
+         "\",\"rootRef\":\"" + json_escape(record.root_ref) +
+         "\",\"moduleClass\":\"user\"" +
+         ",\"sha256\":\"" + json_escape(record.sha256) +
+         "\",\"arch\":" + json_string_array(record.archs) +
+         ",\"lifecycle\":\"" + json_escape(record.lifecycle) +
+         "\",\"state\":null,\"observed\":{\"arch\":" + (record.observed_arch ? "true" : "false") +
+         ",\"dependencies\":false},\"reasonDetail\":" +
+         (record.reason_detail.empty() ? std::string("null")
+                                       : "\"" + json_escape(record.reason_detail) + "\"") +
+         "}";
+}
+
+std::string user_plugins_discover_json(const std::optional<user_plugins::Manifest> &manifest) {
+  std::string roots_json = "[";
+  std::string modules_json = "[";
+  if (manifest) {
+    const UserPluginInventory inventory = build_user_plugin_inventory(*manifest);
+    for (std::size_t i = 0; i < inventory.roots.size(); ++i) {
+      if (i) roots_json += ",";
+      roots_json += "{\"rootRef\":\"" + json_escape(inventory.roots[i].root_ref) +
+                    "\",\"candidateCount\":" + std::to_string(inventory.roots[i].candidate_count) + "}";
+    }
+    for (std::size_t i = 0; i < inventory.modules.size(); ++i) {
+      if (i) modules_json += ",";
+      modules_json += user_plugin_record_json(inventory.modules[i]);
+    }
+  }
+  return "{\"ok\":true,\"mode\":\"" + std::string(kPluginHostMode) + "\",\"roots\":" + roots_json +
+         "],\"modules\":" + modules_json + "]}";
 }
 
 struct PromptSourceSummary {
@@ -3637,6 +4307,17 @@ private:
     });
     add("import.report", [this](int fd, const std::string &id, const std::string &payload) {
       send_renderer_result(fd, id, importer_.report(payload));
+    });
+    // NIF-H1: static user plugin inventory from --user-plugins-manifest roots
+    // (read-only; NO module loading -- dlopen/obs_open_module land in NIF-H2).
+    add("plugins.discover", [this](int fd, const std::string &id, const std::string &) {
+      send_text_frame(fd, rpc_result(id, user_plugins_discover_json(options_.user_plugins)));
+    });
+    // Wire-contract pin only: nothing is loaded before NIF-H2, so the report
+    // is honestly empty (never a fabricated loaded-module record).
+    add("plugins.report", [this](int fd, const std::string &id, const std::string &) {
+      send_text_frame(fd, rpc_result(id, std::string("{\"ok\":true,\"mode\":\"") + kPluginHostMode +
+                                             "\",\"modules\":[]}"));
     });
     add("output.configure", [this](int fd, const std::string &id, const std::string &payload) {
       send_output_result(fd, id, output_.configure(payload));
