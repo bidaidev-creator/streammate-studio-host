@@ -521,14 +521,23 @@ class UserPluginLoadingLibobsTest(unittest.TestCase):
             host.rpc(sock, 9607, "sceneItem.setVisible", {"sceneId": "parity", "itemId": "parity-src", "visible": False})["result"]["ok"]
             and host.rpc(sock, 9608, "sceneItem.setVisible", {"sceneId": "parity", "itemId": "parity-src", "visible": True})["result"]["ok"]
         )
+        # codex F9: a second item makes setOrder a real move, not a no-op.
+        second = host.rpc(
+            sock, 9620, "source.create",
+            {"sceneId": "parity", "sourceId": "parity-backdrop", "kind": "streammate_test_source",
+             "settings": {"color": 0xFF102030}},
+        )
+        self.assertTrue(second["result"]["ok"])
         observed["sceneItem.setOrder"] = host.rpc(
             sock, 9609, "sceneItem.setOrder",
-            {"sceneId": "parity", "itemId": "parity-src", "position": 0, "idempotencyToken": "parity-order-1"},
+            {"sceneId": "parity", "itemId": "parity-src", "position": 1, "idempotencyToken": "parity-order-1"},
         )["result"]["ok"]
-        observed["scene.itemTransform"] = host.rpc(
+        transform = host.rpc(
             sock, 9610, "scene.itemTransform",
             {"sceneId": "parity", "sourceId": "parity-src", "x": 4, "y": 6, "width": 32, "height": 18},
-        )["result"]["ok"]
+        )["result"]
+        observed["scene.itemTransform"] = transform["ok"] and transform["transform"] == {
+            "x": 4, "y": 6, "width": 32, "height": 18}
         observed["source.mute"] = (
             host.rpc(sock, 9611, "source.mute", {"sourceId": "parity-src", "muted": True})["result"]["ok"]
             and host.rpc(sock, 9612, "source.mute", {"sourceId": "parity-src", "muted": False})["result"]["ok"]
@@ -536,10 +545,15 @@ class UserPluginLoadingLibobsTest(unittest.TestCase):
         observed["audio.setVolume"] = host.rpc(
             sock, 9613, "audio.setVolume", {"sourceId": "parity-src", "volumeDb": -12.5}
         )["result"]["ok"]
-        observed["filter.setEnabled"] = (
-            host.rpc(sock, 9614, "filter.setEnabled", {"sourceId": "parity-src", "filterId": "parity-filter", "enabled": False})["result"]["ok"]
-            and host.rpc(sock, 9615, "filter.setEnabled", {"sourceId": "parity-src", "filterId": "parity-filter", "enabled": True})["result"]["ok"]
-        )
+        # codex F9: observe the disabled state between the two toggles rather
+        # than trusting acknowledgement-only results.
+        disabled_ok = host.rpc(sock, 9614, "filter.setEnabled",
+                               {"sourceId": "parity-src", "filterId": "parity-filter", "enabled": False})["result"]["ok"]
+        mid_filters = host.rpc(sock, 9617, "filter.list", {"sourceId": "parity-src"})["result"]["filters"]
+        mid_state = next(f for f in mid_filters if f["filterId"] == "parity-filter")["enabled"]
+        reenabled_ok = host.rpc(sock, 9615, "filter.setEnabled",
+                                {"sourceId": "parity-src", "filterId": "parity-filter", "enabled": True})["result"]["ok"]
+        observed["filter.setEnabled"] = disabled_ok and reenabled_ok and mid_state is False
 
         # Every applicable Spec 36 verb must be observed green against the
         # plugin-backed source/filter — per-verb results, not a single bool.
@@ -557,6 +571,11 @@ class UserPluginLoadingLibobsTest(unittest.TestCase):
         self.assertIs(parity_sources[0]["visible"], True)
         self.assertIs(parity_sources[0]["muted"], False)
         self.assertEqual(parity_sources[0]["volumeDb"], -12.5)
+        # codex F9: transform position and program scene read back through the
+        # observed-state surface, not just RPC acknowledgements.
+        self.assertEqual(parity_sources[0].get("position"), {"x": 4, "y": 6}, parity_sources[0])
+        program = [sc for sc in listed.get("scenes", []) if sc.get("program")]
+        self.assertEqual([sc["sceneId"] for sc in program], ["parity"], listed.get("scenes"))
 
     def test_real_loading_end_to_end(self) -> None:
         before = tree_digest(self.root)

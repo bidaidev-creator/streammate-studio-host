@@ -53,6 +53,7 @@ def parity_collection_body() -> str:
                     "filters": [
                         {"name": "Warm LUT", "id": "color_filter_v2"},
                         {"name": "Shader Glow", "id": "shader_filter"},
+                        {"name": "Voice EQ", "id": "basic_eq_filter"},
                     ],
                 },
                 {"name": "Lower Thirds", "id": "group"},
@@ -134,6 +135,7 @@ class ImportParityTest(unittest.TestCase):
             "source:Overlay",
             "filter:Overlay:Warm LUT",
             "filter:Overlay:Shader Glow",
+            "filter:Overlay:Voice EQ",
             "source:Lower Thirds",
             "source:Desktop Audio",
             "source:Display Mirror",
@@ -219,6 +221,77 @@ class ImportParityTest(unittest.TestCase):
             self.assertEqual(item["bucket"], "unresolved")
             self.assertEqual(item["reason"], "unsupported_plugin_class")
             self.assertIn("Q-137", " ".join(item.get("notes", [])))
+
+    def test_upstream_eq_filter_maps_native(self) -> None:
+        # basic_eq_filter is registered by the pinned obs-filters module
+        # (external/obs-studio/plugins/obs-filters/eq-filter.c) — codex F1.
+        item = self.by_id(self.report())["filter:Overlay:Voice EQ"]
+        self.assertEqual((item["bucket"], item["reason"]), ("mapped", "mapped_native"))
+
+    def test_filter_parent_identity_survives_reversed_key_order(self) -> None:
+        # codex F4: JSON object order is not a semantic contract — a collection
+        # whose "filters" array precedes "name" must still attribute the parent.
+        collection = {
+            "name": "Reversed Order",
+            "sources": [
+                {
+                    "filters": [{"name": "Late LUT", "id": "color_filter_v2"}],
+                    "name": "Late Overlay",
+                    "id": "browser_source",
+                }
+            ],
+        }
+        build_config(self.obs_dir, "parity-reversed", json.dumps(collection))
+        result = self.rpc("import.load", {"collectionId": "parity-reversed"})
+        self.assertTrue(result.get("ok"), result)
+        items = self.by_id(result["report"])
+        self.assertIn("filter:Late Overlay:Late LUT", items)
+        item = items["filter:Late Overlay:Late LUT"]
+        self.assertEqual(item["label"], "Late Overlay / Late LUT")
+
+    def test_duplicate_script_basenames_get_distinct_ids(self) -> None:
+        # codex F5: /show-a/main.lua and /show-b/main.lua must not collide.
+        collection = {
+            "name": "Script Twins",
+            "sources": [{"name": "Slate", "id": "color_source"}],
+            "modules": {
+                "scripts-tool": [
+                    {"path": "show-a/main.lua", "settings": {}},
+                    {"path": "show-b/main.lua", "settings": {}},
+                ]
+            },
+        }
+        build_config(self.obs_dir, "parity-twins", json.dumps(collection))
+        result = self.rpc("import.load", {"collectionId": "parity-twins"})
+        self.assertTrue(result.get("ok"), result)
+        items = self.by_id(result["report"])
+        self.assertIn("script:main.lua", items)
+        self.assertIn("script:main.lua-2", items)
+        for key in ("script:main.lua", "script:main.lua-2"):
+            self.assertEqual(items[key]["reason"], "unsupported_plugin_class")
+        # No raw directory portion may appear anywhere in the report.
+        self.assertNotIn("show-a", json.dumps(result["report"]))
+
+    def test_migration_marked_plugin_source_gets_no_placeholder_record(self) -> None:
+        # codex F6: build_report classifies a marker!=1 third_party source as
+        # settings_migration_required — the import map must not claim a
+        # missing-plugin placeholder for it.
+        collection = {
+            "name": "Migration Mirror",
+            "sources": [
+                {"name": "Old FX", "id": "third_party_camera_fx",
+                 "settings": {"plugin_settings_version": 2}},
+            ],
+        }
+        build_config(self.obs_dir, "parity-migration", json.dumps(collection))
+        result = self.rpc("import.load", {"collectionId": "parity-migration"})
+        self.assertTrue(result.get("ok"), result)
+        items = self.by_id(result["report"])
+        self.assertEqual(items["source:Old FX"]["reason"], "settings_migration_required")
+        workspace = self.home / "studio" / "obs-imports" / "parity-migration"
+        import_map = json.loads((workspace / "streammate-import-map.json").read_text())
+        placeholder_ids = [p["sourceId"] for p in import_map["placeholderSources"]]
+        self.assertNotIn("source:Old FX", placeholder_ids)
 
     def test_report_byte_deterministic(self) -> None:
         first = self.rpc("import.report", {"collectionId": "parity-main"})

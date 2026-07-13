@@ -2877,7 +2877,9 @@ const std::set<std::string> &upstream_filter_ids() {
       "luma_key_filter_v2",   "noise_gate_filter",     "noise_suppress_filter","compressor_filter",
       "limiter_filter",       "expander_filter",       "upward_compressor_filter",
       "invert_polarity_filter","async_delay_filter",   "hdr_tonemap_filter",
-      "premultiplied_alpha_filter", "clut_filter",     "vst_filter"};
+      "premultiplied_alpha_filter", "clut_filter",     "vst_filter",
+      // codex F1: registered by the pinned obs-filters module (eq-filter.c).
+      "basic_eq_filter"};
   return ids;
 }
 
@@ -2963,6 +2965,7 @@ std::vector<ObsSourceEntry> parse_obs_source_entries(const std::string &json) {
     bool is_transition = false;
     bool is_script = false;
     std::string parent_label;
+    size_t parent_depth = std::string::npos;
   };
   // NIF-M3: enclosing-array context — the key that opened the array plus the
   // label of the object that owned that key ("" when unnamed). Anonymous
@@ -2972,10 +2975,14 @@ std::vector<ObsSourceEntry> parse_obs_source_entries(const std::string &json) {
   struct ArrayContext {
     std::string key;
     std::string owner_label;
+    size_t owner_depth = std::string::npos;
   };
   std::vector<ObjectFields> stack;
   std::vector<ArrayContext> arrays;
   std::vector<ObsSourceEntry> entries;
+  // NIF-M3 (codex F4): (entry index, owner stack depth) for filter entries
+  // emitted before their parent's name was parsed.
+  std::vector<std::pair<size_t, size_t>> pending_filter_parents;
   for (size_t pos = 0; pos < json.size();) {
     const char c = json[pos];
     if (c == '{') {
@@ -2985,6 +2992,7 @@ std::vector<ObsSourceEntry> parse_obs_source_entries(const std::string &json) {
         if (context.key == "filters") {
           fields.is_filter = true;
           fields.parent_label = context.owner_label;
+          fields.parent_depth = context.owner_depth;
         } else if (context.key == "transitions") {
           fields.is_transition = true;
         } else if (context.key == "scripts-tool") {
@@ -2996,7 +3004,7 @@ std::vector<ObsSourceEntry> parse_obs_source_entries(const std::string &json) {
       continue;
     }
     if (c == '[') {
-      arrays.push_back({"", ""});
+      arrays.push_back({"", "", std::string::npos});
       ++pos;
       continue;
     }
@@ -3013,6 +3021,17 @@ std::vector<ObsSourceEntry> parse_obs_source_entries(const std::string &json) {
             entries[closing.entry_index].settings_raw.empty()) {
           entries[closing.entry_index].settings_raw = closing.settings_raw;
           entries[closing.entry_index].settings_offset = closing.settings_offset;
+        }
+        // NIF-M3 (codex F4): JSON key order is not a contract — a "filters"
+        // array may precede the parent's "name". Patch child filter entries
+        // whose parent label was unknown when they were emitted.
+        if (!closing.name.empty()) {
+          const size_t owner_depth = stack.size() - 1;
+          for (auto &pending : pending_filter_parents) {
+            if (pending.second == owner_depth && entries[pending.first].parent_label.empty()) {
+              entries[pending.first].parent_label = closing.name;
+            }
+          }
         }
         stack.pop_back();
       }
@@ -3051,7 +3070,8 @@ std::vector<ObsSourceEntry> parse_obs_source_entries(const std::string &json) {
     // NIF-M3: a key opening an array records the enclosing-array context and
     // consumes the bracket (the generic '[' branch never sees it).
     if (json[pos] == '[') {
-      arrays.push_back({*key, stack.empty() ? "" : stack.back().name});
+      arrays.push_back({*key, stack.empty() ? "" : stack.back().name,
+                        stack.empty() ? std::string::npos : stack.size() - 1});
       ++pos;
       continue;
     }
@@ -3066,7 +3086,8 @@ std::vector<ObsSourceEntry> parse_obs_source_entries(const std::string &json) {
       current.id = *value;
     } else if (*key == "path" && current.is_script && !current.emitted) {
       // NIF-M3 / Q-137: script entries carry a path, not name/id. Inventory
-      // them by file name only (never the directory portion).
+      // them by file name only (never the directory portion). Scripts bypass
+      // the adjacent-entry dedup: two scripts may share a basename (codex F5).
       std::string base = *value;
       const size_t slash = base.find_last_of("/\\");
       if (slash != std::string::npos) base = base.substr(slash + 1);
@@ -3084,6 +3105,9 @@ std::vector<ObsSourceEntry> parse_obs_source_entries(const std::string &json) {
       if (entries.empty() || entries.back().label != entry.label || entries.back().module != entry.module) {
         entries.push_back(entry);
         current.entry_index = entries.size() - 1;
+        if (current.is_filter && entry.parent_label.empty() && current.parent_depth != std::string::npos) {
+          pending_filter_parents.emplace_back(entries.size() - 1, current.parent_depth);
+        }
         if (!current.settings_raw.empty()) {
           entries.back().settings_raw = current.settings_raw;
           entries.back().settings_offset = current.settings_offset;
@@ -4917,7 +4941,11 @@ private:
         }
         continue;
       }
-      if (entry.module == "third_party_camera_fx" || plugin_disposition(entry) == PluginDisposition::missing) {
+      const PluginDisposition disposition = plugin_disposition(entry);
+      // codex F6: a migration-marked source reports settings_migration_required
+      // — the map must not claim a missing-plugin placeholder for it.
+      if (disposition == PluginDisposition::missing ||
+          (entry.module == "third_party_camera_fx" && disposition != PluginDisposition::migration)) {
         placeholders.push_back("{\"sourceId\":\"source:" + json_escape(entry.label) + "\",\"label\":\"" + json_escape(entry.label) +
                                "\",\"reason\":\"missing_plugin\"}");
       }
@@ -4955,12 +4983,18 @@ private:
     std::vector<std::string> mapped;
     std::vector<std::string> degraded;
     std::vector<std::string> unresolved;
+    std::map<std::string, int> script_label_counts;
     for (const auto &entry : parse_obs_source_entries(json)) {
       const std::string source_id = "source:" + entry.label;
       // NIF-M3 / Q-137: Lua/Python scripts are inventoried and deferred —
       // precise class, never a silent drop.
       if (entry.is_script) {
-        unresolved.push_back(report_item("script:" + entry.label, "source", entry.label, "unresolved",
+        // codex F5: duplicate basenames get a deterministic ordinal suffix so
+        // report ids stay unique without disclosing directory portions.
+        std::string script_id = "script:" + entry.label;
+        const int seen = ++script_label_counts[entry.label];
+        if (seen > 1) script_id += "-" + std::to_string(seen);
+        unresolved.push_back(report_item(script_id, "source", entry.label, "unresolved",
                                          "unsupported_plugin_class", "", "",
                                          {"Lua/Python scripts are inventoried and deferred (Q-137)."}));
         continue;
