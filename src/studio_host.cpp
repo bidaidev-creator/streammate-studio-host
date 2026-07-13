@@ -569,6 +569,13 @@ bool is_loopback_host(const std::string &host) {
 // the durable `suspects` map and refuses those modules (state runtime_crash)
 // until the manifest retries or excludes them — bounded by construction: one
 // crash per module per explicit retry, never a restart loop.
+// N1 (opus, accepted): attribution is coarse per-load-window — a previously
+// loaded module's background thread crashing DURING a later module's load
+// window suspects the later module; inherent to the single sentinel record,
+// bounded (one boot) and retry-recoverable.
+// N5 (opus, accepted): the sentinel file assumes the single-supervisor
+// posture — two concurrent hosts sharing one install-dir sentinel could
+// interleave records; Station spawns one supervised host per install dir.
 namespace plugin_sentinel {
 
 constexpr std::uintmax_t kMaxSentinelBytes = 65536;
@@ -840,6 +847,10 @@ Options parse_args(int argc, char **argv) {
     options.plugin_consumed_retries = resolved.consumed_retries;
     // Writability probe (codex F2): if attribution cannot be persisted here,
     // no load attempt may proceed — refuse startup, never fail open.
+    // N3 (opus, accepted): the retry grant is consumed at parse time, so a
+    // kill between parse and the load loop spends the grant without the
+    // attempt — safe: the per-attempt loading write re-suspects any real
+    // crash on whichever boot actually reaches the load.
     plugin_sentinel::State probe;
     probe.suspects = resolved.suspects;
     probe.consumed_retries = resolved.consumed_retries;
