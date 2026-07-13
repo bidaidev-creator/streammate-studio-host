@@ -257,12 +257,25 @@ class PluginCrashContainmentScaffoldTest(unittest.TestCase):
         )
         report = self._report("--plugin-load-sentinel", str(self.sentinel))
         alpha = self._by_ref(report)["module:alpha"]
-        # Scaffold lane: a fresh (non-suspected) candidate is plan-only.
-        self.assertEqual(alpha["lifecycle"], "discovered")
-        self.assertEqual(alpha["reasonDetail"], "scaffold-not-loaded")
-        self.assertIsNone(alpha["state"])
-        # The retried ref left the durable suspects map.
-        self.assertEqual(read_sentinel(self.sentinel)["suspects"], {})
+        # Decisive in BOTH lanes: the retry granted a fresh attempt — alpha is
+        # no longer refused as a suspect.
+        self.assertNotEqual(alpha["lifecycle"], "excluded")
+        self.assertNotEqual(alpha["reasonDetail"], "crash-suspected")
+        self.assertNotEqual(alpha.get("state"), "runtime_crash")
+        if report["mode"] == "scaffold":
+            # Scaffold lane: a fresh (non-suspected) candidate is plan-only.
+            self.assertEqual(alpha["lifecycle"], "discovered")
+            self.assertEqual(alpha["reasonDetail"], "scaffold-not-loaded")
+            self.assertIsNone(alpha["state"])
+        else:
+            # libobs lane: the attempt is REAL — this fixture binary is not a
+            # loadable OBS module, so the honest outcome is a clean load
+            # failure (an attempt, never suspicion, never a process crash).
+            self.assertEqual(alpha["lifecycle"], "load_failed")
+        # The retried ref left the durable suspects map and its grant is spent.
+        idle = read_sentinel(self.sentinel)
+        self.assertEqual(idle["suspects"], {})
+        self.assertEqual(idle.get("consumedRetries"), ["module:alpha"])
 
     def test_retry_is_consumed_once_a_persistent_retry_cannot_loop(self) -> None:
         # F1 (codex): a retry left in the manifest must be honored EXACTLY once.
@@ -278,7 +291,14 @@ class PluginCrashContainmentScaffoldTest(unittest.TestCase):
         # Boot 1: suspicion cleared (retry honored) and recorded consumed.
         write_sentinel(self.sentinel, "idle", suspects={"module:alpha": "crash"})
         first = self._report("--plugin-load-sentinel", str(self.sentinel))
-        self.assertEqual(self._by_ref(first)["module:alpha"]["lifecycle"], "discovered")
+        alpha_first = self._by_ref(first)["module:alpha"]
+        # Both lanes: the grant produced an ATTEMPT, not a suspicion refusal.
+        self.assertNotEqual(alpha_first["lifecycle"], "excluded")
+        self.assertNotEqual(alpha_first["reasonDetail"], "crash-suspected")
+        if first["mode"] == "scaffold":
+            self.assertEqual(alpha_first["lifecycle"], "discovered")
+        else:
+            self.assertEqual(alpha_first["lifecycle"], "load_failed")
         idle = read_sentinel(self.sentinel)
         self.assertEqual(idle.get("consumedRetries"), ["module:alpha"])
         # Simulate the retried module crashing again (loading record left behind).
