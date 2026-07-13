@@ -1636,7 +1636,8 @@ public:
     auto obs_it = obs_sources_.find(source_id);
     if (obs_it == obs_sources_.end()) return rpc_error_result(-32603, "libobs source unavailable");
     obs_source_frame *frame = nullptr;
-    for (int attempt = 0; attempt < 40 && !frame; ++attempt) {
+    // 100 x 50ms: CI runners tick the offscreen video thread slowly under load.
+    for (int attempt = 0; attempt < 100 && !frame; ++attempt) {
       frame = obs_source_get_frame(obs_it->second);
       if (!frame) std::this_thread::sleep_for(std::chrono::milliseconds(50));
     }
@@ -2114,6 +2115,11 @@ private:
     obs_source_t *source = obs_source_create(model.kind.c_str(), model.id.c_str(), settings, nullptr);
     obs_data_release(settings);
     if (!source) return false;
+
+    // Unbuffered async: promote the newest queued frame each tick without
+    // timestamp bookkeeping, so source.captureFrame observes test/plugin
+    // sources that emit synthetic timestamps.
+    obs_source_set_async_unbuffered(source, true);
 
     obs_sources_[model.id] = source;
     obs_sceneitem_t *item = obs_scene_add(scene->second, source);

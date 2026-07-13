@@ -405,6 +405,7 @@ class UserPluginLoadingLibobsTest(unittest.TestCase):
 
         # Real async frame: deterministic pattern derived from the settings.
         cap1 = host.rpc(sock, 9404, "source.captureFrame", {"sourceId": "slice-src"})
+        self.assertIn("result", cap1, msg=f"captureFrame errored: {json.dumps(cap1)}")
         self.assertTrue(cap1["result"]["ok"])
         self.assertEqual(cap1["result"]["renderer"], "libobs-async-frame")
         self.assertEqual(cap1["result"]["format"], "bgra")
