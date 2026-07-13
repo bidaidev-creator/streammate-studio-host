@@ -254,7 +254,23 @@ class UserPluginLoadingPlanTest(unittest.TestCase):
         # Mono contract (StudioPluginModuleRecord.fileName): bare bundle or
         # library file name, never a relative path with separators.
         build_legacy(self.root1, "legacy-mod", thin_macho64(HOST_CPU), subdir="nested")
-        process, port, _ = host.start_host("--user-plugins-manifest", str(self.manifest))
+        # The OBS fixture and STREAMMATE_HOME ride the env-only launch
+        # contract (mirrors the Station harness: no config path in payloads).
+        color = 0xFFFF8020
+        obs_dir = host.write_obs_fixture(self.base)
+        scenes_path = obs_dir / "basic" / "scenes" / "fixture-main.json"
+        scenes = json.loads(scenes_path.read_text(encoding="utf-8"))
+        scenes["sources"].append({"name": "Slice Plugin Source", "id": "streammate_test_source",
+                                  "settings": {"color": color}})
+        scenes["sources"].append({"name": "Slice Plugin Filter", "id": "streammate_test_filter"})
+        scenes_path.write_text(json.dumps(scenes, indent=2) + "\n", encoding="utf-8")
+        home_dir = self.base / "streammate-home"
+        home_dir.mkdir(parents=True, exist_ok=True)
+
+        process, port, _ = host.start_host(
+            "--user-plugins-manifest", str(self.manifest),
+            env={"STREAMMATE_HOME": str(home_dir), "STREAMMATE_OBS_CONFIG_DIR": str(obs_dir)},
+        )
         self.addCleanup(host.stop_process, process)
         sock = host.websocket_connect(port)
         self.addCleanup(sock.close)
@@ -374,7 +390,23 @@ class UserPluginLoadingLibobsTest(unittest.TestCase):
         """NIF-V1: plugin-kind instantiation, real frame capture, generic
         production actions, and mapped_plugin import classification against
         the packaged HAS_LIBOBS host."""
-        process, port, _ = host.start_host("--user-plugins-manifest", str(self.manifest))
+        # The OBS fixture and STREAMMATE_HOME ride the env-only launch
+        # contract (mirrors the Station harness: no config path in payloads).
+        color = 0xFFFF8020
+        obs_dir = host.write_obs_fixture(self.base)
+        scenes_path = obs_dir / "basic" / "scenes" / "fixture-main.json"
+        scenes = json.loads(scenes_path.read_text(encoding="utf-8"))
+        scenes["sources"].append({"name": "Slice Plugin Source", "id": "streammate_test_source",
+                                  "settings": {"color": color}})
+        scenes["sources"].append({"name": "Slice Plugin Filter", "id": "streammate_test_filter"})
+        scenes_path.write_text(json.dumps(scenes, indent=2) + "\n", encoding="utf-8")
+        home_dir = self.base / "streammate-home"
+        home_dir.mkdir(parents=True, exist_ok=True)
+
+        process, port, _ = host.start_host(
+            "--user-plugins-manifest", str(self.manifest),
+            env={"STREAMMATE_HOME": str(home_dir), "STREAMMATE_OBS_CONFIG_DIR": str(obs_dir)},
+        )
         self.addCleanup(host.stop_process, process)
         sock = host.websocket_connect(port)
         self.addCleanup(sock.close)
@@ -386,7 +418,6 @@ class UserPluginLoadingLibobsTest(unittest.TestCase):
 
         # Instantiate the plugin source WITH settings and the plugin filter
         # attached — no placeholder path exists for plugin kinds.
-        color = 0xFFFF8020
         created = host.rpc(
             sock,
             9403,
@@ -440,17 +471,12 @@ class UserPluginLoadingLibobsTest(unittest.TestCase):
 
         # Import classification: a collection whose source type is registered
         # by a LOADED user plugin maps as mapped_plugin (no placeholder).
-        obs_dir = host.write_obs_fixture(self.base)
-        scenes_path = obs_dir / "basic" / "scenes" / "fixture-main.json"
-        scenes = json.loads(scenes_path.read_text(encoding="utf-8"))
-        scenes["sources"].append({"name": "Slice Plugin Source", "id": "streammate_test_source",
-                                  "settings": {"color": color}})
-        scenes["sources"].append({"name": "Slice Plugin Filter", "id": "streammate_test_filter"})
-        scenes_path.write_text(json.dumps(scenes, indent=2) + "\n", encoding="utf-8")
-
-        scan = host.rpc(sock, 9411, "import.scan", {"configDir": str(obs_dir)})
+        scan = host.rpc(sock, 9411, "import.scan", {})
+        self.assertIn("result", scan, msg=f"import.scan errored: {json.dumps(scan)}")
         collection_id = scan["result"]["collections"][0]["collectionId"]
-        report = host.rpc(sock, 9412, "import.load", {"collectionId": collection_id})["result"]["report"]
+        loaded_report = host.rpc(sock, 9412, "import.load", {"collectionId": collection_id})
+        self.assertIn("result", loaded_report, msg=f"import.load errored: {json.dumps(loaded_report)}")
+        report = loaded_report["result"]["report"]
         mapped_by_module = {item.get("moduleName"): item for item in report["mapped"]}
         self.assertIn("streammate_test_source", mapped_by_module)
         self.assertEqual(mapped_by_module["streammate_test_source"]["reason"], "mapped_plugin")
