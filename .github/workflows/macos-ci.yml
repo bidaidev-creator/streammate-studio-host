@@ -164,7 +164,7 @@ jobs:
       # loads-but-registers-nothing fixture + the instance+render probe smoke.
       # No `|| true` — all three modules and the smoke MUST compile.
       - name: Build user-plugin test modules and probe smoke
-        run: cmake --build build/host --target streammate-test-source streammate-test-filter streammate-test-noop user-plugin-module-smoke
+        run: cmake --build build/host --target streammate-test-source streammate-test-filter streammate-test-noop streammate-test-crash streammate-test-hang user-plugin-module-smoke
 
       # The `compatible` matrix row for NIF-H2: instance creation from
       # preserved settings + a render probe through a real offscreen video
@@ -229,6 +229,21 @@ jobs:
           STREAMMATE_DEP_MISSING_PLUGIN="$depmiss" \
           STREAMMATE_NOEXPORTS_DYLIB="$PWD/dist/StreamMateStudioHost.app/Contents/Frameworks/libobs-opengl.dylib" \
           python3 tests/integration/test_user_plugin_loading.py \
+            dist/StreamMateStudioHost.app/Contents/MacOS/studio-host
+
+      # Spec 39 / NIF-H3: REAL crash/hang containment — the seeded crashing
+      # module aborts a packaged-host boot mid-load (sentinel attribution),
+      # the hanging module trips the load watchdog (deadline-exceeded sentinel
+      # + bounded exit 65), later boots refuse both suspects while the
+      # UNRELATED test-source module still loads, retry grants exactly one
+      # fresh attempt, and the user plugin roots stay byte-identical.
+      - name: Run seeded crash/hang containment end-to-end against packaged app
+        run: |
+          STREAMMATE_EXPECT_LIBOBS=1 \
+          STREAMMATE_TEST_SOURCE_PLUGIN="$PWD/build/host/streammate-test-source.plugin" \
+          STREAMMATE_TEST_CRASH_PLUGIN="$PWD/build/host/streammate-test-crash.plugin" \
+          STREAMMATE_TEST_HANG_PLUGIN="$PWD/build/host/streammate-test-hang.plugin" \
+          python3 tests/integration/test_plugin_crash_containment.py \
             dist/StreamMateStudioHost.app/Contents/MacOS/studio-host
 
       - name: Verify inside-out ad-hoc signature before upload

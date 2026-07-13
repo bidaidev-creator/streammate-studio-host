@@ -109,7 +109,9 @@ if(STREAMMATE_REQUIRE_LIBOBS)
   # probe smoke. These MODULE bundles are NEVER staged into the app bundle's
   # Contents/PlugIns/obs-plugins: they ship in the CI artifact's test-plugins/
   # dir and load only through the --user-plugins-manifest path.
-  foreach(test_module streammate-test-source streammate-test-filter streammate-test-noop)
+  # NIF-H3 adds the seeded crash/hang failure fixtures (containment CI proof).
+  foreach(test_module streammate-test-source streammate-test-filter streammate-test-noop
+          streammate-test-crash streammate-test-hang)
     string(REPLACE "-" "_" test_module_src "${test_module}")
     add_library(${test_module} MODULE src/obs_module/${test_module_src}_module.cpp)
     set_target_properties(${test_module} PROPERTIES
@@ -200,6 +202,13 @@ if(BUILD_TESTING)
   add_test(
     NAME plugin-slice-verbs
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_plugin_slice_verbs.py $<TARGET_FILE:studio-host>
+  )
+  # NIF-H3: bounded plugin failure containment — durable crash/hang
+  # attribution sentinel, retry grammar, watchdog deadline; scaffold lane
+  # proves the lane-agnostic suspicion/refusal/determinism contracts.
+  add_test(
+    NAME plugin-crash-containment
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_plugin_crash_containment.py $<TARGET_FILE:studio-host>
   )
   add_test(
     NAME macos-packaging

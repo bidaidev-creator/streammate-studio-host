@@ -31,6 +31,8 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <thread>
+#include <mutex>
+#include <condition_variable>
 #include <unistd.h>
 #include <vector>
 
@@ -55,6 +57,9 @@ namespace {
 constexpr const char *kVersion = STREAMMATE_STUDIO_HOST_VERSION;
 constexpr int kUsageExit = 64;
 constexpr int kRuntimeExit = 70;
+// NIF-H3: the plugin-load watchdog terminates a hung load with this code
+// after writing a deadline-exceeded sentinel (bounded, attributable exit).
+constexpr int kPluginWatchdogExit = 65;
 constexpr int kHeartbeatMs = 5000;
 constexpr int kMaxSceneItemPosition = 1000000;
 constexpr std::uintmax_t kMaxSceneCollectionBytes = 8 * 1024 * 1024;
@@ -97,6 +102,9 @@ struct Manifest {
   bool has_selected = false;         // "selected" present and non-null
   std::vector<std::string> selected; // reserved for NIF-H2 loading
   std::vector<std::string> exclude;
+  // NIF-H3: one-shot retry list — clears crash/hang suspicion for these refs
+  // for exactly this boot's load attempt.
+  std::vector<std::string> retry;
 };
 
 // Strict, self-contained scanner for the small v1 schema. The host's loose
@@ -435,6 +443,20 @@ inline ParseOutcome parse_manifest_text(const std::string &text) {
             return fail("malformed-json");
           }
         }
+      } else if (*key == "retry") {
+        // NIF-H3: same grammar as exclude; refs get one fresh load attempt
+        // even when the durable sentinel suspects them.
+        if (!scan.consume('[')) return fail("invalid-retry");
+        if (!scan.consume(']')) {
+          while (true) {
+            auto value = scan.string();
+            if (!value || !is_module_ref(*value)) return fail("invalid-retry");
+            manifest.retry.push_back(*value);
+            if (scan.consume(',')) continue;
+            if (scan.consume(']')) break;
+            return fail("malformed-json");
+          }
+        }
       } else if (!scan.skip_value()) {
         return fail("malformed-json");
       }
@@ -495,6 +517,13 @@ struct Options {
   bool allow_live_egress = false;
   // NIF-H1: parsed --user-plugins-manifest (absent arg = behavior unchanged).
   std::optional<user_plugins::Manifest> user_plugins;
+  // NIF-H3: crash/hang attribution sentinel + load watchdog deadline.
+  std::string plugin_sentinel_path;
+  int plugin_load_deadline_ms = 30000;
+  bool plugin_load_deadline_explicit = false;
+  // Resolved at parse time from the sentinel file + manifest retry list.
+  std::map<std::string, std::string> plugin_suspects;
+  std::set<std::string> plugin_consumed_retries;
 };
 
 std::string json_escape(const std::string &input) {
@@ -530,6 +559,219 @@ bool is_loopback_host(const std::string &host) {
   return host == "127.0.0.1" || host == "localhost" || host == "::1" || host == "[::1]";
 }
 
+
+// --- NIF-H3: plugin-load crash/hang attribution sentinel --------------------
+// The host writes {phase:"loading",moduleRef} before every user-module load
+// attempt and rewrites {phase:"idle"} once the load phase completes. A crash
+// mid-load leaves the loading record behind; the watchdog deadline writes
+// {phase:"deadline-exceeded"} before terminating the process
+// (kPluginWatchdogExit). Every later boot promotes the leftover record into
+// the durable `suspects` map and refuses those modules (state runtime_crash)
+// until the manifest retries or excludes them — bounded by construction: one
+// crash per module per explicit retry, never a restart loop.
+// N1 (opus, accepted): attribution is coarse per-load-window — a previously
+// loaded module's background thread crashing DURING a later module's load
+// window suspects the later module; inherent to the single sentinel record,
+// bounded (one boot) and retry-recoverable.
+// N5 (opus, accepted): the sentinel file assumes the single-supervisor
+// posture — two concurrent hosts sharing one install-dir sentinel could
+// interleave records; Station spawns one supervised host per install dir.
+namespace plugin_sentinel {
+
+constexpr std::uintmax_t kMaxSentinelBytes = 65536;
+// Suspects are bounded so the sentinel can never outgrow its own parser: a
+// setup with this many crash-attributed modules is pathological and refuses
+// startup deterministically rather than silently dropping attribution.
+constexpr std::size_t kMaxSuspects = 256;
+constexpr const char *kSchema = "plugin-load-sentinel.v1";
+
+struct State {
+  std::string phase = "idle";                  // idle | loading | deadline-exceeded
+  std::string module_ref;                      // set for loading/deadline-exceeded
+  std::map<std::string, std::string> suspects; // module ref -> "crash" | "hang"
+  // One-shot retry accounting: refs whose manifest retry has been honored.
+  // A spent retry never clears suspicion again; withdrawing the retry from
+  // the manifest resets the record (a re-added retry is a fresh grant).
+  std::set<std::string> consumed_retries;
+};
+
+inline std::string serialize(const State &state) {
+  std::ostringstream out;
+  out << "{\"schema\":\"" << kSchema << "\",\"phase\":\"" << json_escape(state.phase) << "\"";
+  if (!state.module_ref.empty()) {
+    out << ",\"moduleRef\":\"" << json_escape(state.module_ref) << "\"";
+  }
+  out << ",\"suspects\":{";
+  bool first = true;
+  for (const auto &entry : state.suspects) {
+    if (!first) out << ",";
+    first = false;
+    out << "\"" << json_escape(entry.first) << "\":\"" << json_escape(entry.second) << "\"";
+  }
+  out << "},\"consumedRetries\":[";
+  first = true;
+  for (const auto &ref : state.consumed_retries) {
+    if (!first) out << ",";
+    first = false;
+    out << "\"" << json_escape(ref) << "\"";
+  }
+  out << "]}";
+  return out.str();
+}
+
+// Atomic write (tmp + rename) so a crash can never leave a torn sentinel.
+// Fail-closed: callers must treat a false return as "attribution cannot be
+// persisted" and refuse the guarded action (codex F2 — never load a module
+// whose crash could not be pinned on it afterwards).
+inline bool write(const std::string &path, const State &state) {
+  const std::string tmp = path + ".tmp";
+  {
+    std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
+    if (!out) return false;
+    out << serialize(state);
+    out.flush();
+    if (!out.good()) return false;
+  }
+  std::error_code ec;
+  std::filesystem::rename(tmp, path, ec);
+  return !ec;
+}
+
+// Strict parse. Missing file => fresh idle state. Malformed content refuses
+// startup: a corrupt sentinel means attribution is unreliable, and guessing
+// would defeat the containment guarantee. The raw path is never leaked.
+inline State load_or_throw(const std::string &path) {
+  const std::string prefix = "invalid --plugin-load-sentinel: ";
+  State state;
+  std::error_code ec;
+  const bool present = std::filesystem::exists(path, ec);
+  if (ec) throw std::runtime_error(prefix + "unreadable-file");
+  if (!present) return state;
+  const std::uintmax_t size = std::filesystem::file_size(path, ec);
+  if (ec) throw std::runtime_error(prefix + "unreadable-file");
+  if (size > kMaxSentinelBytes) throw std::runtime_error(prefix + "sentinel-too-large");
+  std::ifstream in(path, std::ios::binary);
+  if (!in) throw std::runtime_error(prefix + "unreadable-file");
+  std::ostringstream buffer;
+  buffer << in.rdbuf();
+  const std::string text = buffer.str();
+  if (text.size() > kMaxSentinelBytes) throw std::runtime_error(prefix + "sentinel-too-large");
+
+  const auto fail = [&prefix]() { return std::runtime_error(prefix + "malformed-sentinel"); };
+  user_plugins::ManifestScanner scan(text);
+  bool saw_schema = false;
+  bool saw_phase = false;
+  if (!scan.consume('{')) throw fail();
+  if (!scan.consume('}')) {
+    std::set<std::string> seen;
+    while (true) {
+      auto key = scan.string();
+      if (!key) throw fail();
+      if (!seen.insert(*key).second) throw fail();
+      if (!scan.consume(':')) throw fail();
+      if (*key == "schema") {
+        auto value = scan.string();
+        if (!value || *value != kSchema) throw fail();
+        saw_schema = true;
+      } else if (*key == "phase") {
+        auto value = scan.string();
+        if (!value || (*value != "idle" && *value != "loading" && *value != "deadline-exceeded")) {
+          throw fail();
+        }
+        state.phase = *value;
+        saw_phase = true;
+      } else if (*key == "moduleRef") {
+        auto value = scan.string();
+        if (!value || !user_plugins::is_module_ref(*value)) throw fail();
+        state.module_ref = *value;
+      } else if (*key == "suspects") {
+        if (!scan.consume('{')) throw fail();
+        if (!scan.consume('}')) {
+          std::set<std::string> seen_refs;
+          while (true) {
+            auto ref = scan.string();
+            if (!ref || !user_plugins::is_module_ref(*ref)) throw fail();
+            if (!seen_refs.insert(*ref).second) throw fail();
+            if (!scan.consume(':')) throw fail();
+            auto kind = scan.string();
+            if (!kind || (*kind != "crash" && *kind != "hang")) throw fail();
+            if (state.suspects.size() >= kMaxSuspects) {
+              throw std::runtime_error(prefix + "suspects-overflow");
+            }
+            state.suspects[*ref] = *kind;
+            if (scan.consume(',')) continue;
+            if (scan.consume('}')) break;
+            throw fail();
+          }
+        }
+      } else if (*key == "consumedRetries") {
+        if (!scan.consume('[')) throw fail();
+        if (!scan.consume(']')) {
+          while (true) {
+            auto ref = scan.string();
+            if (!ref || !user_plugins::is_module_ref(*ref)) throw fail();
+            if (!state.consumed_retries.insert(*ref).second) throw fail();
+            if (scan.consume(',')) continue;
+            if (scan.consume(']')) break;
+            throw fail();
+          }
+        }
+      } else {
+        throw fail();
+      }
+      if (scan.consume(',')) continue;
+      if (scan.consume('}')) break;
+      throw fail();
+    }
+  }
+  if (!scan.eof()) throw fail();
+  if (!saw_schema || !saw_phase) throw fail();
+  if (state.phase != "idle" && state.module_ref.empty()) throw fail();
+  return state;
+}
+
+struct Resolution {
+  std::map<std::string, std::string> suspects;
+  std::set<std::string> consumed_retries;
+};
+
+// Promote a crash/deadline leftover into the durable suspects map, then apply
+// the manifest's retry list EXACTLY ONCE per grant (codex F1): a retry that
+// was already honored (consumedRetries) no longer clears suspicion, and a
+// retry withdrawn from the manifest resets its consumption record.
+inline Resolution resolve(const State &state, const std::vector<std::string> &retry) {
+  Resolution out;
+  out.suspects = state.suspects;
+  if (state.phase == "loading") {
+    out.suspects[state.module_ref] = "crash";
+  } else if (state.phase == "deadline-exceeded") {
+    out.suspects[state.module_ref] = "hang";
+  }
+  if (out.suspects.size() > kMaxSuspects) {
+    throw std::runtime_error("invalid --plugin-load-sentinel: suspects-overflow");
+  }
+  for (const auto &ref : retry) {
+    if (state.consumed_retries.count(ref) != 0) {
+      out.consumed_retries.insert(ref); // spent grant: suspicion stays
+      continue;
+    }
+    out.suspects.erase(ref); // fresh grant: one attempt, now consumed
+    out.consumed_retries.insert(ref);
+  }
+  return out;
+}
+
+} // namespace plugin_sentinel
+
+// Launch-resolved containment context (disabled => behavior unchanged).
+struct PluginContainment {
+  bool enabled = false;
+  std::string sentinel_path;
+  int deadline_ms = 30000;
+  std::map<std::string, std::string> suspects;   // post-retry, ref -> crash|hang
+  std::set<std::string> consumed_retries;        // one-shot retry accounting
+};
+
 Options parse_args(int argc, char **argv) {
   Options options;
   for (int i = 1; i < argc; ++i) {
@@ -557,6 +799,29 @@ Options parse_args(int argc, char **argv) {
       // Validated fail-closed at launch; a bad manifest refuses startup with
       // a sanitized reason code (never the raw path).
       options.user_plugins = user_plugins::load_or_throw(require_value("--user-plugins-manifest"));
+    } else if (arg == "--plugin-load-sentinel") {
+      // NIF-H3: durable crash/hang attribution sentinel (absolute path;
+      // parsed fail-closed below once the manifest is known).
+      const std::string value = require_value("--plugin-load-sentinel");
+      if (!user_plugins::is_absolute_manifest_path(value)) {
+        throw std::runtime_error("invalid --plugin-load-sentinel: not-absolute-path");
+      }
+      options.plugin_sentinel_path = value;
+    } else if (arg == "--plugin-load-deadline-ms") {
+      const std::string value = require_value("--plugin-load-deadline-ms");
+      int parsed = 0;
+      try {
+        std::size_t used = 0;
+        parsed = std::stoi(value, &used);
+        if (used != value.size()) parsed = 0;
+      } catch (...) {
+        parsed = 0;
+      }
+      if (parsed < 100 || parsed > 600000) {
+        throw std::runtime_error("invalid --plugin-load-deadline-ms: out-of-range");
+      }
+      options.plugin_load_deadline_ms = parsed;
+      options.plugin_load_deadline_explicit = true;
     } else if (arg == "--allow-live-egress") {
       // Q-122 defense-in-depth: a launch-time gate over the caller-supplied
       // allowLiveEgress JSON flag. Default off; both layers must assert before
@@ -567,6 +832,32 @@ Options parse_args(int argc, char **argv) {
     }
   }
 
+  if (!options.plugin_sentinel_path.empty() && !options.user_plugins) {
+    throw std::runtime_error("invalid --plugin-load-sentinel: requires-user-plugins-manifest");
+  }
+  if (options.plugin_load_deadline_explicit && options.plugin_sentinel_path.empty()) {
+    throw std::runtime_error("invalid --plugin-load-deadline-ms: requires-plugin-load-sentinel");
+  }
+  if (!options.plugin_sentinel_path.empty()) {
+    // Fail-closed at launch, exactly like the manifest itself: a corrupt
+    // sentinel refuses startup with a sanitized category (never the path).
+    const plugin_sentinel::State sentinel = plugin_sentinel::load_or_throw(options.plugin_sentinel_path);
+    const plugin_sentinel::Resolution resolved = plugin_sentinel::resolve(sentinel, options.user_plugins->retry);
+    options.plugin_suspects = resolved.suspects;
+    options.plugin_consumed_retries = resolved.consumed_retries;
+    // Writability probe (codex F2): if attribution cannot be persisted here,
+    // no load attempt may proceed — refuse startup, never fail open.
+    // N3 (opus, accepted): the retry grant is consumed at parse time, so a
+    // kill between parse and the load loop spends the grant without the
+    // attempt — safe: the per-attempt loading write re-suspects any real
+    // crash on whichever boot actually reaches the load.
+    plugin_sentinel::State probe;
+    probe.suspects = resolved.suspects;
+    probe.consumed_retries = resolved.consumed_retries;
+    if (!plugin_sentinel::write(options.plugin_sentinel_path, probe)) {
+      throw std::runtime_error("invalid --plugin-load-sentinel: sentinel-unwritable");
+    }
+  }
   if (options.token.empty()) {
     throw std::runtime_error("--token is required");
   }
@@ -597,11 +888,13 @@ std::string sha256_hex_of_bytes(const uint8_t *data, size_t size);
 std::string build_user_plugins_boot_report_json(
     const std::optional<user_plugins::Manifest> &manifest,
     const std::filesystem::path &bundle_plugins_dir,
-    UserPluginTypeMaps *out_types = nullptr);
+    UserPluginTypeMaps *out_types = nullptr,
+    const PluginContainment *containment = nullptr);
 
 class EngineLifecycle {
 public:
-  bool start(const std::optional<user_plugins::Manifest> &user_plugins_manifest) {
+  bool start(const std::optional<user_plugins::Manifest> &user_plugins_manifest,
+             const PluginContainment &containment = {}) {
 #if STREAMMATE_HAS_LIBOBS
     if (!obs_startup("en-US", nullptr, nullptr)) {
       return false;
@@ -617,13 +910,14 @@ public:
     // NIF-H2: user modules load PER-MODULE here — after the bundled modules,
     // before obs_post_load_modules(), so everything exists ahead of any
     // collection instantiation and post-load runs exactly once.
-    user_plugins_report_json_ =
-        build_user_plugins_boot_report_json(user_plugins_manifest, bundle_plugins_dir(), &user_plugin_types_);
+    user_plugins_report_json_ = build_user_plugins_boot_report_json(
+        user_plugins_manifest, bundle_plugins_dir(), &user_plugin_types_, &containment);
     obs_post_load_modules();
 #else
     // Scaffold lane: plan facts only, labeled mode:"scaffold" (never a
     // loading claim).
-    user_plugins_report_json_ = build_user_plugins_boot_report_json(user_plugins_manifest, {});
+    user_plugins_report_json_ =
+        build_user_plugins_boot_report_json(user_plugins_manifest, {}, nullptr, &containment);
 #endif
     started_ = true;
     return true;
@@ -3249,11 +3543,86 @@ void classify_failed_dlopen(const std::filesystem::path &binary, UserPluginRecor
   }
 }
 
+// NIF-H3: converts a hanging obs_open_module/obs_init_module into a bounded,
+// attributable exit — the deadline-exceeded sentinel is written first, then
+// the process terminates with kPluginWatchdogExit (no unbounded hang, and the
+// next boot refuses the culprit as hang-suspected).
+class PluginLoadWatchdog {
+public:
+  PluginLoadWatchdog(std::string sentinel_path, int deadline_ms,
+                     std::map<std::string, std::string> suspects,
+                     std::set<std::string> consumed_retries)
+      : sentinel_path_(std::move(sentinel_path)),
+        deadline_ms_(deadline_ms),
+        suspects_(std::move(suspects)),
+        consumed_retries_(std::move(consumed_retries)),
+        thread_([this] { run(); }) {}
+
+  ~PluginLoadWatchdog() {
+    {
+      std::lock_guard<std::mutex> lock(mutex_);
+      stop_ = true;
+    }
+    cv_.notify_all();
+    thread_.join();
+  }
+
+  void arm(const std::string &module_ref) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    module_ref_ = module_ref;
+    deadline_ = std::chrono::steady_clock::now() + std::chrono::milliseconds(deadline_ms_);
+    armed_ = true;
+  }
+
+  void disarm() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    armed_ = false;
+  }
+
+private:
+  void run() {
+    std::unique_lock<std::mutex> lock(mutex_);
+    while (!stop_) {
+      cv_.wait_for(lock, std::chrono::milliseconds(50));
+      if (stop_) return;
+      if (armed_ && std::chrono::steady_clock::now() > deadline_) {
+        plugin_sentinel::State state;
+        state.phase = "deadline-exceeded";
+        state.module_ref = module_ref_;
+        state.suspects = suspects_;
+        state.consumed_retries = consumed_retries_;
+        plugin_sentinel::write(sentinel_path_, state);
+        std::_Exit(kPluginWatchdogExit);
+      }
+    }
+  }
+
+  std::string sentinel_path_;
+  int deadline_ms_;
+  std::map<std::string, std::string> suspects_;
+  std::set<std::string> consumed_retries_;
+  std::mutex mutex_;
+  std::condition_variable cv_;
+  bool stop_ = false;
+  bool armed_ = false;
+  std::string module_ref_;
+  std::chrono::steady_clock::time_point deadline_;
+  std::thread thread_;
+};
+
 // Load each plan candidate per-module. MUST run between the bundled
 // obs_load_all_modules() and obs_post_load_modules(), so every user module
 // exists before any collection instantiation and post-load runs exactly once.
 void load_user_plugin_candidates(UserPluginLoadPlan &plan,
-                                 const std::filesystem::path &bundle_plugins_dir) {
+                                 const std::filesystem::path &bundle_plugins_dir,
+                                 const PluginContainment *containment = nullptr) {
+  const bool contained = containment != nullptr && containment->enabled;
+  std::optional<PluginLoadWatchdog> watchdog;
+  if (contained) {
+    watchdog.emplace(containment->sentinel_path, containment->deadline_ms,
+                     containment->suspects, containment->consumed_retries);
+  }
+
   const std::set<std::string> bundled = bundled_module_stems(bundle_plugins_dir);
   std::array<std::set<std::string>, 6> before = snapshot_registered_types();
 
@@ -3287,11 +3656,30 @@ void load_user_plugin_candidates(UserPluginLoadPlan &plan,
     }
 
     const char *data_path = source.data_dir.empty() ? nullptr : source.data_dir.c_str();
+    // NIF-H3: record the attempt BEFORE dlopen/init — a crash mid-load leaves
+    // this loading record behind and the next boot attributes it. If the
+    // record cannot be persisted, the attempt is REFUSED (codex F2): loading
+    // without attribution would reopen the unbounded-crash-loop hole.
+    if (contained) {
+      plugin_sentinel::State loading;
+      loading.phase = "loading";
+      loading.module_ref = record.module_ref;
+      loading.suspects = containment->suspects;
+      loading.consumed_retries = containment->consumed_retries;
+      if (!plugin_sentinel::write(containment->sentinel_path, loading)) {
+        record.lifecycle = "excluded";
+        record.reason_detail = "sentinel-write-failed";
+        continue;
+      }
+      watchdog->arm(record.module_ref);
+    }
     obs_module_t *module = nullptr;
     const int rc = obs_open_module(&module, source.binary.c_str(), data_path);
     if (rc == MODULE_SUCCESS) {
       record.observed_dependencies = true; // dlopen resolved every dependent library
-      if (!obs_init_module(module)) {
+      const bool init_ok = obs_init_module(module);
+      if (contained) watchdog->disarm();
+      if (!init_ok) {
         record.lifecycle = "load_failed";
         record.state = "module_load_failed";
         record.reason_detail = "module-init-failed";
@@ -3328,6 +3716,7 @@ void load_user_plugin_candidates(UserPluginLoadPlan &plan,
       continue;
     }
 
+    if (contained) watchdog->disarm();
     record.lifecycle = "load_failed";
     switch (rc) {
     case MODULE_MISSING_EXPORTS:
@@ -3356,13 +3745,35 @@ void load_user_plugin_candidates(UserPluginLoadPlan &plan,
 std::string build_user_plugins_boot_report_json(
     const std::optional<user_plugins::Manifest> &manifest,
     const std::filesystem::path &bundle_plugins_dir,
-    UserPluginTypeMaps *out_types) {
+    UserPluginTypeMaps *out_types,
+    const PluginContainment *containment) {
   if (!manifest) {
     return empty_user_plugins_report_json();
   }
   UserPluginLoadPlan plan = build_user_plugin_load_plan(*manifest);
+  // NIF-H3: durable crash/hang suspicion refuses the suspect BEFORE any load
+  // attempt, in both lanes, without touching any unrelated candidate.
+  // Manifest-excluded records never reached plan.candidates, so an explicit
+  // exclusion keeps its plain excluded record (exclude wins over suspicion).
+  const bool contained = containment != nullptr && containment->enabled;
+  if (contained && !containment->suspects.empty()) {
+    std::vector<std::size_t> kept;
+    kept.reserve(plan.candidates.size());
+    for (std::size_t index : plan.candidates) {
+      UserPluginRecord &record = plan.inventory.modules[index];
+      const auto suspect = containment->suspects.find(record.module_ref);
+      if (suspect == containment->suspects.end()) {
+        kept.push_back(index);
+        continue;
+      }
+      record.lifecycle = "excluded";
+      record.state = "runtime_crash";
+      record.reason_detail = suspect->second == "hang" ? "hang-suspected" : "crash-suspected";
+    }
+    plan.candidates = std::move(kept);
+  }
 #if STREAMMATE_HAS_LIBOBS
-  load_user_plugin_candidates(plan, bundle_plugins_dir);
+  load_user_plugin_candidates(plan, bundle_plugins_dir, containment);
   if (out_types) {
     // kRegisteredTypeKinds order: sources=0, filters=1. Only LOADED modules
     // contribute (a failed init's partial registrations are never credited).
@@ -3379,6 +3790,15 @@ std::string build_user_plugins_boot_report_json(
     plan.inventory.modules[index].reason_detail = "scaffold-not-loaded";
   }
 #endif
+  // NIF-H3: the load phase completed (trivially so in the scaffold lane) —
+  // rewrite the sentinel idle while KEEPING the durable suspects map, so a
+  // clean boot can never resurrect a crash-looping module.
+  if (contained) {
+    plugin_sentinel::State idle;
+    idle.suspects = containment->suspects;
+    idle.consumed_retries = containment->consumed_retries;
+    plugin_sentinel::write(containment->sentinel_path, idle);
+  }
   return user_plugins_report_json_from(plan.inventory);
 }
 
@@ -5295,8 +5715,16 @@ int main(int argc, char **argv) {
 
   try {
     Options options = parse_args(argc, argv);
+    PluginContainment containment;
+    if (!options.plugin_sentinel_path.empty()) {
+      containment.enabled = true;
+      containment.sentinel_path = options.plugin_sentinel_path;
+      containment.deadline_ms = options.plugin_load_deadline_ms;
+      containment.suspects = options.plugin_suspects;
+      containment.consumed_retries = options.plugin_consumed_retries;
+    }
     EngineLifecycle engine;
-    if (!engine.start(options.user_plugins)) {
+    if (!engine.start(options.user_plugins, containment)) {
       emit_log("error", "host.degraded", "engine startup failed");
       return kRuntimeExit;
     }
