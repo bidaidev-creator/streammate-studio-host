@@ -38,7 +38,7 @@ jobs:
         run: cmake -S . -B build/scaffold -G Ninja -DSTREAMMATE_REQUIRE_LIBOBS=OFF
 
       - name: Build scaffold host and smoke
-        run: cmake --build build/scaffold --target studio-host studio-host-smoke native-overlay-renderer-test
+        run: cmake --build build/scaffold --target studio-host studio-host-smoke native-overlay-renderer-test user-plugin-portability-test
 
       - name: Run scaffold smoke
         run: ./build/scaffold/studio-host-smoke
@@ -160,6 +160,23 @@ jobs:
           test -f "$module_bin"
           ./build/host/native-overlay-module-smoke "$module_bin" tests/unit/native_overlay_golden.txt
 
+      # Spec 39 / NIF-H2: the redistributable in-tree test plugins + the
+      # loads-but-registers-nothing fixture + the instance+render probe smoke.
+      # No `|| true` — all three modules and the smoke MUST compile.
+      - name: Build user-plugin test modules and probe smoke
+        run: cmake --build build/host --target streammate-test-source streammate-test-filter streammate-test-noop user-plugin-module-smoke
+
+      # The `compatible` matrix row for NIF-H2: instance creation from
+      # preserved settings + a render probe through a real offscreen video
+      # thread, for BOTH test plugins (load+registration alone never counts).
+      - name: Run user-plugin instance+render probe smoke
+        run: |
+          src_bin="build/host/streammate-test-source.plugin/Contents/MacOS/streammate-test-source"
+          flt_bin="build/host/streammate-test-filter.plugin/Contents/MacOS/streammate-test-filter"
+          test -f "$src_bin"
+          test -f "$flt_bin"
+          ./build/host/user-plugin-module-smoke "$src_bin" "$flt_bin" "$PWD/${{ steps.libobs.outputs.graphics_module }}"
+
       - name: Package ad-hoc-signed bundle and checksum manifest
         run: |
           packaging/macos/package-app.sh \
@@ -188,6 +205,30 @@ jobs:
           # only exist inside the packaged bundle), so the verb smoke runs against
           # the relocatable app exactly as an installed host would.
           python3 tests/integration/test_production_control_verbs.py \
+            dist/StreamMateStudioHost.app/Contents/MacOS/studio-host
+
+      # Spec 39 / NIF-H2: REAL user-plugin loading end-to-end — the packaged
+      # host loads the test plugins through the --user-plugins-manifest path
+      # (obs_open_module per module between bundled load and post-load) and
+      # plugins.report must show the registered-type deltas, every seeded
+      # refusal class, restart determinism, and byte-identical user roots.
+      - name: Run real user-plugin loading end-to-end against packaged app
+        run: |
+          depmiss="$RUNNER_TEMP/depmiss.plugin"
+          rm -rf "$depmiss"
+          cp -R build/host/streammate-test-source.plugin "$depmiss"
+          bin="$depmiss/Contents/MacOS/streammate-test-source"
+          dep="$(otool -L "$bin" | awk 'NR>1 && /libobs/ {print $1; exit}')"
+          test -n "$dep"
+          install_name_tool -change "$dep" /nonexistent/streammate-missing-dep.dylib "$bin"
+          codesign -s - -f "$bin"
+          STREAMMATE_EXPECT_LIBOBS=1 \
+          STREAMMATE_TEST_SOURCE_PLUGIN="$PWD/build/host/streammate-test-source.plugin" \
+          STREAMMATE_TEST_FILTER_PLUGIN="$PWD/build/host/streammate-test-filter.plugin" \
+          STREAMMATE_TEST_NOOP_PLUGIN="$PWD/build/host/streammate-test-noop.plugin" \
+          STREAMMATE_DEP_MISSING_PLUGIN="$depmiss" \
+          STREAMMATE_NOEXPORTS_DYLIB="$PWD/dist/StreamMateStudioHost.app/Contents/Frameworks/libobs-opengl.dylib" \
+          python3 tests/integration/test_user_plugin_loading.py \
             dist/StreamMateStudioHost.app/Contents/MacOS/studio-host
 
       - name: Verify inside-out ad-hoc signature before upload
@@ -229,6 +270,16 @@ jobs:
           # same build tree must produce byte-identical manifests.
           diff dist/sha256-manifest.txt dist-repack/sha256-manifest.txt
           rm -rf dist-repack
+
+      # Spec 39 / NIF-H2: the artifact ships the test plugins OUTSIDE the app
+      # bundle (test-plugins/, never Contents/PlugIns/obs-plugins) so local
+      # NIF-V1 slices can exercise the real user-plugin loading path.
+      - name: Stage redistributable test plugins into the artifact
+        run: |
+          mkdir -p dist/test-plugins
+          cp -R build/host/streammate-test-source.plugin dist/test-plugins/
+          cp -R build/host/streammate-test-filter.plugin dist/test-plugins/
+          cp -R build/host/streammate-test-noop.plugin dist/test-plugins/
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

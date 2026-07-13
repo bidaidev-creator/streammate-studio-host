@@ -239,7 +239,8 @@ class PluginDiscoveryTest(unittest.TestCase):
 
         alpha = by_key[("module:alpha", "root:0")]
         self.assertEqual(alpha["label"], "alpha")
-        self.assertEqual(alpha["fileName"], "alpha.plugin/Contents/MacOS/alpha")
+        # Bare bundle name (mono contract: fileName never carries separators).
+        self.assertEqual(alpha["fileName"], "alpha.plugin")
         self.assertEqual(alpha["lifecycle"], "discovered")
         self.assertEqual(alpha["sha256"], sha256_of(self.alpha_bin))
         if IS_MACOS:
@@ -256,7 +257,7 @@ class PluginDiscoveryTest(unittest.TestCase):
 
         legacy = by_key[("module:legacy-mod", "root:0")]
         self.assertEqual(legacy["lifecycle"], "discovered")
-        self.assertEqual(legacy["fileName"], "legacy-mod/bin/nested/legacy-mod.so")
+        self.assertEqual(legacy["fileName"], "legacy-mod.so")
         # Universal binary: slices reported in fat-file order.
         self.assertEqual(legacy["arch"], ["x86_64", "arm64"])
         self.assertEqual(legacy["sha256"], sha256_of(self.legacy_bin))
@@ -406,13 +407,22 @@ class PluginDiscoveryTest(unittest.TestCase):
         self.assertIn("plugins.discover", commands)
         self.assertIn("plugins.report", commands)
 
-    def test_plugins_report_is_honestly_empty_before_nif_h2(self) -> None:
-        # Pins the wire contract only: no module has been loaded, so no
-        # loaded-module record may be fabricated.
+    def test_plugins_report_carries_plan_records_never_fabricated_loads(self) -> None:
+        # NIF-H2 superseded the empty pin: the report now carries the boot
+        # plan/load records. In the scaffold lane nothing may EVER claim a
+        # load happened (full loading assertions live in
+        # test_user_plugin_loading.py).
         sock = self._connect("--user-plugins-manifest", str(self.manifest))
         report = host.rpc(sock, 1, "plugins.report", {})["result"]
         self.assertIn(report["mode"], ("scaffold", "libobs"))
-        self.assertEqual(report, {"ok": True, "mode": report["mode"], "modules": []})
+        self.assertEqual(
+            {m["moduleRef"] for m in report["modules"]},
+            {"module:alpha", "module:excluded-mod", "module:legacy-mod", "module:intel-only"},
+        )
+        if report["mode"] == "scaffold":
+            for module in report["modules"]:
+                self.assertNotIn(module["lifecycle"], ("loaded", "load_failed"))
+                self.assertNotIn("registeredTypes", module)
 
     # -- launch refusals ---------------------------------------------------
 

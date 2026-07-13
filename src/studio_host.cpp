@@ -35,6 +35,7 @@
 #include <vector>
 
 #include "native_overlay_renderer.h"
+#include "user_plugin_portability.h"
 
 #if defined(__APPLE__)
 #include <CoreGraphics/CoreGraphics.h>
@@ -44,6 +45,7 @@
 #endif
 
 #if STREAMMATE_HAS_LIBOBS
+#include <dlfcn.h>
 #include <obs.h>
 #include <callback/calldata.h>
 #include <callback/proc.h>
@@ -574,9 +576,17 @@ Options parse_args(int argc, char **argv) {
   return options;
 }
 
+// NIF-H2: boot-frozen user-plugin load report (defined with the user-plugin
+// machinery below; the libobs lane performs the real per-module loading).
+// bundle_plugins_dir feeds the duplicate_of_bundled collision set (empty in
+// the scaffold lane / non-packaged binaries).
+std::string build_user_plugins_boot_report_json(
+    const std::optional<user_plugins::Manifest> &manifest,
+    const std::filesystem::path &bundle_plugins_dir);
+
 class EngineLifecycle {
 public:
-  bool start() {
+  bool start(const std::optional<user_plugins::Manifest> &user_plugins_manifest) {
 #if STREAMMATE_HAS_LIBOBS
     if (!obs_startup("en-US", nullptr, nullptr)) {
       return false;
@@ -589,11 +599,23 @@ public:
       return false;
     }
     obs_load_all_modules();
+    // NIF-H2: user modules load PER-MODULE here — after the bundled modules,
+    // before obs_post_load_modules(), so everything exists ahead of any
+    // collection instantiation and post-load runs exactly once.
+    user_plugins_report_json_ =
+        build_user_plugins_boot_report_json(user_plugins_manifest, bundle_plugins_dir());
     obs_post_load_modules();
+#else
+    // Scaffold lane: plan facts only, labeled mode:"scaffold" (never a
+    // loading claim).
+    user_plugins_report_json_ = build_user_plugins_boot_report_json(user_plugins_manifest, {});
 #endif
     started_ = true;
     return true;
   }
+
+  // Boot-frozen: byte-identical for every plugins.report request this boot.
+  const std::string &user_plugins_report_json() const { return user_plugins_report_json_; }
 
   void shutdown() {
     if (!started_) {
@@ -627,14 +649,24 @@ private:
 #endif
   }
 
-  static void add_bundle_module_path() {
+  // The packaged app's bundled-module directory (empty for raw builds) —
+  // also the duplicate_of_bundled collision inventory for user loading.
+  static std::filesystem::path bundle_plugins_dir() {
     auto executable = executable_path();
     if (!executable) {
-      return;
+      return {};
     }
     std::filesystem::path contents = executable->parent_path().parent_path();
     std::filesystem::path plugins = contents / "PlugIns" / "obs-plugins";
     if (!std::filesystem::is_directory(plugins)) {
+      return {};
+    }
+    return plugins;
+  }
+
+  static void add_bundle_module_path() {
+    std::filesystem::path plugins = bundle_plugins_dir();
+    if (plugins.empty()) {
       return;
     }
     std::string binary_pattern = (plugins / "%module%.plugin" / "Contents" / "MacOS").string();
@@ -669,6 +701,7 @@ private:
 #endif
 
   bool started_ = false;
+  std::string user_plugins_report_json_;
 };
 
 class StateFile {
@@ -2527,8 +2560,9 @@ UserPluginBinaryProbe probe_user_plugin_binary(const std::filesystem::path &path
 struct UserPluginCandidate {
   std::string name;              // protocol-safe module name
   std::filesystem::path binary;  // absolute path to the module binary
-  std::string relative;          // binary path relative to its manifest root
+  std::string relative;          // bare bundle/library file name (mono contract)
   bool confined = false;         // not a symlink AND canonical path stays in the root
+  bool bundle = false;           // CFBundle layout (data dir = Contents/Resources)
 };
 
 // Symlink confinement: a candidate binary must itself be a real regular file
@@ -2596,6 +2630,10 @@ struct UserPluginRootScan {
   bool truncated = false; // a walk bound was hit; the scan stopped deterministically
 };
 
+// The six registered-type kinds, in the mono contract's pinned key order.
+constexpr std::array<const char *, 6> kRegisteredTypeKinds = {
+    "sources", "filters", "transitions", "outputs", "encoders", "services"};
+
 struct UserPluginRecord {
   std::string module_ref;
   std::string label;
@@ -2606,6 +2644,12 @@ struct UserPluginRecord {
   bool observed_arch = false;
   std::string lifecycle;
   std::string reason_detail; // empty => null on the wire
+  // NIF-H2 plan/load facts. Defaults preserve the NIF-H1 discover shape
+  // (state null, dependencies unobserved, no registeredTypes field).
+  std::string state; // empty => null on the wire
+  bool observed_dependencies = false;
+  bool has_registered_types = false;
+  std::array<std::vector<std::string>, 6> registered_types; // kRegisteredTypeKinds order
 };
 
 struct UserPluginRootSummary {
@@ -2655,7 +2699,8 @@ UserPluginRootScan scan_user_plugin_root(const std::filesystem::path &root) {
       // is_regular_file follows symlinks on purpose: a symlinked binary must
       // become a candidate so confinement can refuse it with a visible record.
       if (std::filesystem::is_regular_file(binary, entry_ec) && !entry_ec) {
-        candidate = UserPluginCandidate{name, binary, entry_name + "/Contents/MacOS/" + name, false};
+        // fileName is the BARE bundle name (mono contract: no separators).
+        candidate = UserPluginCandidate{name, binary, entry_name, false, true};
       }
     } else {
       const std::string &name = entry_name;
@@ -2668,8 +2713,8 @@ UserPluginRootScan scan_user_plugin_root(const std::filesystem::path &root) {
       if (scan.truncated) break;
       if (!matches.empty()) {
         const std::filesystem::path &binary = matches.front(); // already sorted per level
-        candidate = UserPluginCandidate{name, binary, binary.lexically_relative(root).generic_string(),
-                                        false};
+        // fileName is the BARE library name (mono contract: no separators).
+        candidate = UserPluginCandidate{name, binary, binary.filename().string(), false, false};
       }
     }
     if (!candidate) continue;
@@ -2683,7 +2728,15 @@ UserPluginRootScan scan_user_plugin_root(const std::filesystem::path &root) {
   return scan;
 }
 
-UserPluginInventory build_user_plugin_inventory(const user_plugins::Manifest &manifest) {
+// Per-module load-source facts kept OFF the wire (absolute paths) — parallel
+// to UserPluginInventory.modules when requested by the load planner.
+struct UserPluginModuleSource {
+  std::filesystem::path binary;
+  std::filesystem::path data_dir; // empty => no data path handed to libobs
+};
+
+UserPluginInventory build_user_plugin_inventory(const user_plugins::Manifest &manifest,
+                                                std::vector<UserPluginModuleSource> *sources_out = nullptr) {
   UserPluginInventory inventory;
   const std::set<std::string> excluded(manifest.exclude.begin(), manifest.exclude.end());
   std::set<std::string> seen;
@@ -2698,12 +2751,32 @@ UserPluginInventory build_user_plugin_inventory(const user_plugins::Manifest &ma
     }
     inventory.roots.push_back({root_ref, static_cast<int>(scan.candidates.size()), scan.truncated});
 
+    std::size_t ordinal = 0;
     for (const auto &candidate : scan.candidates) {
+      const std::size_t candidate_ordinal = ordinal++;
       UserPluginRecord record;
+      record.root_ref = root_ref;
+      // F2 (opus review): a name the host tolerates but the mono validator
+      // refuses (leading ._-/length > 120) must never form the wire ref.
+      // The candidate surfaces as a REFUSED record under a synthesized
+      // conforming ref — never silently dropped, never loaded, and its raw
+      // name is never disclosed on the wire.
+      if (!streammate::user_plugins::is_portable_module_name(candidate.name)) {
+        record.module_ref = "module:unportable-" + std::to_string(index) + "-" +
+                            std::to_string(candidate_ordinal);
+        record.label = "unportable-candidate";
+        record.file_name = "unportable";
+        record.lifecycle = "discovered";
+        record.reason_detail = "name-not-portable";
+        if (sources_out != nullptr) {
+          sources_out->push_back({});
+        }
+        inventory.modules.push_back(std::move(record));
+        continue;
+      }
       record.module_ref = "module:" + candidate.name;
       record.label = candidate.name;
       record.file_name = candidate.relative;
-      record.root_ref = root_ref;
       // Reason precedence (one category per record): symlink-refused >
       // unreadable-binary > binary-too-large > unreadable-macho-header.
       if (!candidate.confined) {
@@ -2731,6 +2804,16 @@ UserPluginInventory build_user_plugin_inventory(const user_plugins::Manifest &ma
       } else {
         record.lifecycle = "discovered";
       }
+      if (sources_out != nullptr) {
+        UserPluginModuleSource source;
+        source.binary = candidate.binary;
+        if (candidate.bundle) {
+          source.data_dir = candidate.binary.parent_path().parent_path() / "Resources";
+        } else if (!manifest.roots[index].data_dir.empty()) {
+          source.data_dir = std::filesystem::path(manifest.roots[index].data_dir) / candidate.name;
+        }
+        sources_out->push_back(std::move(source));
+      }
       inventory.modules.push_back(std::move(record));
     }
   }
@@ -2738,9 +2821,9 @@ UserPluginInventory build_user_plugin_inventory(const user_plugins::Manifest &ma
 }
 
 std::string user_plugin_record_json(const UserPluginRecord &record) {
-  // "state" stays null and observed.dependencies stays false until NIF-H2:
-  // nothing has been loaded and dependencies were NOT probed in this chunk.
-  return "{\"moduleRef\":\"" + json_escape(record.module_ref) +
+  // Discover keeps NIF-H1 defaults (state null, dependencies false, no
+  // registeredTypes); plugins.report records carry the plan/load facts.
+  std::string json = "{\"moduleRef\":\"" + json_escape(record.module_ref) +
          "\",\"label\":\"" + json_escape(record.label) +
          "\",\"fileName\":\"" + json_escape(record.file_name) +
          "\",\"rootRef\":\"" + json_escape(record.root_ref) +
@@ -2749,11 +2832,24 @@ std::string user_plugin_record_json(const UserPluginRecord &record) {
          (record.sha256.empty() ? std::string("null") : "\"" + json_escape(record.sha256) + "\"") +
          ",\"arch\":" + json_string_array(record.archs) +
          ",\"lifecycle\":\"" + json_escape(record.lifecycle) +
-         "\",\"state\":null,\"observed\":{\"arch\":" + (record.observed_arch ? "true" : "false") +
-         ",\"dependencies\":false},\"reasonDetail\":" +
+         "\",\"state\":" +
+         (record.state.empty() ? std::string("null") : "\"" + json_escape(record.state) + "\"") +
+         ",\"observed\":{\"arch\":" + (record.observed_arch ? "true" : "false") +
+         ",\"dependencies\":" + (record.observed_dependencies ? "true" : "false") +
+         "},\"reasonDetail\":" +
          (record.reason_detail.empty() ? std::string("null")
-                                       : "\"" + json_escape(record.reason_detail) + "\"") +
-         "}";
+                                       : "\"" + json_escape(record.reason_detail) + "\"");
+  if (record.has_registered_types) {
+    // The mono validator requires ALL six kinds when the field is present.
+    json += ",\"registeredTypes\":{";
+    for (std::size_t kind = 0; kind < kRegisteredTypeKinds.size(); ++kind) {
+      if (kind) json += ",";
+      json += "\"" + std::string(kRegisteredTypeKinds[kind]) + "\":" +
+              json_string_array(record.registered_types[kind]);
+    }
+    json += "}";
+  }
+  return json + "}";
 }
 
 std::string user_plugins_discover_json(const std::optional<user_plugins::Manifest> &manifest) {
@@ -2774,6 +2870,288 @@ std::string user_plugins_discover_json(const std::optional<user_plugins::Manifes
   }
   return "{\"ok\":true,\"mode\":\"" + std::string(kPluginHostMode) + "\",\"roots\":" + roots_json +
          "],\"modules\":" + modules_json + "]}";
+}
+
+// ---------------------------------------------------------------------------
+// NIF-H2: user-plugin LOAD plan + boot loading + boot-frozen plugins.report.
+//
+// The plan runs in BOTH lanes over static filesystem facts only:
+//   - a record refused at discovery (any reasonDetail) is never a candidate;
+//   - a wrong-arch record gets state "architecture_mismatch" (observed from
+//     the Mach-O header) and is never attempted, selected or not;
+//   - manifest `selected` gates candidacy (`not-selected` reason; selected
+//     null/absent means every discovered candidate in the given roots);
+//   - excluded / duplicate_in_roots lifecycles never load.
+// The libobs lane then loads each candidate per-module between the bundled
+// obs_load_all_modules() and obs_post_load_modules(); the scaffold lane
+// NEVER claims loading: candidates stay lifecycle "discovered" with
+// reasonDetail "scaffold-not-loaded" and no registeredTypes field ever
+// appears (mode:"scaffold" labels the whole payload non-real).
+// ---------------------------------------------------------------------------
+
+constexpr const char *kHostCpuArch =
+#if defined(__aarch64__) || defined(__arm64__)
+    "arm64";
+#elif defined(__x86_64__)
+    "x86_64";
+#else
+    "";
+#endif
+
+struct UserPluginLoadPlan {
+  UserPluginInventory inventory;
+  std::vector<UserPluginModuleSource> sources; // parallel to inventory.modules
+  std::vector<std::size_t> candidates;         // indices into inventory.modules
+};
+
+UserPluginLoadPlan build_user_plugin_load_plan(const user_plugins::Manifest &manifest) {
+  UserPluginLoadPlan plan;
+  plan.inventory = build_user_plugin_inventory(manifest, &plan.sources);
+  const std::set<std::string> selected(manifest.selected.begin(), manifest.selected.end());
+
+  for (std::size_t i = 0; i < plan.inventory.modules.size(); ++i) {
+    UserPluginRecord &record = plan.inventory.modules[i];
+    if (record.lifecycle != "discovered") continue;   // excluded / duplicate_in_roots
+    if (!record.reason_detail.empty()) continue;      // discovery refusal: never loadable
+    const bool arch_mismatch = record.observed_arch && kHostCpuArch[0] != '\0' &&
+                               std::find(record.archs.begin(), record.archs.end(),
+                                         std::string(kHostCpuArch)) == record.archs.end();
+    if (arch_mismatch) {
+      record.state = "architecture_mismatch"; // static observed fact, never attempted
+      continue;
+    }
+    if (manifest.has_selected && selected.count(record.module_ref) == 0) {
+      record.reason_detail = "not-selected";
+      continue;
+    }
+    plan.candidates.push_back(i);
+  }
+  return plan;
+}
+
+std::string user_plugins_report_json_from(const UserPluginInventory &inventory) {
+  std::string modules_json = "[";
+  for (std::size_t i = 0; i < inventory.modules.size(); ++i) {
+    if (i) modules_json += ",";
+    modules_json += user_plugin_record_json(inventory.modules[i]);
+  }
+  // No roots field: the pinned plugins.report shape (mono treats absent as []).
+  return "{\"ok\":true,\"mode\":\"" + std::string(kPluginHostMode) + "\",\"modules\":" +
+         modules_json + "]}";
+}
+
+std::string empty_user_plugins_report_json() {
+  return "{\"ok\":true,\"mode\":\"" + std::string(kPluginHostMode) + "\",\"modules\":[]}";
+}
+
+#if STREAMMATE_HAS_LIBOBS
+std::array<std::set<std::string>, 6> snapshot_registered_types() {
+  std::array<std::set<std::string>, 6> out;
+  const char *id = nullptr;
+  for (size_t i = 0; obs_enum_input_types(i, &id); ++i)
+    if (id != nullptr) out[0].insert(id);
+  for (size_t i = 0; obs_enum_filter_types(i, &id); ++i)
+    if (id != nullptr) out[1].insert(id);
+  for (size_t i = 0; obs_enum_transition_types(i, &id); ++i)
+    if (id != nullptr) out[2].insert(id);
+  for (size_t i = 0; obs_enum_output_types(i, &id); ++i)
+    if (id != nullptr) out[3].insert(id);
+  for (size_t i = 0; obs_enum_encoder_types(i, &id); ++i)
+    if (id != nullptr) out[4].insert(id);
+  for (size_t i = 0; obs_enum_service_types(i, &id); ++i)
+    if (id != nullptr) out[5].insert(id);
+  return out;
+}
+
+// Bundled-module stems ("mac-capture" from mac-capture.plugin etc.): the
+// UNION of (a) modules libobs actually opened (obs_enum_modules) and (b) the
+// app bundle's Contents/PlugIns/obs-plugins directory listing — a bundled
+// module that failed to open/init is absent from (a) but must still shadow a
+// same-named user module (bundled wins even when broken). A user module
+// colliding with either is refused (duplicate_of_bundled) before any dlopen.
+std::set<std::string> bundled_module_stems(const std::filesystem::path &bundle_plugins_dir) {
+  std::set<std::string> stems;
+  obs_enum_modules(
+      [](void *param, obs_module_t *module) {
+        const char *file = obs_get_module_file_name(module);
+        if (file == nullptr) return;
+        std::string stem = std::filesystem::path(file).stem().string();
+        if (!stem.empty()) static_cast<std::set<std::string> *>(param)->insert(std::move(stem));
+      },
+      &stems);
+  std::error_code ec;
+  if (!bundle_plugins_dir.empty() && std::filesystem::is_directory(bundle_plugins_dir, ec) && !ec) {
+    std::filesystem::directory_iterator it(bundle_plugins_dir, ec);
+    for (std::filesystem::directory_iterator end; !ec && it != end; it.increment(ec)) {
+      const std::filesystem::path entry = it->path();
+      if (entry.extension() == ".plugin") {
+        std::string stem = entry.stem().string();
+        if (!stem.empty()) stems.insert(std::move(stem));
+      }
+    }
+  }
+  return stems;
+}
+
+// Sanitized dlerror classification: NEVER the raw dlerror text (it embeds
+// absolute paths). "Library not loaded" appears ONLY when a dependent dylib
+// failed to resolve — a bare "image not found" also fires for a missing
+// CANDIDATE file, so it must not be treated as a dependency signal;
+// "architecture" => arch rejection at load. In the pinned libobs,
+// MODULE_FILE_NOT_FOUND is a deprecated alias of MODULE_FAILED_TO_OPEN (every
+// os_dlopen failure returns it), so ALL open failures route through here.
+void classify_failed_dlopen(const std::filesystem::path &binary, UserPluginRecord &record) {
+  std::error_code exists_ec;
+  if (!std::filesystem::exists(binary, exists_ec) || exists_ec) {
+    record.state = "module_load_failed";
+    record.reason_detail = "file-not-found";
+    return;
+  }
+  // Probe dlopen runs constructors if it unexpectedly succeeds; that only
+  // happens after obs_open_module already failed on the same path, so the
+  // side-effect window is accepted (the module was user-selected for load).
+  void *handle = dlopen(binary.c_str(), RTLD_LAZY | RTLD_LOCAL);
+  if (handle != nullptr) {
+    dlclose(handle);
+    record.state = "module_load_failed";
+    record.reason_detail = "dlopen-failed";
+    return;
+  }
+  const char *raw = dlerror();
+  const std::string text = raw != nullptr ? raw : "";
+  if (text.find("Library not loaded") != std::string::npos) {
+    record.state = "dependency_missing";
+    record.reason_detail = "library-not-loaded";
+    record.observed_dependencies = true; // the failure itself is an observed dependency fact
+  } else if (text.find("architecture") != std::string::npos) {
+    record.state = "architecture_mismatch";
+    record.reason_detail = "wrong-architecture";
+  } else {
+    record.state = "module_load_failed";
+    record.reason_detail = "dlopen-failed";
+  }
+}
+
+// Load each plan candidate per-module. MUST run between the bundled
+// obs_load_all_modules() and obs_post_load_modules(), so every user module
+// exists before any collection instantiation and post-load runs exactly once.
+void load_user_plugin_candidates(UserPluginLoadPlan &plan,
+                                 const std::filesystem::path &bundle_plugins_dir) {
+  const std::set<std::string> bundled = bundled_module_stems(bundle_plugins_dir);
+  std::array<std::set<std::string>, 6> before = snapshot_registered_types();
+
+  for (std::size_t index : plan.candidates) {
+    UserPluginRecord &record = plan.inventory.modules[index];
+    const UserPluginModuleSource &source = plan.sources[index];
+
+    // Stem comparison is deliberately case-sensitive: APFS defaults are
+    // case-insensitive, but libobs module ids are exact-match, and a
+    // case-variant name that survives here still fails obs_open_module.
+    if (bundled.count(record.label) != 0) {
+      record.lifecycle = "duplicate_of_bundled"; // bundled upstream wins, never dlopened
+      continue;
+    }
+
+    // Re-verify confinement at the load boundary: discovery hashed/probed the
+    // path earlier, and path-based checks are TOCTOU-bounded (accepted at the
+    // recorded threat model — the roots are the local user's own directories
+    // and the manifest is Station-authored). Re-checking here shrinks the
+    // window from discovery-to-load down to check-to-dlopen.
+    {
+      std::error_code canon_ec;
+      const std::filesystem::path parent_root =
+          std::filesystem::canonical(source.binary.parent_path(), canon_ec);
+      if (canon_ec || !user_plugin_binary_confined(source.binary, parent_root)) {
+        record.lifecycle = "load_failed";
+        record.state = "module_load_failed";
+        record.reason_detail = "symlink-refused";
+        continue;
+      }
+    }
+
+    const char *data_path = source.data_dir.empty() ? nullptr : source.data_dir.c_str();
+    obs_module_t *module = nullptr;
+    const int rc = obs_open_module(&module, source.binary.c_str(), data_path);
+    if (rc == MODULE_SUCCESS) {
+      record.observed_dependencies = true; // dlopen resolved every dependent library
+      if (!obs_init_module(module)) {
+        record.lifecycle = "load_failed";
+        record.state = "module_load_failed";
+        record.reason_detail = "module-init-failed";
+        // The module stays in libobs's list (no public API frees an
+        // init-failed module the way the internal loader does), so ROLL the
+        // snapshot: any types it registered before failing must not be
+        // credited to the next successful module.
+        before = snapshot_registered_types();
+        continue;
+      }
+      record.lifecycle = "loaded";
+      record.has_registered_types = true;
+      std::array<std::set<std::string>, 6> after = snapshot_registered_types();
+      bool any = false;
+      for (std::size_t kind = 0; kind < after.size(); ++kind) {
+        for (const std::string &type_id : after[kind]) {
+          // Only ids the mono STUDIO_PLUGIN_TYPE_ID_PATTERN accepts may be
+          // emitted (a single non-conforming id would fail-close the whole
+          // inventory downstream); non-conforming ids are dropped from the
+          // delta while the module still reports loaded honestly.
+          if (before[kind].count(type_id) == 0 &&
+              streammate::user_plugins::is_portable_type_id(type_id)) {
+            record.registered_types[kind].push_back(type_id);
+            any = true;
+          }
+        }
+      }
+      before = after;
+      // NEGATIVE ASSERTION (spec 39): load + registration alone is never
+      // "compatible" — state stays null; the instance+render probe smoke owns
+      // the derived verdict. A module registering NOTHING is the observed
+      // type_not_registered state.
+      if (!any) record.state = "type_not_registered";
+      continue;
+    }
+
+    record.lifecycle = "load_failed";
+    switch (rc) {
+    case MODULE_MISSING_EXPORTS:
+      record.state = "module_load_failed";
+      record.reason_detail = "missing-exports";
+      record.observed_dependencies = true;
+      break;
+    case MODULE_INCOMPATIBLE_VER:
+      record.state = "libobs_version_mismatch";
+      record.reason_detail = "incompatible-module-version";
+      record.observed_dependencies = true;
+      break;
+    default:
+      // MODULE_FAILED_TO_OPEN (== deprecated MODULE_FILE_NOT_FOUND) and
+      // MODULE_ERROR: classify via a sanitized probe dlopen.
+      classify_failed_dlopen(source.binary, record);
+      break;
+    }
+  }
+}
+#endif
+
+// Boot-frozen plugins.report payload. libobs lane: performs the real
+// per-module loading (call site: EngineLifecycle::start, between bundled
+// load and post-load). Scaffold lane: plan facts only, honestly labeled.
+std::string build_user_plugins_boot_report_json(
+    const std::optional<user_plugins::Manifest> &manifest,
+    const std::filesystem::path &bundle_plugins_dir) {
+  if (!manifest) {
+    return empty_user_plugins_report_json();
+  }
+  UserPluginLoadPlan plan = build_user_plugin_load_plan(*manifest);
+#if STREAMMATE_HAS_LIBOBS
+  load_user_plugin_candidates(plan, bundle_plugins_dir);
+#else
+  (void)bundle_plugins_dir;
+  for (std::size_t index : plan.candidates) {
+    plan.inventory.modules[index].reason_detail = "scaffold-not-loaded";
+  }
+#endif
+  return user_plugins_report_json_from(plan.inventory);
 }
 
 struct PromptSourceSummary {
@@ -4557,11 +4935,10 @@ private:
     add("plugins.discover", [this](int fd, const std::string &id, const std::string &) {
       send_text_frame(fd, rpc_result(id, user_plugins_discover_json(options_.user_plugins)));
     });
-    // Wire-contract pin only: nothing is loaded before NIF-H2, so the report
-    // is honestly empty (never a fabricated loaded-module record).
+    // NIF-H2: the boot-frozen per-module load report (plan facts in scaffold,
+    // real per-module load outcomes + registered-type deltas under libobs).
     add("plugins.report", [this](int fd, const std::string &id, const std::string &) {
-      send_text_frame(fd, rpc_result(id, std::string("{\"ok\":true,\"mode\":\"") + kPluginHostMode +
-                                             "\",\"modules\":[]}"));
+      send_text_frame(fd, rpc_result(id, engine_.user_plugins_report_json()));
     });
     add("output.configure", [this](int fd, const std::string &id, const std::string &payload) {
       send_output_result(fd, id, output_.configure(payload));
@@ -4670,7 +5047,7 @@ int main(int argc, char **argv) {
   try {
     Options options = parse_args(argc, argv);
     EngineLifecycle engine;
-    if (!engine.start()) {
+    if (!engine.start(options.user_plugins)) {
       emit_log("error", "host.degraded", "engine startup failed");
       return kRuntimeExit;
     }

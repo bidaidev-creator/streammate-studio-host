@@ -103,6 +103,36 @@ if(STREAMMATE_REQUIRE_LIBOBS)
     set_target_properties(streammate-native-overlay PROPERTIES BUILD_RPATH "${STREAMMATE_STUDIO_HOST_RPATHS}")
     set_target_properties(native-overlay-module-smoke PROPERTIES BUILD_RPATH "${STREAMMATE_STUDIO_HOST_RPATHS}")
   endif()
+
+  # Spec 39 / NIF-H2 — redistributable in-tree TEST plugins (user-plugin load
+  # proof) + the loads-but-registers-nothing fixture + the instance+render
+  # probe smoke. These MODULE bundles are NEVER staged into the app bundle's
+  # Contents/PlugIns/obs-plugins: they ship in the CI artifact's test-plugins/
+  # dir and load only through the --user-plugins-manifest path.
+  foreach(test_module streammate-test-source streammate-test-filter streammate-test-noop)
+    string(REPLACE "-" "_" test_module_src "${test_module}")
+    add_library(${test_module} MODULE src/obs_module/${test_module_src}_module.cpp)
+    set_target_properties(${test_module} PROPERTIES
+      BUNDLE TRUE
+      BUNDLE_EXTENSION plugin
+      PREFIX ""
+      OUTPUT_NAME ${test_module}
+    )
+    target_compile_definitions(${test_module} PRIVATE STREAMMATE_HAS_LIBOBS=1)
+    target_include_directories(${test_module} PRIVATE ${STREAMMATE_OBS_INCLUDE_DIRS})
+    target_link_libraries(${test_module} PRIVATE "${STREAMMATE_OBS_LIBRARY}")
+    if(APPLE AND STREAMMATE_STUDIO_HOST_RPATHS)
+      set_target_properties(${test_module} PROPERTIES BUILD_RPATH "${STREAMMATE_STUDIO_HOST_RPATHS}")
+    endif()
+  endforeach()
+
+  add_executable(user-plugin-module-smoke src/obs_module/user_plugin_module_smoke.cpp)
+  target_compile_definitions(user-plugin-module-smoke PRIVATE STREAMMATE_HAS_LIBOBS=1)
+  target_include_directories(user-plugin-module-smoke PRIVATE ${STREAMMATE_OBS_INCLUDE_DIRS})
+  target_link_libraries(user-plugin-module-smoke PRIVATE "${STREAMMATE_OBS_LIBRARY}")
+  if(APPLE AND STREAMMATE_STUDIO_HOST_RPATHS)
+    set_target_properties(user-plugin-module-smoke PROPERTIES BUILD_RPATH "${STREAMMATE_STUDIO_HOST_RPATHS}")
+  endif()
 else()
   foreach(target studio-host studio-host-smoke)
     target_compile_definitions(${target} PRIVATE STREAMMATE_HAS_LIBOBS=0)
@@ -118,6 +148,15 @@ if(BUILD_TESTING)
   add_test(
     NAME native-overlay-renderer
     COMMAND native-overlay-renderer-test ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/native_overlay_golden.txt
+  )
+
+  # NIF-H2 (opus review F1/F2): the wire-portability predicates must mirror
+  # the mono validator's pinned patterns exactly.
+  add_executable(user-plugin-portability-test tests/unit/test_user_plugin_portability.cpp)
+  target_include_directories(user-plugin-portability-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  add_test(
+    NAME user-plugin-portability
+    COMMAND user-plugin-portability-test
   )
 
   add_test(
@@ -148,6 +187,12 @@ if(BUILD_TESTING)
   add_test(
     NAME plugin-discovery
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_plugin_discovery.py $<TARGET_FILE:studio-host>
+  )
+  # NIF-H2: real user-plugin loading plan/report honesty (scaffold lane) +
+  # static contracts for the in-tree test plugins and the CI loading lane.
+  add_test(
+    NAME user-plugin-loading
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_user_plugin_loading.py $<TARGET_FILE:studio-host>
   )
   add_test(
     NAME macos-packaging
