@@ -2593,6 +2593,11 @@ std::string path_stem_id(const std::filesystem::path &path) {
 struct ObsSourceEntry {
   std::string label;
   std::string module;
+  // NIF-M2: raw balanced `"settings":{...}` object body for this source, and
+  // its absolute byte offset in the collection JSON (npos when absent). Used
+  // for custody analysis only; never re-serialized.
+  std::string settings_raw;
+  size_t settings_offset = std::string::npos;
 };
 
 std::optional<uint32_t> json_hex_value(char c) {
@@ -2716,11 +2721,168 @@ void skip_json_whitespace(const std::string &json, size_t &pos) {
   while (pos < json.size() && std::isspace(static_cast<unsigned char>(json[pos]))) ++pos;
 }
 
+// NIF-M2: capture a balanced JSON object as its raw substring (string- and
+// escape-aware), advancing pos past it. Returns nullopt on malformed input.
+std::optional<std::string> capture_json_object_raw(const std::string &json, size_t &pos) {
+  if (pos >= json.size() || json[pos] != '{') return std::nullopt;
+  size_t start = pos;
+  int depth = 0;
+  bool in_string = false;
+  bool escaped = false;
+  for (; pos < json.size(); ++pos) {
+    char c = json[pos];
+    if (in_string) {
+      if (escaped) escaped = false;
+      else if (c == '\\') escaped = true;
+      else if (c == '"') in_string = false;
+      continue;
+    }
+    if (c == '"') in_string = true;
+    else if (c == '{') ++depth;
+    else if (c == '}') {
+      --depth;
+      if (depth == 0) {
+        ++pos;
+        return json.substr(start, pos - start);
+      }
+    }
+  }
+  return std::nullopt;
+}
+
+// NIF-M2: one top-level field of a source `settings` object. Offsets are
+// relative to the settings_raw string (value span includes string quotes).
+struct SettingsField {
+  std::string key;
+  bool is_string = false;
+  std::string string_value;
+  bool is_number = false;
+  double number_value = 0;
+  size_t value_offset = 0;
+  size_t value_length = 0;
+};
+
+std::vector<SettingsField> parse_settings_fields(const std::string &settings_raw) {
+  std::vector<SettingsField> fields;
+  if (settings_raw.empty() || settings_raw.front() != '{') return fields;
+  size_t pos = 1;
+  while (pos < settings_raw.size()) {
+    skip_json_whitespace(settings_raw, pos);
+    if (pos >= settings_raw.size() || settings_raw[pos] == '}') break;
+    if (settings_raw[pos] == ',') {
+      ++pos;
+      continue;
+    }
+    if (settings_raw[pos] != '"') break;
+    auto key = parse_json_string_token(settings_raw, pos);
+    if (!key) break;
+    skip_json_whitespace(settings_raw, pos);
+    if (pos >= settings_raw.size() || settings_raw[pos] != ':') break;
+    ++pos;
+    skip_json_whitespace(settings_raw, pos);
+    if (pos >= settings_raw.size()) break;
+    SettingsField field;
+    field.key = *key;
+    field.value_offset = pos;
+    char c = settings_raw[pos];
+    if (c == '"') {
+      auto value = parse_json_string_token(settings_raw, pos);
+      if (!value) break;
+      field.is_string = true;
+      field.string_value = *value;
+      field.value_length = pos - field.value_offset;
+    } else if (c == '{') {
+      if (!capture_json_object_raw(settings_raw, pos)) break;
+      field.value_length = pos - field.value_offset;
+    } else if (c == '[') {
+      int depth = 0;
+      bool in_string = false, escaped = false;
+      for (; pos < settings_raw.size(); ++pos) {
+        char a = settings_raw[pos];
+        if (in_string) {
+          if (escaped) escaped = false;
+          else if (a == '\\') escaped = true;
+          else if (a == '"') in_string = false;
+          continue;
+        }
+        if (a == '"') in_string = true;
+        else if (a == '[') ++depth;
+        else if (a == ']') {
+          --depth;
+          if (depth == 0) {
+            ++pos;
+            break;
+          }
+        }
+      }
+      field.value_length = pos - field.value_offset;
+    } else {
+      size_t start = pos;
+      while (pos < settings_raw.size() && settings_raw[pos] != ',' && settings_raw[pos] != '}' &&
+             !std::isspace(static_cast<unsigned char>(settings_raw[pos])))
+        ++pos;
+      std::string raw = settings_raw.substr(start, pos - start);
+      field.value_length = pos - field.value_offset;
+      if (!raw.empty() && (std::isdigit(static_cast<unsigned char>(raw[0])) || raw[0] == '-')) {
+        try {
+          field.number_value = std::stod(raw);
+          field.is_number = true;
+        } catch (...) {
+        }
+      }
+    }
+    fields.push_back(std::move(field));
+  }
+  return fields;
+}
+
+// NIF-M2 custody vocabularies. Upstream source ids at the OBS 32.x pin: a
+// module id in this set is an upstream capability gap (NIF-M3 parity work),
+// never a third-party plugin, so it must not fall into the missing_plugin
+// placeholder path. The pin is fixed by OBS_PIN, so the set cannot drift
+// silently.
+const std::set<std::string> &upstream_source_ids() {
+  static const std::set<std::string> ids = {
+      "scene",           "group",          "color_source",       "image_source",          "slideshow",
+      "browser_source",  "ffmpeg_source",  "vlc_source",         "text_ft2_source",       "text_gdiplus",
+      "av_capture_input", "coreaudio_input_capture", "coreaudio_output_capture", "screen_capture",
+      "display_capture", "window_capture", "sck_audio_capture",  "syphon-input",          "decklink-input",
+      "audio_line",      "wasapi_input_capture", "wasapi_output_capture", "dshow_input",  "game_capture",
+      "monitor_capture", "jack_output_capture",  "pulse_input_capture",   "pulse_output_capture",
+      "v4l2_input",      "xcomposite_input",     "xshm_input",            "alsa_input_capture"};
+  return ids;
+}
+
+// Credential-class settings keys (per the existing service-exclusion rules):
+// values are redacted in the WORKSPACE COPY and recorded by key name only.
+const std::set<std::string> &credential_settings_keys() {
+  static const std::set<std::string> keys = {"stream_key",   "password",     "token",        "api_key",
+                                             "apikey",       "secret",       "access_token", "refresh_token",
+                                             "bearer_token", "auth_token",   "service_key",  "credential"};
+  return keys;
+}
+
+// Settings keys whose string values reference on-disk assets
+// (shaders/LUTs/masks/fonts/media) subject to the resource map.
+const std::set<std::string> &asset_settings_keys() {
+  static const std::set<std::string> keys = {"file",      "local_file", "path",       "image_path", "lut_file",
+                                             "font_file", "media_file", "shader_file", "mask_file"};
+  return keys;
+}
+
+constexpr const char *kSettingsVersionMarkerKey = "plugin_settings_version";
+constexpr const char *kRedactionSentinel = "__streammate-redacted__";
+
 std::vector<ObsSourceEntry> parse_obs_source_entries(const std::string &json) {
   struct ObjectFields {
     std::string name;
     std::string id;
     bool emitted = false;
+    // NIF-M2: captured `"settings":{...}` body for this object (raw) plus
+    // its absolute offset, and the emitted entry index to patch on pop.
+    std::string settings_raw;
+    size_t settings_offset = std::string::npos;
+    size_t entry_index = std::string::npos;
   };
   std::vector<ObjectFields> stack;
   std::vector<ObsSourceEntry> entries;
@@ -2732,7 +2894,16 @@ std::vector<ObsSourceEntry> parse_obs_source_entries(const std::string &json) {
       continue;
     }
     if (c == '}') {
-      if (!stack.empty()) stack.pop_back();
+      if (!stack.empty()) {
+        // NIF-M2: patch settings captured after emission onto the entry.
+        ObjectFields &closing = stack.back();
+        if (closing.entry_index != std::string::npos && !closing.settings_raw.empty() &&
+            entries[closing.entry_index].settings_raw.empty()) {
+          entries[closing.entry_index].settings_raw = closing.settings_raw;
+          entries[closing.entry_index].settings_offset = closing.settings_offset;
+        }
+        stack.pop_back();
+      }
       ++pos;
       continue;
     }
@@ -2747,7 +2918,25 @@ std::vector<ObsSourceEntry> parse_obs_source_entries(const std::string &json) {
     if (pos >= json.size() || json[pos] != ':') continue;
     ++pos;
     skip_json_whitespace(json, pos);
-    if (pos >= json.size() || json[pos] != '"') continue;
+    if (pos >= json.size()) continue;
+    // NIF-M2: capture (and skip) the balanced settings object so nested
+    // plugin settings never masquerade as source objects, and custody
+    // analysis sees the raw per-source settings body.
+    if (*key == "settings" && json[pos] == '{' && !stack.empty()) {
+      size_t settings_offset = pos;
+      auto raw = capture_json_object_raw(json, pos);
+      if (raw) {
+        ObjectFields &owner = stack.back();
+        owner.settings_raw = *raw;
+        owner.settings_offset = settings_offset;
+        if (owner.entry_index != std::string::npos && entries[owner.entry_index].settings_raw.empty()) {
+          entries[owner.entry_index].settings_raw = *raw;
+          entries[owner.entry_index].settings_offset = settings_offset;
+        }
+      }
+      continue;
+    }
+    if (json[pos] != '"') continue;
     auto value = parse_json_string_token(json, pos);
     if (!value || stack.empty()) continue;
 
@@ -2761,6 +2950,11 @@ std::vector<ObsSourceEntry> parse_obs_source_entries(const std::string &json) {
       ObsSourceEntry entry{current.name, current.id};
       if (entries.empty() || entries.back().label != entry.label || entries.back().module != entry.module) {
         entries.push_back(entry);
+        current.entry_index = entries.size() - 1;
+        if (!current.settings_raw.empty()) {
+          entries.back().settings_raw = current.settings_raw;
+          entries.back().settings_offset = current.settings_offset;
+        }
       }
       current.emitted = true;
     }
@@ -3938,9 +4132,16 @@ public:
       return error(-32602, "scene collection exceeds import size limit");
     }
     try {
+      const std::string digest_before = config_tree_digest(*config);
+      const CustodyAnalysis analysis = analyze_custody(*config, json);
+      std::map<std::string, std::string> overrides;
+      if (!analysis.redactions.empty()) {
+        overrides[std::filesystem::relative(*collection, *config).generic_string()] = apply_redactions(json, analysis.redactions);
+      }
       std::filesystem::remove_all(temp);
-      copy_config_without_service_json(*config, temp);
-      write_import_map(temp, json);
+      copy_config_without_service_json(*config, temp, overrides.empty() ? nullptr : &overrides);
+      const std::string digest_after = config_tree_digest(*config);
+      write_import_map(temp, json, analysis, digest_before, digest_after);
       std::filesystem::remove_all(destination);
       std::filesystem::create_directories(destination.parent_path());
       std::filesystem::rename(temp, destination);
@@ -4174,7 +4375,8 @@ private:
     return std::nullopt;
   }
 
-  void copy_config_without_service_json(const std::filesystem::path &config, const std::filesystem::path &destination) const {
+  void copy_config_without_service_json(const std::filesystem::path &config, const std::filesystem::path &destination,
+                                        const std::map<std::string, std::string> *content_overrides = nullptr) const {
     std::filesystem::recursive_directory_iterator end;
     for (std::filesystem::recursive_directory_iterator it(config); it != end; ++it) {
       const auto &entry = *it;
@@ -4189,22 +4391,252 @@ private:
         std::filesystem::create_directories(target);
       } else if (entry.is_regular_file()) {
         std::filesystem::create_directories(target.parent_path());
+        // NIF-M2: the scene-collection copy is written with credential-class
+        // values redacted; every other byte is copied verbatim. The SOURCE
+        // file is never touched.
+        if (content_overrides) {
+          auto override_it = content_overrides->find(relative.generic_string());
+          if (override_it != content_overrides->end()) {
+            std::ofstream out(target, std::ios::binary);
+            out << override_it->second;
+            continue;
+          }
+        }
         std::filesystem::copy_file(entry.path(), target, std::filesystem::copy_options::overwrite_existing);
       }
     }
   }
 
-  void write_import_map(const std::filesystem::path &destination, const std::string &json) const {
+  // --- NIF-M2: settings/data/assets custody ---------------------------------
+
+  struct CustodyResource {
+    std::string source_id;
+    std::string settings_key;
+    std::string status; // copied | missing-resource | moved-candidate | external-resource | plugin-module
+    std::string workspace_path;
+    std::string candidate_path;
+    std::string remediation;
+    std::string module_ref;
+  };
+  struct CustodyRedaction {
+    std::string source_id;
+    std::string settings_key;
+    size_t absolute_offset = 0;
+    size_t length = 0;
+  };
+  struct CustodyMarker {
+    std::string source_id;
+    std::string settings_key;
+    double value = 0;
+  };
+  struct CustodyAnalysis {
+    std::vector<CustodyResource> resources;
+    std::vector<CustodyRedaction> redactions;
+    std::vector<CustodyMarker> markers;
+  };
+
+  // Optional numeric plugin-private version marker for an entry (nullopt when
+  // absent). Recorded in the map; a value != 1 degrades the source to
+  // settings_migration_required (fixture-level v1 convention: the honest
+  // seeded signal, not a vendor semantic).
+  static std::optional<double> settings_version_marker(const ObsSourceEntry &entry) {
+    if (entry.settings_raw.empty()) return std::nullopt;
+    for (const auto &field : parse_settings_fields(entry.settings_raw)) {
+      if (field.key == kSettingsVersionMarkerKey && field.is_number) return field.number_value;
+    }
+    return std::nullopt;
+  }
+
+  enum class PluginDisposition { none, mapped_source, mapped_filter, migration, missing };
+
+  // Classify a non-upstream (plugin-family) module entry. Upstream modules —
+  // including upstream capability gaps like coreaudio_output_capture or
+  // group — never enter the plugin paths (NIF-M3 parity work owns those).
+  PluginDisposition plugin_disposition(const ObsSourceEntry &entry) const {
+    if (entry.module.empty() || entry.module == "scene") return PluginDisposition::none;
+    if (upstream_source_ids().count(entry.module) > 0) return PluginDisposition::none;
+    const bool loaded_source = user_plugin_types_ && user_plugin_types_->sources.count(entry.module) > 0;
+    const bool loaded_filter = user_plugin_types_ && user_plugin_types_->filters.count(entry.module) > 0;
+    auto marker = settings_version_marker(entry);
+    if (marker && *marker != 1.0) return PluginDisposition::migration;
+    if (loaded_source) return PluginDisposition::mapped_source;
+    if (loaded_filter) return PluginDisposition::mapped_filter;
+    if (entry.module.find("filter") != std::string::npos) return PluginDisposition::none; // frontend-filter path
+    return PluginDisposition::missing;
+  }
+
+  CustodyResource classify_asset(const std::filesystem::path &config, const std::string &source_id,
+                                 const SettingsField &field) const {
+    CustodyResource resource;
+    resource.source_id = source_id;
+    resource.settings_key = field.key;
+    const std::string &value = field.string_value;
+    if (!value.empty() && value.front() == '/') {
+      resource.status = "external-resource";
+      resource.remediation = "asset lives outside the OBS config directory; relink it inside the imported workspace";
+      return resource;
+    }
+    if (value.empty() || value.find("..") != std::string::npos) {
+      resource.status = "missing-resource";
+      resource.remediation = "asset path escapes the OBS config directory; relink it inside the imported workspace";
+      return resource;
+    }
+    std::error_code ec;
+    if (std::filesystem::is_regular_file(std::filesystem::symlink_status(config / value, ec))) {
+      resource.status = "copied";
+      resource.workspace_path = value;
+      return resource;
+    }
+    const std::string basename = std::filesystem::path(value).filename().string();
+    std::vector<std::string> candidates;
+    std::filesystem::recursive_directory_iterator end;
+    for (std::filesystem::recursive_directory_iterator it(config, ec); it != end; ++it) {
+      if (std::filesystem::is_symlink(it->symlink_status())) {
+        it.disable_recursion_pending();
+        continue;
+      }
+      if (it->is_regular_file() && it->path().filename().string() == basename) {
+        candidates.push_back(std::filesystem::relative(it->path(), config).generic_string());
+      }
+    }
+    if (!candidates.empty()) {
+      std::sort(candidates.begin(), candidates.end());
+      resource.status = "moved-candidate";
+      resource.candidate_path = candidates.front();
+      resource.remediation = "same-named file found at the candidate path; relink the source to it";
+      return resource;
+    }
+    resource.status = "missing-resource";
+    resource.remediation = "place the file at " + value + " in the imported workspace or relink the source";
+    return resource;
+  }
+
+  CustodyAnalysis analyze_custody(const std::filesystem::path &config, const std::string &json) const {
+    CustodyAnalysis analysis;
+    for (const auto &entry : parse_obs_source_entries(json)) {
+      const std::string source_id = "source:" + entry.label;
+      if (!entry.settings_raw.empty()) {
+        for (const auto &field : parse_settings_fields(entry.settings_raw)) {
+          if (credential_settings_keys().count(field.key) > 0 && field.is_string) {
+            analysis.redactions.push_back(
+                {source_id, field.key, entry.settings_offset + field.value_offset, field.value_length});
+          } else if (field.key == kSettingsVersionMarkerKey && field.is_number) {
+            analysis.markers.push_back({source_id, field.key, field.number_value});
+          } else if (asset_settings_keys().count(field.key) > 0 && field.is_string) {
+            analysis.resources.push_back(classify_asset(config, source_id, field));
+          }
+        }
+      }
+      // Loaded-plugin data custody: record the backing module ref so
+      // deserialization can resolve the plugin's data directory.
+      const auto disposition = plugin_disposition(entry);
+      if (disposition == PluginDisposition::mapped_source || disposition == PluginDisposition::mapped_filter) {
+        const auto &map = disposition == PluginDisposition::mapped_source ? user_plugin_types_->sources
+                                                                          : user_plugin_types_->filters;
+        CustodyResource resource;
+        resource.source_id = source_id;
+        resource.settings_key = "__module__";
+        resource.status = "plugin-module";
+        resource.module_ref = map.at(entry.module);
+        analysis.resources.push_back(std::move(resource));
+      }
+    }
+    return analysis;
+  }
+
+  static std::string apply_redactions(const std::string &json, std::vector<CustodyRedaction> redactions) {
+    std::sort(redactions.begin(), redactions.end(),
+              [](const CustodyRedaction &a, const CustodyRedaction &b) { return a.absolute_offset > b.absolute_offset; });
+    std::string out = json;
+    const std::string replacement = std::string("\"") + kRedactionSentinel + "\"";
+    for (const auto &redaction : redactions) {
+      if (redaction.absolute_offset + redaction.length <= out.size()) {
+        out.replace(redaction.absolute_offset, redaction.length, replacement);
+      }
+    }
+    return out;
+  }
+
+  // Deterministic digest over every regular file in the tree (relative path
+  // bytes then content bytes, component-ordered like pathlib sorting).
+  static std::string config_tree_digest(const std::filesystem::path &root) {
+    std::vector<std::pair<std::string, std::filesystem::path>> files;
+    std::error_code ec;
+    std::filesystem::recursive_directory_iterator end;
+    for (std::filesystem::recursive_directory_iterator it(root, ec); it != end; ++it) {
+      if (std::filesystem::is_symlink(it->symlink_status())) {
+        it.disable_recursion_pending();
+        continue;
+      }
+      if (!it->is_regular_file()) continue;
+      std::string rel = std::filesystem::relative(it->path(), root).generic_string();
+      std::string sort_key = rel;
+      for (char &c : sort_key)
+        if (c == '/') c = '\x01';
+      files.emplace_back(sort_key, it->path());
+    }
+    std::sort(files.begin(), files.end());
+    Sha256Stream digest;
+    for (const auto &[sort_key, path] : files) {
+      std::string rel = sort_key;
+      for (char &c : rel)
+        if (c == '\x01') c = '/';
+      digest.update(reinterpret_cast<const unsigned char *>(rel.data()), rel.size());
+      std::ifstream in(path, std::ios::binary);
+      char buffer[65536];
+      while (in.read(buffer, sizeof(buffer)) || in.gcount() > 0) {
+        digest.update(reinterpret_cast<const unsigned char *>(buffer), static_cast<size_t>(in.gcount()));
+        if (in.gcount() < static_cast<std::streamsize>(sizeof(buffer)) && !in) break;
+      }
+    }
+    return digest.finish_hex();
+  }
+
+  static std::string format_marker_value(double value) {
+    if (value == static_cast<double>(static_cast<long long>(value))) {
+      return std::to_string(static_cast<long long>(value));
+    }
+    std::ostringstream out;
+    out << value;
+    return out.str();
+  }
+
+  void write_import_map(const std::filesystem::path &destination, const std::string &json, const CustodyAnalysis &analysis,
+                        const std::string &digest_before, const std::string &digest_after) const {
     std::vector<std::string> placeholders;
     for (const auto &entry : parse_obs_source_entries(json)) {
-      if (entry.module == "third_party_camera_fx") {
+      if (entry.module == "third_party_camera_fx" || plugin_disposition(entry) == PluginDisposition::missing) {
         placeholders.push_back("{\"sourceId\":\"source:" + json_escape(entry.label) + "\",\"label\":\"" + json_escape(entry.label) +
                                "\",\"reason\":\"missing_plugin\"}");
       }
     }
+    std::vector<std::string> resources;
+    for (const auto &resource : analysis.resources) {
+      std::string item = "{\"sourceId\":\"" + json_escape(resource.source_id) + "\",\"settingsKey\":\"" +
+                         json_escape(resource.settings_key) + "\",\"status\":\"" + json_escape(resource.status) + "\"";
+      if (!resource.workspace_path.empty()) item += ",\"workspacePath\":\"" + json_escape(resource.workspace_path) + "\"";
+      if (!resource.candidate_path.empty()) item += ",\"candidatePath\":\"" + json_escape(resource.candidate_path) + "\"";
+      if (!resource.remediation.empty()) item += ",\"remediation\":\"" + json_escape(resource.remediation) + "\"";
+      if (!resource.module_ref.empty()) item += ",\"moduleRef\":\"" + json_escape(resource.module_ref) + "\"";
+      item += "}";
+      resources.push_back(std::move(item));
+    }
+    std::vector<std::string> redacted;
+    for (const auto &redaction : analysis.redactions) {
+      redacted.push_back("{\"sourceId\":\"" + json_escape(redaction.source_id) + "\",\"settingsKey\":\"" +
+                         json_escape(redaction.settings_key) + "\"}");
+    }
+    std::vector<std::string> markers;
+    for (const auto &marker : analysis.markers) {
+      markers.push_back("{\"sourceId\":\"" + json_escape(marker.source_id) + "\",\"settingsKey\":\"" +
+                        json_escape(marker.settings_key) + "\",\"value\":" + format_marker_value(marker.value) + "}");
+    }
     std::filesystem::create_directories(destination);
     std::ofstream out(destination / "streammate-import-map.json");
-    out << "{\"placeholderSources\":" << json_array_join(placeholders) << "}\n";
+    out << "{\"placeholderSources\":" << json_array_join(placeholders) << ",\"resources\":" << json_array_join(resources)
+        << ",\"redactedKeys\":" << json_array_join(redacted) << ",\"versionMarkers\":" << json_array_join(markers)
+        << ",\"sourceDigest\":{\"before\":\"" << json_escape(digest_before) << "\",\"after\":\"" << json_escape(digest_after)
+        << "\"}}\n";
   }
 
   std::string build_report(const std::filesystem::path &config, const std::string &json, const std::string &collection_id) const {
@@ -4213,11 +4645,21 @@ private:
     std::vector<std::string> unresolved;
     for (const auto &entry : parse_obs_source_entries(json)) {
       const std::string source_id = "source:" + entry.label;
+      const PluginDisposition disposition = plugin_disposition(entry);
       if (entry.module == "scene") {
         mapped.push_back(report_item("scene:" + entry.label, "scene", entry.label, "mapped", "mapped_native"));
       } else if (entry.module == "color_source" || entry.module == "browser_source" || entry.module == "text_ft2_source" ||
                  entry.module == "text_gdiplus" || entry.module == "image_source" || entry.module == "ffmpeg_source") {
         mapped.push_back(report_item(source_id, "source", entry.label, "mapped", "mapped_native", entry.module));
+      } else if (disposition == PluginDisposition::migration) {
+        // NIF-M2: seeded settings-version signal — the plugin-family source
+        // carries a plugin_settings_version above the supported v1, so the
+        // import degrades it instead of instantiating stale settings.
+        const auto marker = settings_version_marker(entry);
+        degraded.push_back(report_item(
+            source_id, "source", entry.label, "degraded", "settings_migration_required", entry.module, "",
+            {"plugin_settings_version " + format_marker_value(marker ? *marker : 0) +
+             " exceeds the supported settings schema v1; update the plugin mapping before import."}));
       } else if (user_plugin_types_ && user_plugin_types_->sources.count(entry.module) > 0) {
         // NIF-V1: the type is registered by a manifest-LOADED user plugin —
         // mapped, never a placeholder. Scaffold lane never reaches here
@@ -4248,6 +4690,13 @@ private:
         unresolved.push_back(report_item("filter:Station Overlay:" + entry.label, "filter", "Station Overlay / " + entry.label, "unresolved",
                                          "unsupported_frontend_feature", entry.module, "",
                                          {"OBS frontend filter is not imported by the native host scaffold."}));
+      } else if (disposition == PluginDisposition::missing) {
+        // NIF-M2: generalized missing_plugin — a non-upstream module with no
+        // loaded user plugin degrades to a placeholder with the module named.
+        // Upstream capability gaps (upstream_source_ids) never take this path.
+        degraded.push_back(report_item(source_id, "source", entry.label, "degraded", "missing_plugin", entry.module, "",
+                                       {"Replaced with placeholder source because module " + entry.module +
+                                        " is not loaded by the native host."}));
       }
     }
 
