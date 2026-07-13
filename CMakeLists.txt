@@ -184,6 +184,12 @@ if(BUILD_TESTING)
     NAME import-parity
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_import_parity.py $<TARGET_FILE:studio-host>
   )
+  # NIF-CM: derive-from-pin guard for the hand-pinned upstream id sets (skips
+  # loudly without the submodule tree; CI enforces via STREAMMATE_REQUIRE_OBS_TREE=1).
+  add_test(
+    NAME upstream-pin-sets
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_upstream_pin_sets.py
+  )
   add_test(
     NAME production-control-verbs
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_production_control_verbs.py $<TARGET_FILE:studio-host>

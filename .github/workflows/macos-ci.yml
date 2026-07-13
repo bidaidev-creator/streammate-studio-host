@@ -46,6 +46,9 @@ jobs:
       - name: Run lifecycle integration tests
         run: ctest --test-dir build/scaffold --output-on-failure
 
+      - name: Enforce the upstream pin-set derivation guard against the pinned tree
+        run: STREAMMATE_REQUIRE_OBS_TREE=1 python3 tests/integration/test_upstream_pin_sets.py
+
       - name: Fetch OBS version tag metadata for upstream CMake
         run: git -C external/obs-studio fetch --tags --force --depth 1 origin tag 32.1.2
 
