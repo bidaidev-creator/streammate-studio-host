@@ -53,10 +53,12 @@ def write_manifest(path: Path, roots, selected, exclude, retry=None) -> None:
     path.write_text(json.dumps(body))
 
 
-def write_sentinel(path: Path, phase: str, module_ref=None, suspects=None) -> None:
+def write_sentinel(path: Path, phase: str, module_ref=None, suspects=None, consumed=None) -> None:
     body = {"schema": SENTINEL_SCHEMA, "phase": phase, "suspects": suspects or {}}
     if module_ref is not None:
         body["moduleRef"] = module_ref
+    if consumed is not None:
+        body["consumedRetries"] = consumed
     path.write_text(json.dumps(body))
 
 
@@ -160,7 +162,7 @@ class PluginCrashContainmentScaffoldTest(unittest.TestCase):
 
     def test_oversized_sentinel_is_refused(self) -> None:
         bad = self.base / "sentinel.json"
-        bad.write_text("[" + " " * 5000 + "]")
+        bad.write_text("[" + " " * 70000 + "]")
         proc = self._refusal(
             "--user-plugins-manifest", str(self.manifest),
             "--plugin-load-sentinel", str(bad),
@@ -261,6 +263,60 @@ class PluginCrashContainmentScaffoldTest(unittest.TestCase):
         self.assertIsNone(alpha["state"])
         # The retried ref left the durable suspects map.
         self.assertEqual(read_sentinel(self.sentinel)["suspects"], {})
+
+    def test_retry_is_consumed_once_a_persistent_retry_cannot_loop(self) -> None:
+        # F1 (codex): a retry left in the manifest must be honored EXACTLY once.
+        # After the honored attempt re-crashes, the same manifest must keep the
+        # module suspected (consumedRetries), never re-clearing every boot.
+        write_manifest(
+            self.manifest,
+            [{"binaryDir": str(self.root)}],
+            ["module:alpha", "module:beta"],
+            [],
+            retry=["module:alpha"],
+        )
+        # Boot 1: suspicion cleared (retry honored) and recorded consumed.
+        write_sentinel(self.sentinel, "idle", suspects={"module:alpha": "crash"})
+        first = self._report("--plugin-load-sentinel", str(self.sentinel))
+        self.assertEqual(self._by_ref(first)["module:alpha"]["lifecycle"], "discovered")
+        idle = read_sentinel(self.sentinel)
+        self.assertEqual(idle.get("consumedRetries"), ["module:alpha"])
+        # Simulate the retried module crashing again (loading record left behind).
+        write_sentinel(
+            self.sentinel, "loading", "module:alpha",
+            suspects={}, consumed=["module:alpha"],
+        )
+        # Boot 2, SAME manifest: the spent retry must NOT clear the fresh suspicion.
+        second = self._report("--plugin-load-sentinel", str(self.sentinel))
+        alpha = self._by_ref(second)["module:alpha"]
+        self.assertEqual(alpha["lifecycle"], "excluded")
+        self.assertEqual(alpha["reasonDetail"], "crash-suspected")
+
+    def test_withdrawing_a_retry_resets_its_consumption(self) -> None:
+        write_sentinel(self.sentinel, "idle", suspects={}, consumed=["module:alpha"])
+        write_manifest(
+            self.manifest,
+            [{"binaryDir": str(self.root)}],
+            ["module:alpha", "module:beta"],
+            [],
+        )
+        self._report("--plugin-load-sentinel", str(self.sentinel))
+        # No retry in the manifest: the consumption record is dropped, so a
+        # future re-added retry is a fresh one-shot grant.
+        self.assertEqual(read_sentinel(self.sentinel).get("consumedRetries", []), [])
+
+    def test_unwritable_sentinel_parent_refuses_startup(self) -> None:
+        # F2 (codex): loading must never proceed when attribution cannot be
+        # persisted; an unwritable sentinel location refuses at launch.
+        proc = self._refusal(
+            "--user-plugins-manifest", str(self.manifest),
+            "--plugin-load-sentinel", str(self.base / "missing-dir" / "sentinel.json"),
+        )
+        self.assertEqual(proc.returncode, USAGE_EXIT)
+        self.assertIn(
+            "invalid --plugin-load-sentinel: sentinel-unwritable",
+            proc.stdout + proc.stderr,
+        )
 
     def test_manifest_exclude_wins_over_suspicion(self) -> None:
         write_sentinel(self.sentinel, "idle", suspects={"module:alpha": "crash"})
@@ -381,7 +437,8 @@ class PluginCrashContainmentLibobsTest(unittest.TestCase):
     def _dead_boot(self, timeout: float = 60.0) -> subprocess.CompletedProcess:
         """A boot expected to die during engine start (crash or watchdog)."""
         return subprocess.run(
-            [str(HOST_BIN), "--host", "127.0.0.1", "--port", "0",
+            [str(HOST_BIN), "--token", "containment-test-token",
+             "--host", "127.0.0.1", "--port", "0",
              *self._containment_args()],
             capture_output=True,
             text=True,
@@ -428,6 +485,20 @@ class PluginCrashContainmentLibobsTest(unittest.TestCase):
         fourth = self._dead_boot()
         self.assertNotEqual(fourth.returncode, 0)
         self.assertEqual(read_sentinel(self.sentinel)["moduleRef"], "module:streammate-test-crash")
+
+        # Boot 5, SAME manifest (retry still listed): the spent retry must not
+        # re-clear suspicion — the host boots healthy with the crash module
+        # refused (the decisive no-crash-loop proof).
+        process, port, _ = host.start_host(*self._containment_args())
+        self.addCleanup(host.stop_process, process)
+        sock = host.websocket_connect(port)
+        self.addCleanup(sock.close)
+        report5 = json.loads(rpc_raw(sock, 51, "plugins.report", {}))["result"]
+        by_ref5 = {m["moduleRef"]: m for m in report5["modules"]}
+        self.assertEqual(by_ref5["module:streammate-test-crash"]["reasonDetail"], "crash-suspected")
+        self.assertEqual(by_ref5["module:streammate-test-source"]["lifecycle"], "loaded")
+        sock.close()
+        host.stop_process(process)
 
         # The user plugin roots stayed byte-identical through every crash.
         self.assertEqual(tree_digest(self.root), roots_before)

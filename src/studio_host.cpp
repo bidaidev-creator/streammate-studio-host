@@ -523,6 +523,7 @@ struct Options {
   bool plugin_load_deadline_explicit = false;
   // Resolved at parse time from the sentinel file + manifest retry list.
   std::map<std::string, std::string> plugin_suspects;
+  std::set<std::string> plugin_consumed_retries;
 };
 
 std::string json_escape(const std::string &input) {
@@ -570,13 +571,21 @@ bool is_loopback_host(const std::string &host) {
 // crash per module per explicit retry, never a restart loop.
 namespace plugin_sentinel {
 
-constexpr std::uintmax_t kMaxSentinelBytes = 4096;
+constexpr std::uintmax_t kMaxSentinelBytes = 65536;
+// Suspects are bounded so the sentinel can never outgrow its own parser: a
+// setup with this many crash-attributed modules is pathological and refuses
+// startup deterministically rather than silently dropping attribution.
+constexpr std::size_t kMaxSuspects = 256;
 constexpr const char *kSchema = "plugin-load-sentinel.v1";
 
 struct State {
   std::string phase = "idle";                  // idle | loading | deadline-exceeded
   std::string module_ref;                      // set for loading/deadline-exceeded
   std::map<std::string, std::string> suspects; // module ref -> "crash" | "hang"
+  // One-shot retry accounting: refs whose manifest retry has been honored.
+  // A spent retry never clears suspicion again; withdrawing the retry from
+  // the manifest resets the record (a re-added retry is a fresh grant).
+  std::set<std::string> consumed_retries;
 };
 
 inline std::string serialize(const State &state) {
@@ -592,21 +601,33 @@ inline std::string serialize(const State &state) {
     first = false;
     out << "\"" << json_escape(entry.first) << "\":\"" << json_escape(entry.second) << "\"";
   }
-  out << "}}";
+  out << "},\"consumedRetries\":[";
+  first = true;
+  for (const auto &ref : state.consumed_retries) {
+    if (!first) out << ",";
+    first = false;
+    out << "\"" << json_escape(ref) << "\"";
+  }
+  out << "]}";
   return out.str();
 }
 
 // Atomic write (tmp + rename) so a crash can never leave a torn sentinel.
-// Best-effort: containment bookkeeping must never itself crash the host.
-inline void write(const std::string &path, const State &state) {
+// Fail-closed: callers must treat a false return as "attribution cannot be
+// persisted" and refuse the guarded action (codex F2 — never load a module
+// whose crash could not be pinned on it afterwards).
+inline bool write(const std::string &path, const State &state) {
   const std::string tmp = path + ".tmp";
   {
     std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
-    if (!out) return;
+    if (!out) return false;
     out << serialize(state);
+    out.flush();
+    if (!out.good()) return false;
   }
   std::error_code ec;
   std::filesystem::rename(tmp, path, ec);
+  return !ec;
 }
 
 // Strict parse. Missing file => fresh idle state. Malformed content refuses
@@ -616,7 +637,9 @@ inline State load_or_throw(const std::string &path) {
   const std::string prefix = "invalid --plugin-load-sentinel: ";
   State state;
   std::error_code ec;
-  if (!std::filesystem::exists(path, ec)) return state;
+  const bool present = std::filesystem::exists(path, ec);
+  if (ec) throw std::runtime_error(prefix + "unreadable-file");
+  if (!present) return state;
   const std::uintmax_t size = std::filesystem::file_size(path, ec);
   if (ec) throw std::runtime_error(prefix + "unreadable-file");
   if (size > kMaxSentinelBytes) throw std::runtime_error(prefix + "sentinel-too-large");
@@ -665,9 +688,24 @@ inline State load_or_throw(const std::string &path) {
             if (!scan.consume(':')) throw fail();
             auto kind = scan.string();
             if (!kind || (*kind != "crash" && *kind != "hang")) throw fail();
+            if (state.suspects.size() >= kMaxSuspects) {
+              throw std::runtime_error(prefix + "suspects-overflow");
+            }
             state.suspects[*ref] = *kind;
             if (scan.consume(',')) continue;
             if (scan.consume('}')) break;
+            throw fail();
+          }
+        }
+      } else if (*key == "consumedRetries") {
+        if (!scan.consume('[')) throw fail();
+        if (!scan.consume(']')) {
+          while (true) {
+            auto ref = scan.string();
+            if (!ref || !user_plugins::is_module_ref(*ref)) throw fail();
+            if (!state.consumed_retries.insert(*ref).second) throw fail();
+            if (scan.consume(',')) continue;
+            if (scan.consume(']')) break;
             throw fail();
           }
         }
@@ -685,18 +723,35 @@ inline State load_or_throw(const std::string &path) {
   return state;
 }
 
+struct Resolution {
+  std::map<std::string, std::string> suspects;
+  std::set<std::string> consumed_retries;
+};
+
 // Promote a crash/deadline leftover into the durable suspects map, then apply
-// the manifest's one-shot retry list.
-inline std::map<std::string, std::string> derive_suspects(const State &state,
-                                                          const std::vector<std::string> &retry) {
-  std::map<std::string, std::string> suspects = state.suspects;
+// the manifest's retry list EXACTLY ONCE per grant (codex F1): a retry that
+// was already honored (consumedRetries) no longer clears suspicion, and a
+// retry withdrawn from the manifest resets its consumption record.
+inline Resolution resolve(const State &state, const std::vector<std::string> &retry) {
+  Resolution out;
+  out.suspects = state.suspects;
   if (state.phase == "loading") {
-    suspects[state.module_ref] = "crash";
+    out.suspects[state.module_ref] = "crash";
   } else if (state.phase == "deadline-exceeded") {
-    suspects[state.module_ref] = "hang";
+    out.suspects[state.module_ref] = "hang";
   }
-  for (const auto &ref : retry) suspects.erase(ref);
-  return suspects;
+  if (out.suspects.size() > kMaxSuspects) {
+    throw std::runtime_error("invalid --plugin-load-sentinel: suspects-overflow");
+  }
+  for (const auto &ref : retry) {
+    if (state.consumed_retries.count(ref) != 0) {
+      out.consumed_retries.insert(ref); // spent grant: suspicion stays
+      continue;
+    }
+    out.suspects.erase(ref); // fresh grant: one attempt, now consumed
+    out.consumed_retries.insert(ref);
+  }
+  return out;
 }
 
 } // namespace plugin_sentinel
@@ -706,7 +761,8 @@ struct PluginContainment {
   bool enabled = false;
   std::string sentinel_path;
   int deadline_ms = 30000;
-  std::map<std::string, std::string> suspects; // post-retry, ref -> crash|hang
+  std::map<std::string, std::string> suspects;   // post-retry, ref -> crash|hang
+  std::set<std::string> consumed_retries;        // one-shot retry accounting
 };
 
 Options parse_args(int argc, char **argv) {
@@ -779,7 +835,17 @@ Options parse_args(int argc, char **argv) {
     // Fail-closed at launch, exactly like the manifest itself: a corrupt
     // sentinel refuses startup with a sanitized category (never the path).
     const plugin_sentinel::State sentinel = plugin_sentinel::load_or_throw(options.plugin_sentinel_path);
-    options.plugin_suspects = plugin_sentinel::derive_suspects(sentinel, options.user_plugins->retry);
+    const plugin_sentinel::Resolution resolved = plugin_sentinel::resolve(sentinel, options.user_plugins->retry);
+    options.plugin_suspects = resolved.suspects;
+    options.plugin_consumed_retries = resolved.consumed_retries;
+    // Writability probe (codex F2): if attribution cannot be persisted here,
+    // no load attempt may proceed — refuse startup, never fail open.
+    plugin_sentinel::State probe;
+    probe.suspects = resolved.suspects;
+    probe.consumed_retries = resolved.consumed_retries;
+    if (!plugin_sentinel::write(options.plugin_sentinel_path, probe)) {
+      throw std::runtime_error("invalid --plugin-load-sentinel: sentinel-unwritable");
+    }
   }
   if (options.token.empty()) {
     throw std::runtime_error("--token is required");
@@ -3473,10 +3539,12 @@ void classify_failed_dlopen(const std::filesystem::path &binary, UserPluginRecor
 class PluginLoadWatchdog {
 public:
   PluginLoadWatchdog(std::string sentinel_path, int deadline_ms,
-                     std::map<std::string, std::string> suspects)
+                     std::map<std::string, std::string> suspects,
+                     std::set<std::string> consumed_retries)
       : sentinel_path_(std::move(sentinel_path)),
         deadline_ms_(deadline_ms),
         suspects_(std::move(suspects)),
+        consumed_retries_(std::move(consumed_retries)),
         thread_([this] { run(); }) {}
 
   ~PluginLoadWatchdog() {
@@ -3511,6 +3579,7 @@ private:
         state.phase = "deadline-exceeded";
         state.module_ref = module_ref_;
         state.suspects = suspects_;
+        state.consumed_retries = consumed_retries_;
         plugin_sentinel::write(sentinel_path_, state);
         std::_Exit(kPluginWatchdogExit);
       }
@@ -3520,6 +3589,7 @@ private:
   std::string sentinel_path_;
   int deadline_ms_;
   std::map<std::string, std::string> suspects_;
+  std::set<std::string> consumed_retries_;
   std::mutex mutex_;
   std::condition_variable cv_;
   bool stop_ = false;
@@ -3538,7 +3608,8 @@ void load_user_plugin_candidates(UserPluginLoadPlan &plan,
   const bool contained = containment != nullptr && containment->enabled;
   std::optional<PluginLoadWatchdog> watchdog;
   if (contained) {
-    watchdog.emplace(containment->sentinel_path, containment->deadline_ms, containment->suspects);
+    watchdog.emplace(containment->sentinel_path, containment->deadline_ms,
+                     containment->suspects, containment->consumed_retries);
   }
 
   const std::set<std::string> bundled = bundled_module_stems(bundle_plugins_dir);
@@ -3575,13 +3646,20 @@ void load_user_plugin_candidates(UserPluginLoadPlan &plan,
 
     const char *data_path = source.data_dir.empty() ? nullptr : source.data_dir.c_str();
     // NIF-H3: record the attempt BEFORE dlopen/init — a crash mid-load leaves
-    // this loading record behind and the next boot attributes it.
+    // this loading record behind and the next boot attributes it. If the
+    // record cannot be persisted, the attempt is REFUSED (codex F2): loading
+    // without attribution would reopen the unbounded-crash-loop hole.
     if (contained) {
       plugin_sentinel::State loading;
       loading.phase = "loading";
       loading.module_ref = record.module_ref;
       loading.suspects = containment->suspects;
-      plugin_sentinel::write(containment->sentinel_path, loading);
+      loading.consumed_retries = containment->consumed_retries;
+      if (!plugin_sentinel::write(containment->sentinel_path, loading)) {
+        record.lifecycle = "excluded";
+        record.reason_detail = "sentinel-write-failed";
+        continue;
+      }
       watchdog->arm(record.module_ref);
     }
     obs_module_t *module = nullptr;
@@ -3707,6 +3785,7 @@ std::string build_user_plugins_boot_report_json(
   if (contained) {
     plugin_sentinel::State idle;
     idle.suspects = containment->suspects;
+    idle.consumed_retries = containment->consumed_retries;
     plugin_sentinel::write(containment->sentinel_path, idle);
   }
   return user_plugins_report_json_from(plan.inventory);
@@ -5631,6 +5710,7 @@ int main(int argc, char **argv) {
       containment.sentinel_path = options.plugin_sentinel_path;
       containment.deadline_ms = options.plugin_load_deadline_ms;
       containment.suspects = options.plugin_suspects;
+      containment.consumed_retries = options.plugin_consumed_retries;
     }
     EngineLifecycle engine;
     if (!engine.start(options.user_plugins, containment)) {
