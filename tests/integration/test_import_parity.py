@@ -171,7 +171,7 @@ class ImportParityTest(unittest.TestCase):
         items = self.by_id(self.report())
         group = items["source:Lower Thirds"]
         self.assertEqual((group["bucket"], group["reason"]), ("mapped", "mapped_native"))
-        self.assertNotIn("moduleName", group)
+        self.assertEqual(group["moduleName"], "group")
         output = items["source:Desktop Audio"]
         self.assertEqual((output["bucket"], output["reason"]), ("mapped", "mapped_native"))
         self.assertEqual(output["moduleName"], "coreaudio_output_capture")

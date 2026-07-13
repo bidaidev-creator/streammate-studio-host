@@ -5004,8 +5004,9 @@ private:
         mapped.push_back(report_item("scene:" + entry.label, "scene", entry.label, "mapped", "mapped_native"));
       } else if (entry.module == "group") {
         // NIF-M3: OBS groups import as nested scene containers (recorded
-        // Q-103 drift point closed — no moduleName, matching the scene item).
-        mapped.push_back(report_item(source_id, "source", entry.label, "mapped", "mapped_native"));
+        // Q-103 drift point closed). moduleName "group" lets the corpus
+        // normalizer recover the `group-<slug>` id convention.
+        mapped.push_back(report_item(source_id, "source", entry.label, "mapped", "mapped_native", entry.module));
       } else if (mapped_native_source_ids().count(entry.module) > 0) {
         mapped.push_back(report_item(source_id, "source", entry.label, "mapped", "mapped_native", entry.module));
       } else if (disposition == PluginDisposition::migration) {
