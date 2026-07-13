@@ -2877,8 +2877,10 @@ const std::set<std::string> &upstream_filter_ids() {
       "luma_key_filter_v2",   "noise_gate_filter",     "noise_suppress_filter","compressor_filter",
       "limiter_filter",       "expander_filter",       "upward_compressor_filter",
       "invert_polarity_filter","async_delay_filter",   "hdr_tonemap_filter",
-      "premultiplied_alpha_filter", "clut_filter",     "vst_filter",
+      "clut_filter",          "vst_filter",
       // codex F1: registered by the pinned obs-filters module (eq-filter.c).
+      // (opus N1: premultiplied_alpha_filter removed — it is a game-capture
+      // setting key, not a registered filter id at the 32.x pin.)
       "basic_eq_filter"};
   return ids;
 }
@@ -2917,6 +2919,8 @@ const std::set<std::string> &camera_permission_source_ids() {
 // NIF-M3: device-backed upstream ids — the original hardware is not present
 // at import time on this machine.
 const std::set<std::string> &device_backed_source_ids() {
+  // opus N2 verified: audio_line IS a registered libobs source id at the pin
+  // (external/obs-studio/libobs/obs.c, .id = "audio_line") — it stays.
   static const std::set<std::string> ids = {"syphon-input", "decklink-input", "audio_line"};
   return ids;
 }
