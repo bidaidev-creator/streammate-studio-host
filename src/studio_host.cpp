@@ -4154,14 +4154,8 @@ public:
         } catch (...) {
           continue;
         }
-        bool has_credential_key = false;
-        for (const auto &key : credential_settings_keys()) {
-          if (body.find("\"" + key + "\"") != std::string::npos) {
-            has_credential_key = true;
-            break;
-          }
-        }
-        if (!has_credential_key) continue;
+        // Opus F1: no raw-byte pre-gate — the redactor's tokenizer decodes
+        // \uXXXX escapes, so escaped credential keys are matched too.
         auto redacted = redact_all_credential_values(body);
         if (!redacted) {
           // Malformed collection carrying a credential key: refuse rather than
@@ -4466,8 +4460,6 @@ private:
   struct CustodyRedaction {
     std::string source_id;
     std::string settings_key;
-    size_t absolute_offset = 0;
-    size_t length = 0;
   };
   struct CustodyMarker {
     std::string source_id;
@@ -4583,9 +4575,10 @@ private:
       const std::string source_id = "source:" + entry.label;
       if (!entry.settings_raw.empty()) {
         for (const auto &field : parse_settings_fields(entry.settings_raw)) {
-          if (credential_settings_keys().count(field.key) > 0 && field.is_string) {
-            analysis.redactions.push_back(
-                {source_id, field.key, entry.settings_offset + field.value_offset, field.value_length});
+          if (credential_settings_keys().count(field.key) > 0) {
+            // Opus F2: record the key name for every credential-class field,
+            // whatever its JSON value type (the copy redacts them all).
+            analysis.redactions.push_back({source_id, field.key});
           } else if (field.key == kSettingsVersionMarkerKey && field.is_number) {
             analysis.markers.push_back({source_id, field.key, field.number_value});
           } else if (asset_settings_keys().count(field.key) > 0 && field.is_string) {
@@ -4677,19 +4670,6 @@ private:
       }
       out.push_back(c);
       ++pos;
-    }
-    return out;
-  }
-
-  static std::string apply_redactions(const std::string &json, std::vector<CustodyRedaction> redactions) {
-    std::sort(redactions.begin(), redactions.end(),
-              [](const CustodyRedaction &a, const CustodyRedaction &b) { return a.absolute_offset > b.absolute_offset; });
-    std::string out = json;
-    const std::string replacement = std::string("\"") + kRedactionSentinel + "\"";
-    for (const auto &redaction : redactions) {
-      if (redaction.absolute_offset + redaction.length <= out.size()) {
-        out.replace(redaction.absolute_offset, redaction.length, replacement);
-      }
     }
     return out;
   }
