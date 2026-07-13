@@ -2921,7 +2921,9 @@ const std::set<std::string> &camera_permission_source_ids() {
 const std::set<std::string> &device_backed_source_ids() {
   // opus N2 verified: audio_line IS a registered libobs source id at the pin
   // (external/obs-studio/libobs/obs.c, .id = "audio_line") — it stays.
-  static const std::set<std::string> ids = {"syphon-input", "decklink-input", "audio_line"};
+  // NIF-CM: aja_source (plugins/aja) is a macOS-supported device plugin at the
+  // pin; the AJA hardware is absent at import time on this machine.
+  static const std::set<std::string> ids = {"syphon-input", "decklink-input", "audio_line", "aja_source"};
   return ids;
 }
 
@@ -2930,7 +2932,11 @@ const std::set<std::string> &other_platform_source_ids() {
   static const std::set<std::string> ids = {
       "wasapi_input_capture", "wasapi_output_capture", "dshow_input",        "game_capture",
       "monitor_capture",      "jack_output_capture",   "pulse_input_capture","pulse_output_capture",
-      "v4l2_input",           "xcomposite_input",      "xshm_input",         "alsa_input_capture"};
+      "v4l2_input",           "xcomposite_input",      "xshm_input",         "alsa_input_capture",
+      // NIF-CM: remaining Linux ids registered at the 32.x pin (M3 handoff).
+      "xshm_input_v2",        "pipewire-camera-source",
+      "pipewire-desktop-capture-source", "pipewire-window-capture-source",
+      "pipewire-screen-capture-source"};
   return ids;
 }
 
