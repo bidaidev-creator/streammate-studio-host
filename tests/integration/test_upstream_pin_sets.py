@@ -77,15 +77,22 @@ STRING_LITERAL_EVIDENCE_IDS = {
 
 
 def build_registration_index(files: list[tuple[str, str]]) -> tuple[set[str], set[str]]:
-    """Return (registered ids, registered versioned ids `<base>_vN`)."""
+    """Return (registered ids, registered versioned ids `<base>_vN`).
+
+    A `.version` marker is attributed only to the nearest PRECEDING `.id`
+    assignment in the same file (the pinned tree's designated-initializer
+    convention lists `.id` before `.version`); markers are never
+    cross-producted across ids (opus NIF-CM note 1).
+    """
     registered: set[str] = set()
     versioned: set[str] = set()
     for _path, text in files:
-        ids_in_file = REGISTRATION_SITE.findall(text)
-        versions_in_file = VERSION_SITE.findall(text)
-        for found_id in ids_in_file:
+        id_matches = list(REGISTRATION_SITE.finditer(text))
+        for index, match in enumerate(id_matches):
+            found_id = match.group("id")
             registered.add(found_id)
-            for version in versions_in_file:
+            segment_end = id_matches[index + 1].start() if index + 1 < len(id_matches) else len(text)
+            for version in VERSION_SITE.findall(text[match.end():segment_end]):
                 versioned.add(f"{found_id}_v{version}")
     return registered, versioned
 
@@ -232,6 +239,17 @@ class RegistrationEvidencePredicateTest(unittest.TestCase):
         registered, versioned = build_registration_index(without_version)
         self.assertFalse(id_exists_in_tree("real_source_v3", registered, versioned, without_version[0][1]))
         self.assertFalse(id_exists_in_tree("real_source_v999", registered, versioned, with_version[0][1]))
+
+    def test_version_marker_scopes_to_its_own_id_segment(self) -> None:
+        # opus note 1: a version marker belonging to a DIFFERENT id in the same
+        # file must not satisfy <id>_vN for this id.
+        files = [("two.c", '.id = "foo", /* no version */ }; struct b = { .id = "bar", .version = 2, };')]
+        registered, versioned = build_registration_index(files)
+        self.assertIn("bar_v2", versioned)
+        self.assertNotIn("foo_v5", versioned)
+        self.assertNotIn("foo_v2", versioned)
+        self.assertFalse(id_exists_in_tree("foo_v5", registered, versioned, files[0][1]))
+        self.assertTrue(id_exists_in_tree("bar_v2", registered, versioned, files[0][1]))
 
     def test_string_literal_tier_applies_only_to_reviewed_ids(self) -> None:
         files = [("c.c", 'const char *ui = "aja_source"; const char *other = "mystery_source";')]
