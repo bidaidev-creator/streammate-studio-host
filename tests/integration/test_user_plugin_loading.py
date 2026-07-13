@@ -532,12 +532,20 @@ class UserPluginLoadingLibobsTest(unittest.TestCase):
             sock, 9609, "sceneItem.setOrder",
             {"sceneId": "parity", "itemId": "parity-src", "position": 1, "idempotencyToken": "parity-order-1"},
         )["result"]["ok"]
+        # Transform proof is render-observable: the program frame before and
+        # after the move must differ (scene.list's position field is the
+        # z-order index by contract, NOT the coordinate pair).
+        frame_before = host.rpc(sock, 9621, "scene.captureFrame", {"sceneId": "parity", "format": "png"})["result"]["pngBase64"]
         transform = host.rpc(
             sock, 9610, "scene.itemTransform",
             {"sceneId": "parity", "sourceId": "parity-src", "x": 4, "y": 6, "width": 32, "height": 18},
         )["result"]
-        observed["scene.itemTransform"] = transform["ok"] and transform["transform"] == {
-            "x": 4, "y": 6, "width": 32, "height": 18}
+        frame_after = host.rpc(sock, 9622, "scene.captureFrame", {"sceneId": "parity", "format": "png"})["result"]["pngBase64"]
+        observed["scene.itemTransform"] = (
+            transform["ok"]
+            and transform["transform"] == {"x": 4, "y": 6, "width": 32, "height": 18}
+            and frame_after != frame_before
+        )
         observed["source.mute"] = (
             host.rpc(sock, 9611, "source.mute", {"sourceId": "parity-src", "muted": True})["result"]["ok"]
             and host.rpc(sock, 9612, "source.mute", {"sourceId": "parity-src", "muted": False})["result"]["ok"]
@@ -571,9 +579,12 @@ class UserPluginLoadingLibobsTest(unittest.TestCase):
         self.assertIs(parity_sources[0]["visible"], True)
         self.assertIs(parity_sources[0]["muted"], False)
         self.assertEqual(parity_sources[0]["volumeDb"], -12.5)
-        # codex F9: transform position and program scene read back through the
-        # observed-state surface, not just RPC acknowledgements.
-        self.assertEqual(parity_sources[0].get("position"), {"x": 4, "y": 6}, parity_sources[0])
+        # codex F9: order and program scene read back through the observed-state
+        # surface, not just RPC acknowledgements. scene.list's `position` is the
+        # authoritative z-order index (the HOST-GAP-02 contract, mirrored by
+        # studio-control-native-host.ts) — the setOrder move to 1 must be
+        # visible here; the transform is proven by the frame delta above.
+        self.assertEqual(parity_sources[0]["position"], 1, parity_sources[0])
         program = [sc for sc in listed.get("scenes", []) if sc.get("program")]
         self.assertEqual([sc["sceneId"] for sc in program], ["parity"], listed.get("scenes"))
 
