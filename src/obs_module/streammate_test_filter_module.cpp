@@ -65,6 +65,27 @@ struct obs_source_info make_filter_info() {
 
 struct obs_source_info g_test_filter = make_filter_info();
 
+// F1 fixture (opus review): a deliberately NON-portable type id (leading
+// underscore + > 64 chars). The host must drop it from the emitted
+// registered-type delta while this module still reports loaded.
+constexpr const char *kNonPortableFilterId =
+    "_streammate_nonportable_type_id_deliberately_longer_than_sixty_four_characters";
+
+struct obs_source_info make_nonportable_filter_info() {
+  struct obs_source_info info;
+  std::memset(&info, 0, sizeof(info));
+  info.id = kNonPortableFilterId;
+  info.type = OBS_SOURCE_TYPE_FILTER;
+  info.output_flags = OBS_SOURCE_ASYNC_VIDEO;
+  info.get_name = filter_get_name;
+  info.create = filter_create;
+  info.destroy = filter_destroy;
+  info.filter_video = filter_video;
+  return info;
+}
+
+struct obs_source_info g_nonportable_filter = make_nonportable_filter_info();
+
 } // namespace
 
 MODULE_EXPORT const char *obs_module_name(void) { return "streammate-test-filter"; }
@@ -75,6 +96,7 @@ MODULE_EXPORT const char *obs_module_description(void) {
 
 bool obs_module_load(void) {
   obs_register_source(&g_test_filter);
+  obs_register_source(&g_nonportable_filter);
   return true;
 }
 

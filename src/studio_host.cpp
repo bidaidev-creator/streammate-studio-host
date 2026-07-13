@@ -35,6 +35,7 @@
 #include <vector>
 
 #include "native_overlay_renderer.h"
+#include "user_plugin_portability.h"
 
 #if defined(__APPLE__)
 #include <CoreGraphics/CoreGraphics.h>
@@ -2750,12 +2751,32 @@ UserPluginInventory build_user_plugin_inventory(const user_plugins::Manifest &ma
     }
     inventory.roots.push_back({root_ref, static_cast<int>(scan.candidates.size()), scan.truncated});
 
+    std::size_t ordinal = 0;
     for (const auto &candidate : scan.candidates) {
+      const std::size_t candidate_ordinal = ordinal++;
       UserPluginRecord record;
+      record.root_ref = root_ref;
+      // F2 (opus review): a name the host tolerates but the mono validator
+      // refuses (leading ._-/length > 120) must never form the wire ref.
+      // The candidate surfaces as a REFUSED record under a synthesized
+      // conforming ref — never silently dropped, never loaded, and its raw
+      // name is never disclosed on the wire.
+      if (!streammate::user_plugins::is_portable_module_name(candidate.name)) {
+        record.module_ref = "module:unportable-" + std::to_string(index) + "-" +
+                            std::to_string(candidate_ordinal);
+        record.label = "unportable-candidate";
+        record.file_name = "unportable";
+        record.lifecycle = "discovered";
+        record.reason_detail = "name-not-portable";
+        if (sources_out != nullptr) {
+          sources_out->push_back({});
+        }
+        inventory.modules.push_back(std::move(record));
+        continue;
+      }
       record.module_ref = "module:" + candidate.name;
       record.label = candidate.name;
       record.file_name = candidate.relative;
-      record.root_ref = root_ref;
       // Reason precedence (one category per record): symlink-refused >
       // unreadable-binary > binary-too-large > unreadable-macho-header.
       if (!candidate.confined) {
@@ -2986,6 +3007,9 @@ void classify_failed_dlopen(const std::filesystem::path &binary, UserPluginRecor
     record.reason_detail = "file-not-found";
     return;
   }
+  // Probe dlopen runs constructors if it unexpectedly succeeds; that only
+  // happens after obs_open_module already failed on the same path, so the
+  // side-effect window is accepted (the module was user-selected for load).
   void *handle = dlopen(binary.c_str(), RTLD_LAZY | RTLD_LOCAL);
   if (handle != nullptr) {
     dlclose(handle);
@@ -3020,6 +3044,9 @@ void load_user_plugin_candidates(UserPluginLoadPlan &plan,
     UserPluginRecord &record = plan.inventory.modules[index];
     const UserPluginModuleSource &source = plan.sources[index];
 
+    // Stem comparison is deliberately case-sensitive: APFS defaults are
+    // case-insensitive, but libobs module ids are exact-match, and a
+    // case-variant name that survives here still fails obs_open_module.
     if (bundled.count(record.label) != 0) {
       record.lifecycle = "duplicate_of_bundled"; // bundled upstream wins, never dlopened
       continue;
@@ -3064,7 +3091,12 @@ void load_user_plugin_candidates(UserPluginLoadPlan &plan,
       bool any = false;
       for (std::size_t kind = 0; kind < after.size(); ++kind) {
         for (const std::string &type_id : after[kind]) {
-          if (before[kind].count(type_id) == 0 && is_safe_protocol_id(type_id)) {
+          // Only ids the mono STUDIO_PLUGIN_TYPE_ID_PATTERN accepts may be
+          // emitted (a single non-conforming id would fail-close the whole
+          // inventory downstream); non-conforming ids are dropped from the
+          // delta while the module still reports loaded honestly.
+          if (before[kind].count(type_id) == 0 &&
+              streammate::user_plugins::is_portable_type_id(type_id)) {
             record.registered_types[kind].push_back(type_id);
             any = true;
           }

@@ -150,6 +150,15 @@ if(BUILD_TESTING)
     COMMAND native-overlay-renderer-test ${CMAKE_CURRENT_SOURCE_DIR}/tests/unit/native_overlay_golden.txt
   )
 
+  # NIF-H2 (opus review F1/F2): the wire-portability predicates must mirror
+  # the mono validator's pinned patterns exactly.
+  add_executable(user-plugin-portability-test tests/unit/test_user_plugin_portability.cpp)
+  target_include_directories(user-plugin-portability-test PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src")
+  add_test(
+    NAME user-plugin-portability
+    COMMAND user-plugin-portability-test
+  )
+
   add_test(
     NAME studio-host-lifecycle
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_host_lifecycle.py $<TARGET_FILE:studio-host>

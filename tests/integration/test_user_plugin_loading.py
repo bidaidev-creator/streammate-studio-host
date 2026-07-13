@@ -214,6 +214,40 @@ class UserPluginLoadingPlanTest(unittest.TestCase):
         result = json.loads(rpc_raw(sock, 5, "plugins.report", {}))["result"]
         self.assertEqual(result["modules"], [])
 
+    def test_nonportable_names_are_clamped_to_refused_records(self) -> None:
+        # F2 (opus review): names the host accepts (is_safe_protocol_id) but
+        # the mono validator refuses (leading ._-/_ or >120 chars) must never
+        # produce a non-conforming moduleRef. They surface as REFUSED records
+        # with a synthesized conforming ref + reasonDetail name-not-portable —
+        # never silently dropped, never inventory-poisoning, never loaded.
+        root = self.base / "clamp-root"
+        root.mkdir()
+        build_bundle(root, "_hidden", thin_macho64(HOST_CPU))
+        long_name = "a" * 130
+        build_bundle(root, long_name, thin_macho64(HOST_CPU))
+        build_bundle(root, "portable-mod", thin_macho64(HOST_CPU))
+        manifest = self.base / "clamp-manifest.json"
+        write_manifest(manifest, [{"binaryDir": str(root)}], None, [])
+
+        result = self._report(manifest)
+        refs = [m["moduleRef"] for m in result["modules"]]
+        # No mono-refused ref shapes may ever appear on the wire.
+        for ref in refs:
+            self.assertRegex(ref, r"^module:[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
+            self.assertLessEqual(len(ref), 135)
+        self.assertIn("module:portable-mod", refs)
+
+        clamped = [m for m in result["modules"] if m["reasonDetail"] == "name-not-portable"]
+        self.assertEqual(len(clamped), 2)
+        for record in clamped:
+            self.assertRegex(record["moduleRef"], r"^module:unportable-\d+-\d+$")
+            self.assertEqual(record["lifecycle"], "discovered")
+            self.assertIsNone(record["sha256"])
+            self.assertEqual(record["arch"], [])
+            self.assertNotIn("registeredTypes", record)
+            self.assertNotIn("_hidden", json.dumps(record))
+            self.assertNotIn(long_name, json.dumps(record))
+
     def test_discover_filenames_are_bare_names(self) -> None:
         # Mono contract (StudioPluginModuleRecord.fileName): bare bundle or
         # library file name, never a relative path with separators.
@@ -354,8 +388,15 @@ class UserPluginLoadingLibobsTest(unittest.TestCase):
         filt = by_ref["module:streammate-test-filter"]
         self.assertEqual(filt["lifecycle"], "loaded")
         self.assertIsNone(filt["state"])
+        # F1 (opus review): the module ALSO registers a non-portable type id
+        # (leading underscore, >64 chars); the emitted delta must carry only
+        # ids the mono STUDIO_PLUGIN_TYPE_ID_PATTERN accepts, while the module
+        # still reports loaded honestly.
         self.assertEqual(filt["registeredTypes"]["filters"], ["streammate_test_filter"])
         self.assertEqual(filt["registeredTypes"]["sources"], [])
+        for kind_ids in filt["registeredTypes"].values():
+            for type_id in kind_ids:
+                self.assertRegex(type_id, r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")
 
         noop = by_ref["module:streammate-test-noop"]
         self.assertEqual(noop["lifecycle"], "loaded")
