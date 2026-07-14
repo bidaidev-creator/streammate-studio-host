@@ -461,6 +461,26 @@ class UserPluginLoadingLibobsTest(unittest.TestCase):
         scap2 = host.rpc(sock, 9421, "scene.captureFrame", {"sceneId": "slice", "format": "png"})
         self.assertEqual(scap2["result"]["pngBase64"], png1)
 
+        # O-NIF-1: program.captureFrame reads the REAL composited program
+        # video (raw video callback — the frames egress encodes). For a static
+        # program scene: deterministic across consecutive captures, nonzero,
+        # and the test source's visibility provably changes the pixels.
+        pcap1 = host.rpc(sock, 9430, "program.captureFrame", {})
+        self.assertIn("result", pcap1, msg=f"program.captureFrame errored: {json.dumps(pcap1)}")
+        self.assertEqual(pcap1["result"]["renderer"], "libobs-program-video")
+        self.assertIs(pcap1["result"]["nonZeroBytes"], True)
+        pcap2 = host.rpc(sock, 9431, "program.captureFrame", {})
+        self.assertEqual(pcap2["result"]["frameSha256"], pcap1["result"]["frameSha256"])
+        hidden_toggle = host.rpc(sock, 9432, "sceneItem.setVisible",
+                                 {"sceneId": "slice", "itemId": "slice-src", "visible": False})
+        self.assertTrue(hidden_toggle["result"]["ok"])
+        pcap_hidden = host.rpc(sock, 9433, "program.captureFrame", {})
+        self.assertNotEqual(pcap_hidden["result"]["frameSha256"], pcap1["result"]["frameSha256"],
+                            msg="hiding the source must change the real program pixels")
+        shown_toggle = host.rpc(sock, 9434, "sceneItem.setVisible",
+                                {"sceneId": "slice", "itemId": "slice-src", "visible": True})
+        self.assertTrue(shown_toggle["result"]["ok"])
+
         # O-NIF-1: the bounded `text` plugin-setting is accepted in the real
         # lane (the test source ignores it; the settings gate must not refuse).
         text_created = host.rpc(

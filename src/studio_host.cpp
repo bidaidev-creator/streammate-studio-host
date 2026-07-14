@@ -1919,6 +1919,77 @@ public:
            ",\"pngBase64\":\"" + base64(png.data(), png.size()) + "\"}";
   }
 
+  // O-NIF-1: REAL composited program-video capture. Registers a one-shot raw
+  // video callback (the same frame stream egress encodes), converts to BGRA at
+  // the output size, and returns a bounded digest of the packed pixel rows —
+  // the pixel authority for synchronous/custom-draw sources that never emit
+  // async frames. scene.captureFrame stays the scaffold-model raster (an
+  // observed-state read-back, not pixel truth). Scaffold lane refuses.
+#if STREAMMATE_HAS_LIBOBS
+  struct ProgramFrameGrab {
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::vector<uint8_t> packed;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    bool got = false;
+  };
+
+  static void program_frame_grab_cb(void *param, struct video_data *frame) {
+    auto *grab = static_cast<ProgramFrameGrab *>(param);
+    if (!frame || !frame->data[0]) return;
+    std::lock_guard<std::mutex> lock(grab->mutex);
+    if (grab->got) return;
+    const size_t row_bytes = static_cast<size_t>(grab->width) * 4;
+    grab->packed.resize(row_bytes * grab->height);
+    for (uint32_t y = 0; y < grab->height; ++y) {
+      std::memcpy(grab->packed.data() + static_cast<size_t>(y) * row_bytes,
+                  frame->data[0] + static_cast<size_t>(y) * frame->linesize[0], row_bytes);
+    }
+    grab->got = true;
+    grab->cv.notify_all();
+  }
+#endif
+
+  std::string capture_program_frame(const std::string &) {
+#if STREAMMATE_HAS_LIBOBS
+    obs_video_info ovi{};
+    if (!obs_get_video_info(&ovi)) return rpc_error_result(-32603, "video pipeline not initialized");
+    video_scale_info conversion{};
+    conversion.format = VIDEO_FORMAT_BGRA;
+    conversion.width = ovi.output_width;
+    conversion.height = ovi.output_height;
+    conversion.colorspace = VIDEO_CS_DEFAULT;
+    conversion.range = VIDEO_RANGE_DEFAULT;
+    ProgramFrameGrab grab;
+    grab.width = conversion.width;
+    grab.height = conversion.height;
+    obs_add_raw_video_callback(&conversion, program_frame_grab_cb, &grab);
+    bool got = false;
+    {
+      std::unique_lock<std::mutex> lock(grab.mutex);
+      // 5s bound mirrors the async-capture window; clients must use a longer
+      // RPC timeout than this server bound.
+      got = grab.cv.wait_for(lock, std::chrono::seconds(5), [&grab] { return grab.got; });
+    }
+    obs_remove_raw_video_callback(program_frame_grab_cb, &grab);
+    if (!got) return rpc_error_result(-32603, "no program video frame within the capture window");
+    bool non_zero = false;
+    for (uint8_t byte : grab.packed) {
+      if (byte != 0) {
+        non_zero = true;
+        break;
+      }
+    }
+    const std::string digest = sha256_hex_of_bytes(grab.packed.data(), grab.packed.size());
+    return "{\"ok\":true,\"renderer\":\"libobs-program-video\",\"width\":" + std::to_string(grab.width) +
+           ",\"height\":" + std::to_string(grab.height) + ",\"format\":\"bgra\",\"frameSha256\":\"" + digest +
+           "\",\"nonZeroBytes\":" + std::string(non_zero ? "true" : "false") + "}";
+#else
+    return rpc_error_result(-32603, "program video capture requires libobs (scaffold lane refuses honestly)");
+#endif
+  }
+
   // NIF-V1: real async-frame facts for one source. libobs lane only — the
   // scaffold lane refuses honestly rather than fabricating pixels. The digest
   // covers the first video plane (bounded), enough for deterministic
@@ -6451,6 +6522,9 @@ private:
     });
     add("scene.captureFrame", [this](int fd, const std::string &id, const std::string &payload) {
       send_renderer_result(fd, id, renderer_.capture_frame(payload));
+    });
+    add("program.captureFrame", [this](int fd, const std::string &id, const std::string &payload) {
+      send_renderer_result(fd, id, renderer_.capture_program_frame(payload));
     });
     add("source.captureFrame", [this](int fd, const std::string &id, const std::string &payload) {
       send_renderer_result(fd, id, renderer_.capture_source_frame(payload));
