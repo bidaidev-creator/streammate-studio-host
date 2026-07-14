@@ -2126,7 +2126,10 @@ private:
   // settings-custody model owns the general story. Unknown keys are refused
   // by name so both build lanes give the same first answer.
   static const std::set<std::string> &known_plugin_source_setting_keys() {
-    static const std::set<std::string> keys = {"color"};
+    // O-NIF-1 vendor render: `text` rides the shared bounded-string grammar
+    // (<=120 chars, control/url/path/secret shapes refused) so a text-class
+    // vendor source can render visibly; the key set stays fail-closed.
+    static const std::set<std::string> keys = {"color", "text"};
     return keys;
   }
 

@@ -174,6 +174,61 @@ class PluginSliceScaffoldImportHonestyTest(unittest.TestCase):
                     self.assertNotEqual(item.get("reason"), "mapped_plugin")
 
 
+class PluginSliceTextSettingTest(unittest.TestCase):
+    """O-NIF-1 vendor render: the plugin-settings allowlist carries a bounded
+    `text` string so a text-class vendor source can render visibly. The
+    settings gate runs before the lane gate, so the grammar is lane-agnostic.
+    """
+
+    def setUp(self) -> None:
+        self.process, self.sock = start_connected_host()
+        self.addCleanup(lifecycle.stop_process, self.process)
+        self.addCleanup(self.sock.close)
+        loaded = lifecycle.rpc(self.sock, 9290, "scene.load", {"sceneId": "text-scene", "width": 64, "height": 36})
+        self.assertTrue(loaded["result"]["ok"])
+
+    def _create(self, request_id: int, settings: dict) -> dict:
+        return lifecycle.rpc(
+            self.sock,
+            request_id,
+            "source.create",
+            {
+                "sceneId": "text-scene",
+                "sourceId": f"text-src-{request_id}",
+                "kind": TEST_SOURCE_KIND,
+                "settings": settings,
+            },
+        )
+
+    def test_text_key_passes_the_settings_gate(self) -> None:
+        response = self._create(9291, {"text": "STREAMMATE"})
+        if "error" in response:
+            # Scaffold lane still refuses plugin kinds AFTER the settings gate;
+            # the refusal must be the lane, never the text key.
+            self.assertNotIn("unknown plugin-settings key", response["error"]["message"])
+            self.assertIn("libobs", response["error"]["message"])
+
+    def test_text_and_color_compose(self) -> None:
+        response = self._create(9292, {"text": "STREAMMATE", "color": 4294967295})
+        if "error" in response:
+            self.assertNotIn("unknown plugin-settings key", response["error"]["message"])
+
+    def test_oversize_text_is_refused(self) -> None:
+        response = self._create(9293, {"text": "x" * 121})
+        self.assertIn("error", response)
+        self.assertIn("string value refused", response["error"]["message"])
+
+    def test_url_shaped_text_is_refused(self) -> None:
+        response = self._create(9294, {"text": "see https://example.com/x"})
+        self.assertIn("error", response)
+        self.assertIn("string value refused", response["error"]["message"])
+
+    def test_unknown_key_is_still_refused_by_name(self) -> None:
+        response = self._create(9295, {"text": "ok", "totally_unknown_setting": 1})
+        self.assertIn("error", response)
+        self.assertIn("unknown plugin-settings key", response["error"]["message"])
+
+
 if __name__ == "__main__":
     # test_host_lifecycle resolves HOST_BIN from sys.argv[1] at import time
     # (ctest passes $<TARGET_FILE:studio-host>); keep it out of unittest's argv.
