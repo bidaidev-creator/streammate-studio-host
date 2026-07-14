@@ -449,6 +449,33 @@ class UserPluginLoadingLibobsTest(unittest.TestCase):
         cap2 = host.rpc(sock, 9405, "source.captureFrame", {"sourceId": "slice-src"})
         self.assertEqual(cap2["result"]["frameSha256"], cap1["result"]["frameSha256"])
 
+        # O-NIF-1 vendor render proof path: scene.captureFrame reads the
+        # composited PROGRAM render (a texture copy, not the async-frame queue),
+        # so it is the render primitive for synchronous/custom-draw vendor
+        # sources and must be deterministic across consecutive captures of a
+        # static program scene — no consumer race by construction.
+        scap1 = host.rpc(sock, 9420, "scene.captureFrame", {"sceneId": "slice", "format": "png"})
+        self.assertIn("result", scap1, msg=f"scene.captureFrame errored: {json.dumps(scap1)}")
+        png1 = scap1["result"]["pngBase64"]
+        self.assertGreater(len(png1), 0)
+        scap2 = host.rpc(sock, 9421, "scene.captureFrame", {"sceneId": "slice", "format": "png"})
+        self.assertEqual(scap2["result"]["pngBase64"], png1)
+
+        # O-NIF-1: the bounded `text` plugin-setting is accepted in the real
+        # lane (the test source ignores it; the settings gate must not refuse).
+        text_created = host.rpc(
+            sock,
+            9422,
+            "source.create",
+            {
+                "sceneId": "slice",
+                "sourceId": "slice-text-src",
+                "kind": "streammate_test_source",
+                "settings": {"text": "STREAMMATE", "color": color},
+            },
+        )
+        self.assertTrue(text_created["result"]["ok"], msg=json.dumps(text_created))
+
         # The attached plugin filter is listed and toggles (generic production
         # action on the plugin-backed filter).
         filters = host.rpc(sock, 9406, "filter.list", {"sourceId": "slice-src"})
