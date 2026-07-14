@@ -449,6 +449,17 @@ class UserPluginLoadingLibobsTest(unittest.TestCase):
         cap2 = host.rpc(sock, 9405, "source.captureFrame", {"sourceId": "slice-src"})
         self.assertEqual(cap2["result"]["frameSha256"], cap1["result"]["frameSha256"])
 
+        # O-NIF-1 capture-race design fix (CI run 29368227362 red): the scene
+        # is PROGRAM and the plugin filter is attached — the exact starvation
+        # scenario where obs_source_get_frame raced the render consumer.
+        # The tap-based capture must succeed repeatedly, identically, at any
+        # machine speed.
+        for i in range(3):
+            capn = host.rpc(sock, 9440 + i, "source.captureFrame", {"sourceId": "slice-src"})
+            self.assertIn("result", capn, msg=f"tap capture {i} errored: {json.dumps(capn)}")
+            self.assertEqual(capn["result"]["frameSha256"], cap1["result"]["frameSha256"],
+                             msg=f"tap capture {i} digest drifted")
+
         # O-NIF-1 vendor render proof path: scene.captureFrame reads the
         # composited PROGRAM render (a texture copy, not the async-frame queue),
         # so it is the render primitive for synchronous/custom-draw vendor
