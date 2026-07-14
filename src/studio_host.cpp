@@ -892,6 +892,86 @@ std::string build_user_plugins_boot_report_json(
     UserPluginTypeMaps *out_types = nullptr,
     const PluginContainment *containment = nullptr);
 
+namespace capture_tap {
+  // O-NIF-1 capture-race design fix: source.captureFrame must never race the
+  // program-render consumer for async frames (obs_source_get_frame starves
+  // deterministically on fast machines when the scene is program and a filter
+  // is attached — CI run 29368227362). The host-private transparent async
+  // filter below SEES every delivered frame in filter_video, copies plane 0
+  // (identical bytes/bounds to the old obs_source_get_frame digest), and
+  // returns the frame UNCHANGED — it never consumes, so the race disappears
+  // by construction regardless of machine speed or program state. The type is
+  // registered by the HOST at engine start, before the user-module
+  // registered-type baseline, so plugins.report deltas never credit it to any
+  // module; instances are created private and attached only for the duration
+  // of one capture RPC.
+#if STREAMMATE_HAS_LIBOBS
+struct CaptureTapState {
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::vector<uint8_t> plane0;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    uint32_t linesize = 0;
+    enum video_format format = VIDEO_FORMAT_NONE;
+    bool armed = false;
+    bool got = false;
+  };
+
+static CaptureTapState &capture_tap_state() {
+    static CaptureTapState state;
+    return state;
+  }
+
+static const char *capture_tap_get_name(void *) { return "streammate-capture-tap"; }
+static void *capture_tap_create(obs_data_t *, obs_source_t *) { return &capture_tap_state(); }
+static void capture_tap_destroy(void *) {}
+
+static obs_source_frame *capture_tap_filter_video(void *data, obs_source_frame *frame) {
+    auto *state = static_cast<CaptureTapState *>(data);
+    if (frame && frame->data[0] && frame->linesize[0] > 0 && frame->height > 0) {
+      std::lock_guard<std::mutex> lock(state->mutex);
+      if (state->armed && !state->got) {
+        size_t plane_bytes = static_cast<size_t>(frame->linesize[0]) * frame->height;
+        constexpr size_t kMaxFrameHashBytes = 16u * 1024u * 1024u;
+        if (plane_bytes > kMaxFrameHashBytes) plane_bytes = kMaxFrameHashBytes;
+        state->plane0.assign(frame->data[0], frame->data[0] + plane_bytes);
+        state->width = frame->width;
+        state->height = frame->height;
+        state->linesize = frame->linesize[0];
+        state->format = frame->format;
+        state->got = true;
+        state->cv.notify_all();
+      }
+    }
+    return frame;
+  }
+
+static void register_capture_tap_source() {
+    static bool registered = false;
+    if (registered) return;
+    registered = true;
+    static obs_source_info info = {};
+    info.id = "streammate_capture_tap";
+    info.type = OBS_SOURCE_TYPE_FILTER;
+    info.output_flags = OBS_SOURCE_ASYNC_VIDEO;
+    info.get_name = capture_tap_get_name;
+    info.create = capture_tap_create;
+    info.destroy = capture_tap_destroy;
+    info.filter_video = capture_tap_filter_video;
+    obs_register_source(&info);
+  }
+
+  // Serializes captures (one static tap state) — capture RPCs are cheap and
+  // rare; contention just queues briefly.
+static std::mutex &capture_tap_rpc_mutex() {
+  static std::mutex mutex;
+  return mutex;
+}
+#endif
+
+} // namespace capture_tap
+
 class EngineLifecycle {
 public:
   bool start(const std::optional<user_plugins::Manifest> &user_plugins_manifest,
@@ -908,6 +988,9 @@ public:
       return false;
     }
     obs_load_all_modules();
+    // O-NIF-1: the host-private capture-tap filter type registers BEFORE the
+    // user-module registered-type baseline, so no module delta ever credits it.
+    capture_tap::register_capture_tap_source();
     // NIF-H2: user modules load PER-MODULE here — after the bundled modules,
     // before obs_post_load_modules(), so everything exists ahead of any
     // collection instantiation and post-load runs exactly once.
@@ -1919,6 +2002,77 @@ public:
            ",\"pngBase64\":\"" + base64(png.data(), png.size()) + "\"}";
   }
 
+  // O-NIF-1: REAL composited program-video capture. Registers a one-shot raw
+  // video callback (the same frame stream egress encodes), converts to BGRA at
+  // the output size, and returns a bounded digest of the packed pixel rows —
+  // the pixel authority for synchronous/custom-draw sources that never emit
+  // async frames. scene.captureFrame stays the scaffold-model raster (an
+  // observed-state read-back, not pixel truth). Scaffold lane refuses.
+#if STREAMMATE_HAS_LIBOBS
+  struct ProgramFrameGrab {
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::vector<uint8_t> packed;
+    uint32_t width = 0;
+    uint32_t height = 0;
+    bool got = false;
+  };
+
+  static void program_frame_grab_cb(void *param, struct video_data *frame) {
+    auto *grab = static_cast<ProgramFrameGrab *>(param);
+    if (!frame || !frame->data[0]) return;
+    std::lock_guard<std::mutex> lock(grab->mutex);
+    if (grab->got) return;
+    const size_t row_bytes = static_cast<size_t>(grab->width) * 4;
+    grab->packed.resize(row_bytes * grab->height);
+    for (uint32_t y = 0; y < grab->height; ++y) {
+      std::memcpy(grab->packed.data() + static_cast<size_t>(y) * row_bytes,
+                  frame->data[0] + static_cast<size_t>(y) * frame->linesize[0], row_bytes);
+    }
+    grab->got = true;
+    grab->cv.notify_all();
+  }
+#endif
+
+  std::string capture_program_frame(const std::string &) {
+#if STREAMMATE_HAS_LIBOBS
+    obs_video_info ovi{};
+    if (!obs_get_video_info(&ovi)) return rpc_error_result(-32603, "video pipeline not initialized");
+    video_scale_info conversion{};
+    conversion.format = VIDEO_FORMAT_BGRA;
+    conversion.width = ovi.output_width;
+    conversion.height = ovi.output_height;
+    conversion.colorspace = VIDEO_CS_DEFAULT;
+    conversion.range = VIDEO_RANGE_DEFAULT;
+    ProgramFrameGrab grab;
+    grab.width = conversion.width;
+    grab.height = conversion.height;
+    obs_add_raw_video_callback(&conversion, program_frame_grab_cb, &grab);
+    bool got = false;
+    {
+      std::unique_lock<std::mutex> lock(grab.mutex);
+      // 5s bound mirrors the async-capture window; clients must use a longer
+      // RPC timeout than this server bound.
+      got = grab.cv.wait_for(lock, std::chrono::seconds(5), [&grab] { return grab.got; });
+    }
+    obs_remove_raw_video_callback(program_frame_grab_cb, &grab);
+    if (!got) return rpc_error_result(-32603, "no program video frame within the capture window");
+    bool non_zero = false;
+    for (uint8_t byte : grab.packed) {
+      if (byte != 0) {
+        non_zero = true;
+        break;
+      }
+    }
+    const std::string digest = sha256_hex_of_bytes(grab.packed.data(), grab.packed.size());
+    return "{\"ok\":true,\"renderer\":\"libobs-program-video\",\"width\":" + std::to_string(grab.width) +
+           ",\"height\":" + std::to_string(grab.height) + ",\"format\":\"bgra\",\"frameSha256\":\"" + digest +
+           "\",\"nonZeroBytes\":" + std::string(non_zero ? "true" : "false") + "}";
+#else
+    return rpc_error_result(-32603, "program video capture requires libobs (scaffold lane refuses honestly)");
+#endif
+  }
+
   // NIF-V1: real async-frame facts for one source. libobs lane only — the
   // scaffold lane refuses honestly rather than fabricating pixels. The digest
   // covers the first video plane (bounded), enough for deterministic
@@ -1930,26 +2084,50 @@ public:
 #if STREAMMATE_HAS_LIBOBS
     auto obs_it = obs_sources_.find(source_id);
     if (obs_it == obs_sources_.end()) return rpc_error_result(-32603, "libobs source unavailable");
-    obs_source_frame *frame = nullptr;
-    // 100 x 50ms: CI runners tick the offscreen video thread slowly under load.
-    for (int attempt = 0; attempt < 100 && !frame; ++attempt) {
-      frame = obs_source_get_frame(obs_it->second);
-      if (!frame) std::this_thread::sleep_for(std::chrono::milliseconds(50));
+    // Tap-based capture: attach the host-private transparent async filter for
+    // the duration of one delivered frame — it copies without consuming, so
+    // the program-render consumer race is gone by construction.
+    std::lock_guard<std::mutex> rpc_lock(capture_tap::capture_tap_rpc_mutex());
+    auto &tap_state = capture_tap::capture_tap_state();
+    {
+      std::lock_guard<std::mutex> lock(tap_state.mutex);
+      tap_state.plane0.clear();
+      tap_state.got = false;
+      tap_state.armed = true;
     }
-    if (!frame) return rpc_error_result(-32603, "no async frame available from source");
-    const uint32_t width = frame->width;
-    const uint32_t height = frame->height;
+    obs_source_t *tap = obs_source_create_private("streammate_capture_tap", "streammate-capture-tap", nullptr);
+    if (!tap) {
+      std::lock_guard<std::mutex> lock(tap_state.mutex);
+      tap_state.armed = false;
+      return rpc_error_result(-32603, "capture tap unavailable");
+    }
+    obs_source_filter_add(obs_it->second, tap);
+    bool got = false;
+    {
+      std::unique_lock<std::mutex> lock(tap_state.mutex);
+      // Same 5s server bound as before; clients keep using a longer timeout.
+      got = tap_state.cv.wait_for(lock, std::chrono::seconds(5), [&tap_state] { return tap_state.got; });
+      tap_state.armed = false;
+    }
+    obs_source_filter_remove(obs_it->second, tap);
+    obs_source_release(tap);
+    if (!got) return rpc_error_result(-32603, "no async frame available from source");
+    uint32_t width = 0;
+    uint32_t height = 0;
     std::string digest;
     bool non_zero = false;
-    if (frame->data[0] && frame->linesize[0] > 0 && height > 0) {
-      size_t plane_bytes = static_cast<size_t>(frame->linesize[0]) * height;
-      constexpr size_t kMaxFrameHashBytes = 16u * 1024u * 1024u;
-      if (plane_bytes > kMaxFrameHashBytes) plane_bytes = kMaxFrameHashBytes;
-      digest = sha256_hex_of_bytes(frame->data[0], plane_bytes);
-      for (size_t i = 0; i < plane_bytes && !non_zero; ++i) non_zero = frame->data[0][i] != 0;
+    const char *format = "other";
+    {
+      std::lock_guard<std::mutex> lock(tap_state.mutex);
+      width = tap_state.width;
+      height = tap_state.height;
+      if (!tap_state.plane0.empty()) {
+        digest = sha256_hex_of_bytes(tap_state.plane0.data(), tap_state.plane0.size());
+        for (size_t i = 0; i < tap_state.plane0.size() && !non_zero; ++i) non_zero = tap_state.plane0[i] != 0;
+      }
+      format = tap_state.format == VIDEO_FORMAT_BGRA ? "bgra" : "other";
+      tap_state.plane0.clear();
     }
-    const char *format = frame->format == VIDEO_FORMAT_BGRA ? "bgra" : "other";
-    obs_source_release_frame(obs_it->second, frame);
     if (digest.empty()) return rpc_error_result(-32603, "async frame carried no readable plane");
     return "{\"ok\":true,\"sourceId\":\"" + json_escape(source_id) +
            "\",\"renderer\":\"libobs-async-frame\",\"width\":" + std::to_string(width) +
@@ -6451,6 +6629,9 @@ private:
     });
     add("scene.captureFrame", [this](int fd, const std::string &id, const std::string &payload) {
       send_renderer_result(fd, id, renderer_.capture_frame(payload));
+    });
+    add("program.captureFrame", [this](int fd, const std::string &id, const std::string &payload) {
+      send_renderer_result(fd, id, renderer_.capture_program_frame(payload));
     });
     add("source.captureFrame", [this](int fd, const std::string &id, const std::string &payload) {
       send_renderer_result(fd, id, renderer_.capture_source_frame(payload));

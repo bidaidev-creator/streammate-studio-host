@@ -229,6 +229,28 @@ class PluginSliceTextSettingTest(unittest.TestCase):
         self.assertIn("unknown plugin-settings key", response["error"]["message"])
 
 
+class ProgramCaptureFrameTest(unittest.TestCase):
+    """O-NIF-1 render truth: program.captureFrame reads the REAL composited
+    program video frames (obs raw video callback — the same pixels egress
+    encodes). scene.captureFrame remains the scaffold-model raster; the
+    program verb is the pixel authority and refuses honestly off-libobs.
+    """
+
+    def setUp(self) -> None:
+        self.process, self.sock = start_connected_host()
+        self.addCleanup(lifecycle.stop_process, self.process)
+        self.addCleanup(self.sock.close)
+
+    def test_hello_advertises_program_capture(self) -> None:
+        hello = lifecycle.rpc(self.sock, 9296, "host.hello", {})
+        self.assertIn("program.captureFrame", hello["result"]["supportedCommands"])
+
+    def test_scaffold_refuses_program_capture_honestly(self) -> None:
+        response = lifecycle.rpc(self.sock, 9297, "program.captureFrame", {})
+        self.assertIn("error", response)
+        self.assertIn("libobs", response["error"]["message"])
+
+
 if __name__ == "__main__":
     # test_host_lifecycle resolves HOST_BIN from sys.argv[1] at import time
     # (ctest passes $<TARGET_FILE:studio-host>); keep it out of unittest's argv.

@@ -449,6 +449,17 @@ class UserPluginLoadingLibobsTest(unittest.TestCase):
         cap2 = host.rpc(sock, 9405, "source.captureFrame", {"sourceId": "slice-src"})
         self.assertEqual(cap2["result"]["frameSha256"], cap1["result"]["frameSha256"])
 
+        # O-NIF-1 capture-race design fix (CI run 29368227362 red): the scene
+        # is PROGRAM and the plugin filter is attached — the exact starvation
+        # scenario where obs_source_get_frame raced the render consumer.
+        # The tap-based capture must succeed repeatedly, identically, at any
+        # machine speed.
+        for i in range(3):
+            capn = host.rpc(sock, 9440 + i, "source.captureFrame", {"sourceId": "slice-src"})
+            self.assertIn("result", capn, msg=f"tap capture {i} errored: {json.dumps(capn)}")
+            self.assertEqual(capn["result"]["frameSha256"], cap1["result"]["frameSha256"],
+                             msg=f"tap capture {i} digest drifted")
+
         # O-NIF-1 vendor render proof path: scene.captureFrame reads the
         # composited PROGRAM render (a texture copy, not the async-frame queue),
         # so it is the render primitive for synchronous/custom-draw vendor
@@ -460,6 +471,26 @@ class UserPluginLoadingLibobsTest(unittest.TestCase):
         self.assertGreater(len(png1), 0)
         scap2 = host.rpc(sock, 9421, "scene.captureFrame", {"sceneId": "slice", "format": "png"})
         self.assertEqual(scap2["result"]["pngBase64"], png1)
+
+        # O-NIF-1: program.captureFrame reads the REAL composited program
+        # video (raw video callback — the frames egress encodes). For a static
+        # program scene: deterministic across consecutive captures, nonzero,
+        # and the test source's visibility provably changes the pixels.
+        pcap1 = host.rpc(sock, 9430, "program.captureFrame", {})
+        self.assertIn("result", pcap1, msg=f"program.captureFrame errored: {json.dumps(pcap1)}")
+        self.assertEqual(pcap1["result"]["renderer"], "libobs-program-video")
+        self.assertIs(pcap1["result"]["nonZeroBytes"], True)
+        pcap2 = host.rpc(sock, 9431, "program.captureFrame", {})
+        self.assertEqual(pcap2["result"]["frameSha256"], pcap1["result"]["frameSha256"])
+        hidden_toggle = host.rpc(sock, 9432, "sceneItem.setVisible",
+                                 {"sceneId": "slice", "itemId": "slice-src", "visible": False})
+        self.assertTrue(hidden_toggle["result"]["ok"])
+        pcap_hidden = host.rpc(sock, 9433, "program.captureFrame", {})
+        self.assertNotEqual(pcap_hidden["result"]["frameSha256"], pcap1["result"]["frameSha256"],
+                            msg="hiding the source must change the real program pixels")
+        shown_toggle = host.rpc(sock, 9434, "sceneItem.setVisible",
+                                {"sceneId": "slice", "itemId": "slice-src", "visible": True})
+        self.assertTrue(shown_toggle["result"]["ok"])
 
         # O-NIF-1: the bounded `text` plugin-setting is accepted in the real
         # lane (the test source ignores it; the settings gate must not refuse).
