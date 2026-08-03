@@ -43,7 +43,9 @@ endforeach()
 option(STREAMMATE_ENABLE_CEF_QT_LOOP "Run a Qt main-thread event loop for the obs-browser CEF module" OFF)
 if(STREAMMATE_ENABLE_CEF_QT_LOOP)
   find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets)
-  target_compile_definitions(studio-host PRIVATE STREAMMATE_HAS_CEF_QT_LOOP=1)
+  # QT_NO_KEYWORDS: the host uses libobs signal-handler idioms (`signals` as an
+  # identifier), which Qt's keyword macros would otherwise rewrite.
+  target_compile_definitions(studio-host PRIVATE STREAMMATE_HAS_CEF_QT_LOOP=1 QT_NO_KEYWORDS)
   target_link_libraries(studio-host PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets)
 endif()
 
