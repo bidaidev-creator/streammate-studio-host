@@ -67,7 +67,9 @@ jobs:
             -DENABLE_WEBRTC=OFF \
             -DENABLE_VST=OFF \
             -DENABLE_AJA=OFF \
-            -DENABLE_DECKLINK=OFF
+            -DENABLE_DECKLINK=OFF \
+            -DENABLE_BROWSER=ON \
+            -DENABLE_BROWSER_PANELS=OFF
 
       - name: Build libobs and required upstream modules
         run: |
@@ -81,7 +83,56 @@ jobs:
           cmake --build build/obs --config RelWithDebInfo --target coreaudio-encoder || true
           cmake --build build/obs --config RelWithDebInfo --target mac-videotoolbox || true
           cmake --build build/obs --config RelWithDebInfo --target obs-ffmpeg || true
-          cmake --build build/obs --config RelWithDebInfo --target obs-browser || true
+
+      # Spike #521 exit criterion 1: obs-browser MUST build against the pinned
+      # libobs with the pinned CEF distribution (downloaded and hash-verified by
+      # upstream's own buildspec machinery at configure time). No `|| true`.
+      - name: Build obs-browser and CEF helper apps
+        run: |
+          cmake --build build/obs --config RelWithDebInfo --target obs-browser
+          cmake --build build/obs --config RelWithDebInfo --target browser-helper
+          cmake --build build/obs --config RelWithDebInfo --target browser-helper_gpu
+          cmake --build build/obs --config RelWithDebInfo --target browser-helper_plugin
+          cmake --build build/obs --config RelWithDebInfo --target browser-helper_renderer
+
+      - name: Survey CEF payload layout and linkage
+        run: |
+          set -x
+          ls external/obs-studio/.deps
+          find build/obs/plugins/obs-browser -maxdepth 3 \( -name '*.plugin' -o -name '*.app' \) -print
+          cef_root="$(find external/obs-studio/.deps -maxdepth 1 -type d -name 'cef_binary_*' | head -n 1)"
+          ls "$cef_root" "$cef_root/Release" || true
+          plugin_bin="$(find build/obs/plugins/obs-browser -path '*/obs-browser.plugin/Contents/MacOS/obs-browser' | head -n 1)"
+          otool -L "$plugin_bin"
+          otool -l "$plugin_bin" | grep -A2 LC_RPATH || true
+          helper_bin="$(find build/obs/plugins/obs-browser -path '*/OBS Helper.app/Contents/MacOS/OBS Helper' | head -n 1)"
+          otool -L "$helper_bin"
+          otool -l "$helper_bin" | grep -A2 LC_RPATH || true
+
+      - name: Stage spike CEF payload artifact
+        run: |
+          cef_root="$(find external/obs-studio/.deps -maxdepth 1 -type d -name 'cef_binary_*' | head -n 1)"
+          qt_root="$(find external/obs-studio/.deps -maxdepth 1 -type d -name 'obs-deps-qt6-*' | head -n 1)"
+          stage="$RUNNER_TEMP/cef-spike-payload"
+          rm -rf "$stage"
+          mkdir -p "$stage"
+          cp -R "$(find build/obs/plugins/obs-browser -path '*/obs-browser.plugin' -type d | head -n 1)" "$stage/"
+          for helper in "OBS Helper.app" "OBS Helper (GPU).app" "OBS Helper (Plugin).app" "OBS Helper (Renderer).app"; do
+            cp -R "$(find build/obs/plugins/obs-browser -path "*/$helper" -type d | head -n 1)" "$stage/"
+          done
+          cp -R "$cef_root/Release/Chromium Embedded Framework.framework" "$stage/"
+          mkdir -p "$stage/qt6"
+          for fw in QtCore QtGui QtWidgets; do
+            cp -R "$qt_root/lib/$fw.framework" "$stage/qt6/"
+          done
+          cp -R "$qt_root/plugins/platforms" "$stage/qt6/platforms" || true
+          tar -C "$RUNNER_TEMP" -czf cef-spike-payload.tar.gz cef-spike-payload
+
+      - name: Upload spike CEF payload
+        uses: actions/upload-artifact@v4
+        with:
+          name: cef-spike-payload
+          path: cef-spike-payload.tar.gz
 
       - name: Locate built libobs
         id: libobs
