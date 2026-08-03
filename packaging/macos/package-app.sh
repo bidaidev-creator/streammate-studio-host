@@ -9,6 +9,12 @@ obs_modules_dir=""
 obs_deps_lib_dir=""
 obs_graphics_module=""
 streammate_plugin=""
+obs_browser_plugin=""
+obs_frontend_api=""
+cef_framework=""
+cef_helpers_dir=""
+qt_lib_dir=""
+qt_platform_plugin=""
 output_dir="dist"
 skip_codesign=0
 skip_install_name_tool=0
@@ -19,6 +25,8 @@ usage: package-app.sh --host-bin PATH --smoke-bin PATH --info-plist PATH \
   --libobs-framework PATH --obs-modules-dir PATH --obs-deps-lib-dir PATH \
   --obs-graphics-module PATH \
   [--streammate-plugin PATH] \
+  [--obs-browser-plugin PATH --obs-frontend-api PATH --cef-framework PATH \
+   --cef-helpers-dir PATH --qt-lib-dir PATH --qt-platform-plugin PATH] \
   [--output-dir PATH] [--skip-codesign] [--skip-install-name-tool]
 USAGE
 }
@@ -33,6 +41,12 @@ while [[ $# -gt 0 ]]; do
     --obs-deps-lib-dir) obs_deps_lib_dir="${2:-}"; shift 2 ;;
     --obs-graphics-module) obs_graphics_module="${2:-}"; shift 2 ;;
     --streammate-plugin) streammate_plugin="${2:-}"; shift 2 ;;
+    --obs-browser-plugin) obs_browser_plugin="${2:-}"; shift 2 ;;
+    --obs-frontend-api) obs_frontend_api="${2:-}"; shift 2 ;;
+    --cef-framework) cef_framework="${2:-}"; shift 2 ;;
+    --cef-helpers-dir) cef_helpers_dir="${2:-}"; shift 2 ;;
+    --qt-lib-dir) qt_lib_dir="${2:-}"; shift 2 ;;
+    --qt-platform-plugin) qt_platform_plugin="${2:-}"; shift 2 ;;
     --output-dir) output_dir="${2:-}"; shift 2 ;;
     --skip-codesign) skip_codesign=1; shift ;;
     --skip-install-name-tool) skip_install_name_tool=1; shift ;;
@@ -119,6 +133,65 @@ if [[ -n "$streammate_plugin" ]]; then
   cp -R "$streammate_plugin" "$plugins/"
 fi
 
+# CEF payload (spike bidaidev-creator/streammate#521). All five CEF/Qt inputs
+# travel together: the obs-browser module, the CEF framework it loads at
+# runtime from Contents/Frameworks, the four helper apps CEF spawns for its
+# subprocesses, and the Qt frameworks/platform plugin the module links (macOS
+# obs-browser is built with ENABLE_BROWSER_QT_LOOP). CEF resolves the helper
+# bundle name from the MAIN EXECUTABLE name (libcef util_mac.mm:
+# GetNormalChildProcessPath appends "<exe> Helper.app" under
+# Contents/Frameworks), so the upstream-built "OBS Helper*.app" bundles are
+# re-staged as "studio-host Helper*.app" with CFBundleExecutable/CFBundleName
+# and a namespaced CFBundleIdentifier rewritten to match.
+if [[ -n "$obs_browser_plugin" || -n "$cef_framework" || -n "$cef_helpers_dir" ]]; then
+  require_dir "obs-browser plugin bundle" "$obs_browser_plugin"
+  require_file "obs-frontend-api dylib" "$obs_frontend_api"
+  require_dir "CEF framework" "$cef_framework"
+  require_dir "CEF helpers directory" "$cef_helpers_dir"
+  require_dir "Qt library directory" "$qt_lib_dir"
+  require_file "Qt cocoa platform plugin" "$qt_platform_plugin"
+
+  cp -R "$obs_browser_plugin" "$plugins/"
+  # obs-browser links @rpath/obs-frontend-api.dylib (real dylib, not just
+  # headers); with no frontend registered its callbacks are inert no-ops.
+  cp "$obs_frontend_api" "$frameworks/"
+  cp -R "$cef_framework" "$frameworks/"
+
+  for qt_framework in QtCore QtGui QtWidgets; do
+    require_dir "Qt framework $qt_framework" "$qt_lib_dir/$qt_framework.framework"
+    cp -R "$qt_lib_dir/$qt_framework.framework" "$frameworks/"
+  done
+  mkdir -p "$contents/PlugIns/platforms"
+  cp "$qt_platform_plugin" "$contents/PlugIns/platforms/"
+
+  helper_variants=(":" " (GPU):.gpu" " (Plugin):.plugin" " (Renderer):.renderer")
+  for variant in "${helper_variants[@]}"; do
+    suffix="${variant%%:*}"
+    id_suffix="${variant#*:}"
+    src_app="$cef_helpers_dir/OBS Helper$suffix.app"
+    dst_app="$frameworks/studio-host Helper$suffix.app"
+    require_dir "CEF helper bundle" "$src_app"
+    cp -R "$src_app" "$dst_app"
+    mv "$dst_app/Contents/MacOS/OBS Helper$suffix" "$dst_app/Contents/MacOS/studio-host Helper$suffix"
+    /usr/bin/python3 - "$dst_app/Contents/Info.plist" "studio-host Helper$suffix" "$id_suffix" <<'PY'
+import plistlib
+import sys
+from pathlib import Path
+path = Path(sys.argv[1])
+name = sys.argv[2]
+id_suffix = sys.argv[3]
+with path.open('rb') as handle:
+    data = plistlib.load(handle)
+data['CFBundleExecutable'] = name
+data['CFBundleName'] = name
+data['CFBundleDisplayName'] = name
+data['CFBundleIdentifier'] = 'com.streammate.studio-host.helper' + id_suffix
+with path.open('wb') as handle:
+    plistlib.dump(data, handle, sort_keys=False)
+PY
+  done
+fi
+
 required_modules=(mac-avcapture mac-capture obs-outputs obs-x264)
 missing_modules=()
 for module in "${required_modules[@]}"; do
@@ -173,13 +246,24 @@ if [[ $skip_codesign -eq 0 ]]; then
   for dylib in "$frameworks"/*.dylib; do
     sign_adhoc "$(nested_identifier "$dylib")" "$dylib"
   done
-  # 2. OBS plugin/module bundles in Contents/PlugIns/obs-plugins.
-  for module in "$plugins"/*.plugin "$plugins"/*.so "$plugins"/*.dylib; do
+  # 2. OBS plugin/module bundles in Contents/PlugIns/obs-plugins, plus the Qt
+  # platform plugin staged under Contents/PlugIns/platforms.
+  for module in "$plugins"/*.plugin "$plugins"/*.so "$plugins"/*.dylib "$contents/PlugIns/platforms"/*.dylib; do
     sign_adhoc "$(nested_identifier "$module")" "$module"
   done
-  # 3. Versioned frameworks (deepest bundles) after their own leaf code.
+  # 3. Versioned frameworks (deepest bundles) after their own leaf code. The
+  # CEF framework carries nested leaf dylibs (libEGL, swiftshader, ...) that
+  # must hold their own signatures before the enclosing framework is signed,
+  # or the strict verify reports them as unsealed.
+  for cef_leaf in "$frameworks/Chromium Embedded Framework.framework/Libraries"/*.dylib; do
+    sign_adhoc "$(nested_identifier "$cef_leaf")" "$cef_leaf"
+  done
   for framework_bundle in "$frameworks"/*.framework; do
     sign_adhoc "$(nested_identifier "$framework_bundle")" "$framework_bundle"
+  done
+  # 3b. CEF helper app bundles (independent nested apps under Frameworks).
+  for helper_app in "$frameworks"/*.app; do
+    sign_adhoc "$(nested_identifier "$helper_app")" "$helper_app"
   done
   # 4. Secondary Mach-O executable (the main executable is signed with the app).
   sign_adhoc "com.streammate.studio-host.vendored.smoke" "$macos/studio-host-smoke"

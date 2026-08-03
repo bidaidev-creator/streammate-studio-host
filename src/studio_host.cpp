@@ -53,6 +53,11 @@
 #include <callback/proc.h>
 #endif
 
+#if STREAMMATE_HAS_CEF_QT_LOOP
+#include <QApplication>
+#include <QMetaObject>
+#endif
+
 namespace {
 constexpr const char *kVersion = STREAMMATE_STUDIO_HOST_VERSION;
 constexpr int kUsageExit = 64;
@@ -549,6 +554,52 @@ std::string json_escape(const std::string &input) {
   }
   return out.str();
 }
+
+void emit_log(const std::string &level, const std::string &event, const std::string &message);
+
+#if STREAMMATE_HAS_CEF_QT_LOOP
+// CEF must be initialized on the process main thread: the obs-browser module
+// is built with ENABLE_BROWSER_QT_LOOP, so whichever thread first creates a
+// browser_source runs CefInitialize — and control RPCs execute on the control
+// thread, which is the wrong one. Every host code path that may instantiate a
+// browser_source funnels through here first: the one-time init is marshaled
+// to the Qt main loop and waited on, making the create-time call inside
+// obs-browser a guarded no-op. Kinds other than browser_source return
+// immediately, so boots and non-browser tests never pay for (or depend on)
+// CEF. Absence of the module downgrades to a log line — browser sources are
+// then unavailable, never a boot failure.
+void ensure_cef_initialized_for_kind(const char *kind) {
+#if STREAMMATE_HAS_LIBOBS
+  if (!kind || std::strcmp(kind, "browser_source") != 0) return;
+  static std::once_flag cef_once;
+  std::call_once(cef_once, [] {
+    QMetaObject::invokeMethod(
+        QCoreApplication::instance(),
+        [] {
+          obs_module_t *module = obs_get_module("obs-browser");
+          if (!module) {
+            emit_log("info", "host.cef", "obs-browser module not loaded; browser sources unavailable");
+            return;
+          }
+          void *lib = obs_get_module_lib(module);
+          using InitializeFn = void (*)(void);
+          auto initialize = lib ? reinterpret_cast<InitializeFn>(dlsym(lib, "obs_browser_initialize")) : nullptr;
+          if (!initialize) {
+            emit_log("warn", "host.cef", "obs_browser_initialize export not found");
+            return;
+          }
+          initialize();
+          emit_log("info", "host.cef", "CEF initialized on main thread");
+        },
+        Qt::BlockingQueuedConnection);
+  });
+#else
+  (void)kind;
+#endif
+}
+#else
+inline void ensure_cef_initialized_for_kind(const char *) {}
+#endif
 
 void emit_log(const std::string &level, const std::string &event, const std::string &message) {
   std::cout << "{\"level\":\"" << json_escape(level) << "\",\"event\":\"" << json_escape(event)
@@ -2542,6 +2593,7 @@ private:
     obs_data_set_string(settings, "url", model.url.c_str());
     obs_data_set_int(settings, "width", model.width);
     obs_data_set_int(settings, "height", model.height);
+    ensure_cef_initialized_for_kind("browser_source");
     obs_source_t *source = obs_source_create("browser_source", model.id.c_str(), settings, nullptr);
     if (!source) source = obs_source_create("color_source", model.id.c_str(), settings, nullptr);
     obs_data_release(settings);
@@ -2588,6 +2640,7 @@ private:
         break;
       }
     }
+    ensure_cef_initialized_for_kind(model.kind.c_str());
     obs_source_t *source = obs_source_create(model.kind.c_str(), model.id.c_str(), settings, nullptr);
     obs_data_release(settings);
     if (!source) return false;
@@ -4682,6 +4735,7 @@ private:
       obs_data_release(settings);
       return false;
     }
+    ensure_cef_initialized_for_kind(source_id.c_str());
     obs_source_t *source = obs_source_create_private(source_id.c_str(), safe_name.c_str(), settings);
     if (!source) {
       obs_data_release(settings);
@@ -6769,6 +6823,11 @@ int main(int argc, char **argv) {
       containment.suspects = options.plugin_suspects;
       containment.consumed_retries = options.plugin_consumed_retries;
     }
+#if STREAMMATE_HAS_CEF_QT_LOOP
+    // Created before obs_startup, mirroring OBS Studio's own boot order; the
+    // Qt event loop on this thread is what pumps CEF's external message pump.
+    QApplication qt_app(argc, argv);
+#endif
     EngineLifecycle engine;
     if (!engine.start(options.user_plugins, containment)) {
       emit_log("error", "host.degraded", "engine startup failed");
@@ -6776,7 +6835,21 @@ int main(int argc, char **argv) {
     }
     StateFile state(options.state_file);
     ControlServer server(options, engine, state);
+#if STREAMMATE_HAS_CEF_QT_LOOP
+    // The control server moves to a worker thread; the main thread runs the
+    // Qt event loop until the server exits (shutdown RPC or signal), then the
+    // queued quit unwinds exec(). A server that finishes before exec() starts
+    // is fine: the queued invocation is processed as soon as exec() runs.
+    int result = kRuntimeExit;
+    std::thread server_thread([&server, &result, &qt_app] {
+      result = server.run();
+      QMetaObject::invokeMethod(&qt_app, &QCoreApplication::quit, Qt::QueuedConnection);
+    });
+    qt_app.exec();
+    server_thread.join();
+#else
     int result = server.run();
+#endif
     engine.shutdown();
     return result;
   } catch (const std::exception &error) {
