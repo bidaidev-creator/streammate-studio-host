@@ -1818,6 +1818,11 @@ public:
         if (!parsed.ok) return rpc_error_result(-32602, parsed.error);
         plugin_settings = std::move(parsed.settings);
       }
+      // reroute_audio is an obs-browser setting; echoing it for a plugin kind
+      // that never applies it would fabricate routing state.
+      if (request.find("\"rerouteAudio\"") != std::string::npos) {
+        return rpc_error_result(-32602, "rerouteAudio is only valid for browser sources");
+      }
 #if STREAMMATE_HAS_LIBOBS
       if (!user_plugin_types_ || user_plugin_types_->sources.find(kind) == user_plugin_types_->sources.end()) {
         return rpc_error_result(-32602, "kind is not a loaded user-plugin source type");
@@ -1858,6 +1863,26 @@ public:
       source.plugin_filter_kind = plugin_filter_kind;
       source.plugin_filter_id = plugin_filter_id;
     }
+    // Same-id recreation is legal (the compose idempotency path), so a mirror
+    // refusal must restore the replaced model entries, not just erase the new
+    // ones — otherwise a refused recreate deletes a live source from the model.
+    std::optional<SourceModel> replaced_source;
+    if (auto prior = sources_.find(source_id); prior != sources_.end()) replaced_source = prior->second;
+    std::optional<std::vector<FilterModel>> replaced_filters;
+    if (auto prior = filters_.find(source_id); prior != filters_.end()) replaced_filters = prior->second;
+    const auto restore_replaced = [&] {
+      if (replaced_source) {
+        sources_[source_id] = *replaced_source;
+      } else {
+        sources_.erase(source_id);
+      }
+      if (replaced_filters) {
+        filters_[source_id] = *replaced_filters;
+      } else {
+        filters_.erase(source_id);
+      }
+    };
+
     sources_[source_id] = source;
     if (source.is_plugin_kind) {
       // Plugin sources carry ONLY their explicitly-requested plugin filter;
@@ -1876,13 +1901,11 @@ public:
 #if STREAMMATE_HAS_LIBOBS
     if (source.is_plugin_kind) {
       if (!mirror_plugin_source_create(sources_[source_id])) {
-        sources_.erase(source_id);
-        filters_.erase(source_id);
+        restore_replaced();
         return rpc_error_result(-32603, "plugin source instantiation failed (no placeholder substituted)");
       }
     } else if (!mirror_source_create(sources_[source_id])) {
-      sources_.erase(source_id);
-      filters_.erase(source_id);
+      restore_replaced();
       return rpc_error_result(-32603,
                               "browser source instantiation failed: obs-browser (CEF) is unavailable in this build "
                               "(no placeholder substituted)");
@@ -2626,17 +2649,21 @@ private:
   }
 
   void release_obs_source(const std::string &source_id) {
-    auto source = obs_sources_.find(source_id);
-    if (source != obs_sources_.end()) {
-      obs_source_release(source->second);
-      obs_sources_.erase(source);
-    }
+    // Scene items hold their own reference: erasing the bookkeeping without
+    // obs_sceneitem_remove leaves the old source rendering in the live scene
+    // while scene.list/source.remove deny it exists.
     for (auto it = obs_scene_items_.begin(); it != obs_scene_items_.end();) {
       if (it->first.size() > source_id.size() && it->first.ends_with("\n" + source_id)) {
+        if (it->second) obs_sceneitem_remove(it->second);
         it = obs_scene_items_.erase(it);
       } else {
         ++it;
       }
+    }
+    auto source = obs_sources_.find(source_id);
+    if (source != obs_sources_.end()) {
+      obs_source_release(source->second);
+      obs_sources_.erase(source);
     }
   }
 
@@ -2686,8 +2713,10 @@ private:
   bool mirror_source_create(const SourceModel &model) {
     auto scene = obs_scenes_.find(model.scene_id);
     if (scene == obs_scenes_.end()) return false;
-    release_obs_source(model.id);
 
+    // Transactional refusal: probe registration and create the replacement
+    // BEFORE releasing any existing same-id source (same-id recreation is the
+    // compose idempotency path), so a refusal leaves prior state intact.
     ensure_cef_initialized_for_kind("browser_source");
     if (!obs_source_get_display_name("browser_source")) return false;
 
@@ -2701,9 +2730,14 @@ private:
     obs_data_release(settings);
     if (!source) return false;
 
-    obs_sources_[model.id] = source;
+    release_obs_source(model.id);
     obs_sceneitem_t *item = obs_scene_add(scene->second, source);
-    if (item) obs_scene_items_[scene_item_key(model.scene_id, model.id)] = item;
+    if (!item) {
+      obs_source_release(source);
+      return false;
+    }
+    obs_sources_[model.id] = source;
+    obs_scene_items_[scene_item_key(model.scene_id, model.id)] = item;
 
     obs_source_t *filter = obs_source_create("color_filter_v2", "color-correction", nullptr, nullptr);
     if (filter) {

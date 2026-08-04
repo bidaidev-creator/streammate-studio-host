@@ -97,6 +97,22 @@ class CefCompositionScaffoldParityTest(unittest.TestCase):
         )["result"]
         self.assertIs(defaulted["rerouteAudio"], False)
 
+    def test_reroute_audio_is_refused_for_plugin_kinds(self) -> None:
+        # Identical in both lanes: reroute_audio is an obs-browser setting, and
+        # echoing it for a plugin kind that never applies it would fabricate
+        # routing state. The rejection fires before lane divergence.
+        sock = self._connect()
+        self._load_scene(sock)
+        response = host.rpc(
+            sock,
+            520,
+            "source.create",
+            {"sceneId": SCENE_ID, "sourceId": "plugin-reroute", "kind": "some-plugin", "rerouteAudio": True},
+        )
+        self.assertNotIn("result", response, response)
+        self.assertEqual(response["error"]["code"], -32602, response)
+        self.assertIn("only valid for browser sources", response["error"]["message"])
+
     @unittest.skipIf(EXPECT_LIBOBS, "libobs lane captures real program audio")
     def test_program_capture_audio_refuses_honestly_without_libobs(self) -> None:
         sock = self._connect()
@@ -205,6 +221,39 @@ class CefCompositionLibobsTest(unittest.TestCase):
         self.assertIsNotNone(audible, "program mix never carried the page's tone (reroute_audio path)")
         self.assertGreater(audible["peak"], 0.001)
         self.assertGreater(audible["frames"], 0)
+
+    def test_reroute_audio_off_keeps_program_mix_silent(self) -> None:
+        # The false direction: a mirror that unconditionally wrote
+        # reroute_audio=true would pass the audible test above, so prove the
+        # same tone page WITHOUT rerouteAudio leaves the program mix silent
+        # even after its pixels reach program video.
+        _, sock = self._connect()
+        self._program_scene(sock)
+        baseline = self._capture_frame(sock, 800)
+
+        created = host.rpc(
+            sock,
+            801,
+            "source.create",
+            {"sceneId": SCENE_ID, "sourceId": SOURCE_ID, "kind": "browser",
+             "url": self.page_url, "width": 1280, "height": 720},
+        )["result"]
+        self.assertIs(created["rerouteAudio"], False)
+
+        rendered = False
+        deadline = time.time() + 90
+        rpc_id = 810
+        while time.time() < deadline:
+            frame = self._capture_frame(sock, rpc_id)
+            rpc_id += 1
+            if frame["frameSha256"] != baseline["frameSha256"] and frame["nonZeroBytes"]:
+                rendered = True
+                break
+            time.sleep(1)
+        self.assertTrue(rendered, "tone page never rendered (cannot prove the silent direction)")
+
+        audio = self._capture_audio(sock, rpc_id, duration_ms=1500)
+        self.assertIs(audio["nonSilent"], False, f"program mix carried audio without reroute_audio: {audio}")
 
     def test_browser_source_refuses_without_obs_browser_plugin(self) -> None:
         bundle = host.HOST_BIN.parents[2]
