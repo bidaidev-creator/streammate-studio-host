@@ -13,6 +13,7 @@
 #include <fcntl.h>
 #include <filesystem>
 #include <cerrno>
+#include <exception>
 #include <fstream>
 #include <functional>
 #include <iomanip>
@@ -1737,6 +1738,9 @@ struct SourceModel {
   double volume_db = 0.0;
   std::string media_action = "stop";
   int browser_refresh_count = 0;
+  // Phase A composition: route browser-source audio into the program mix
+  // (obs-browser `reroute_audio`) instead of the OS default output.
+  bool reroute_audio = false;
   // NIF-V1: user-plugin source kinds (never placeholder-substituted).
   bool is_plugin_kind = false;
   std::map<std::string, FilterSettingValue> plugin_settings;
@@ -1814,6 +1818,11 @@ public:
         if (!parsed.ok) return rpc_error_result(-32602, parsed.error);
         plugin_settings = std::move(parsed.settings);
       }
+      // reroute_audio is an obs-browser setting; echoing it for a plugin kind
+      // that never applies it would fabricate routing state.
+      if (request.find("\"rerouteAudio\"") != std::string::npos) {
+        return rpc_error_result(-32602, "rerouteAudio is only valid for browser sources");
+      }
 #if STREAMMATE_HAS_LIBOBS
       if (!user_plugin_types_ || user_plugin_types_->sources.find(kind) == user_plugin_types_->sources.end()) {
         return rpc_error_result(-32602, "kind is not a loaded user-plugin source type");
@@ -1846,6 +1855,7 @@ public:
     source.height = extract_json_int(request, "height").value_or(scene.height);
     source.opacity = std::clamp(extract_json_double(request, "opacity").value_or(1.0), 0.0, 1.0);
     source.muted = extract_json_bool(request, "muted").value_or(false);
+    source.reroute_audio = extract_json_bool(request, "rerouteAudio").value_or(false);
     source.position = next_position(scene_id);
     if (kind != "browser") {
       source.is_plugin_kind = true;
@@ -1853,6 +1863,26 @@ public:
       source.plugin_filter_kind = plugin_filter_kind;
       source.plugin_filter_id = plugin_filter_id;
     }
+    // Same-id recreation is legal (the compose idempotency path), so a mirror
+    // refusal must restore the replaced model entries, not just erase the new
+    // ones — otherwise a refused recreate deletes a live source from the model.
+    std::optional<SourceModel> replaced_source;
+    if (auto prior = sources_.find(source_id); prior != sources_.end()) replaced_source = prior->second;
+    std::optional<std::vector<FilterModel>> replaced_filters;
+    if (auto prior = filters_.find(source_id); prior != filters_.end()) replaced_filters = prior->second;
+    const auto restore_replaced = [&] {
+      if (replaced_source) {
+        sources_[source_id] = *replaced_source;
+      } else {
+        sources_.erase(source_id);
+      }
+      if (replaced_filters) {
+        filters_[source_id] = *replaced_filters;
+      } else {
+        filters_.erase(source_id);
+      }
+    };
+
     sources_[source_id] = source;
     if (source.is_plugin_kind) {
       // Plugin sources carry ONLY their explicitly-requested plugin filter;
@@ -1871,12 +1901,14 @@ public:
 #if STREAMMATE_HAS_LIBOBS
     if (source.is_plugin_kind) {
       if (!mirror_plugin_source_create(sources_[source_id])) {
-        sources_.erase(source_id);
-        filters_.erase(source_id);
+        restore_replaced();
         return rpc_error_result(-32603, "plugin source instantiation failed (no placeholder substituted)");
       }
-    } else {
-      mirror_source_create(sources_[source_id]);
+    } else if (!mirror_source_create(sources_[source_id])) {
+      restore_replaced();
+      return rpc_error_result(-32603,
+                              "browser source instantiation failed: obs-browser (CEF) is unavailable in this build "
+                              "(no placeholder substituted)");
     }
 #endif
     return source_result(sources_[source_id], true);
@@ -2124,6 +2156,90 @@ public:
 #endif
   }
 
+  // B0-13 sound-cue authority: a bounded observation of the REAL program
+  // audio mix — the same mix the AAC encoder consumes — so "audio reached the
+  // stream" is a measured fact (peak/RMS over a window), not a timestamp
+  // record. Levels, not samples, cross the wire. Scaffold lane refuses.
+#if STREAMMATE_HAS_LIBOBS
+  struct ProgramAudioGrab {
+    std::mutex mutex;
+    std::condition_variable cv;
+    size_t channels = 0;
+    uint64_t frames = 0;
+    uint64_t target_frames = 0;
+    float peak = 0.0f;
+    double sum_squares = 0.0;
+    uint64_t samples = 0;
+    bool done = false;
+  };
+
+  static void program_audio_grab_cb(void *param, size_t, struct audio_data *data) {
+    auto *grab = static_cast<ProgramAudioGrab *>(param);
+    if (!data || !data->frames) return;
+    std::lock_guard<std::mutex> lock(grab->mutex);
+    if (grab->done) return;
+    for (size_t channel = 0; channel < grab->channels; ++channel) {
+      const float *plane = reinterpret_cast<const float *>(data->data[channel]);
+      if (!plane) continue;
+      for (uint32_t frame = 0; frame < data->frames; ++frame) {
+        const float sample = plane[frame];
+        const float magnitude = sample < 0.0f ? -sample : sample;
+        if (magnitude > grab->peak) grab->peak = magnitude;
+        grab->sum_squares += static_cast<double>(sample) * static_cast<double>(sample);
+        ++grab->samples;
+      }
+    }
+    grab->frames += data->frames;
+    if (grab->frames >= grab->target_frames) {
+      grab->done = true;
+      grab->cv.notify_all();
+    }
+  }
+#endif
+
+  std::string capture_program_audio(const std::string &request) {
+#if STREAMMATE_HAS_LIBOBS
+    const int duration_ms =
+        std::clamp(static_cast<int>(extract_json_int(request, "durationMs").value_or(500)), 50, 5000);
+    audio_t *audio = obs_get_audio();
+    obs_audio_info audio_info{};
+    if (!audio || !obs_get_audio_info(&audio_info)) return rpc_error_result(-32603, "audio pipeline not initialized");
+    const uint32_t sample_rate = audio_output_get_sample_rate(audio);
+    const size_t channels = audio_output_get_channels(audio);
+    if (!sample_rate || !channels) return rpc_error_result(-32603, "audio pipeline not initialized");
+
+    ProgramAudioGrab grab;
+    grab.channels = channels;
+    grab.target_frames = static_cast<uint64_t>(sample_rate) * static_cast<uint64_t>(duration_ms) / 1000;
+
+    audio_convert_info conversion{};
+    conversion.samples_per_sec = sample_rate;
+    conversion.format = AUDIO_FORMAT_FLOAT_PLANAR;
+    conversion.speakers = audio_info.speakers;
+    obs_add_raw_audio_callback(0, &conversion, program_audio_grab_cb, &grab);
+    bool done = false;
+    {
+      std::unique_lock<std::mutex> lock(grab.mutex);
+      // The window plus a 5s scheduling grace, mirroring the video bound;
+      // clients must use a longer RPC timeout than this server bound.
+      done = grab.cv.wait_for(lock, std::chrono::milliseconds(duration_ms + 5000), [&grab] { return grab.done; });
+    }
+    obs_remove_raw_audio_callback(0, program_audio_grab_cb, &grab);
+    if (!done) return rpc_error_result(-32603, "no program audio within the capture window");
+
+    const double rms = grab.samples ? std::sqrt(grab.sum_squares / static_cast<double>(grab.samples)) : 0.0;
+    // -80 dBFS floor: dithering/denormal noise stays "silent"; any real
+    // playback (tone, cue file) lands orders of magnitude above it.
+    const bool non_silent = grab.peak > 0.0001f;
+    return "{\"ok\":true,\"renderer\":\"libobs-program-audio\",\"sampleRate\":" + std::to_string(sample_rate) +
+           ",\"channels\":" + std::to_string(channels) + ",\"durationMs\":" + std::to_string(duration_ms) +
+           ",\"frames\":" + std::to_string(grab.frames) + ",\"peak\":" + std::to_string(grab.peak) +
+           ",\"rms\":" + std::to_string(rms) + ",\"nonSilent\":" + std::string(non_silent ? "true" : "false") + "}";
+#else
+    return rpc_error_result(-32603, "program audio capture requires libobs (scaffold lane refuses honestly)");
+#endif
+  }
+
   // NIF-V1: real async-frame facts for one source. libobs lane only — the
   // scaffold lane refuses honestly rather than fabricating pixels. The digest
   // covers the first video plane (bounded), enough for deterministic
@@ -2281,6 +2397,7 @@ private:
   std::string source_result(const SourceModel &source, bool url_touched) const {
     return "{\"ok\":true,\"sourceId\":\"" + json_escape(source.id) + "\",\"sceneId\":\"" + json_escape(source.scene_id) +
            "\",\"kind\":\"" + json_escape(source.kind) + "\",\"muted\":" + std::string(source.muted ? "true" : "false") +
+           ",\"rerouteAudio\":" + std::string(source.reroute_audio ? "true" : "false") +
            ",\"opacity\":" + std::to_string(source.opacity) + ",\"urlStatus\":\"" +
            std::string(url_touched || !source.url.empty() ? "stored-redacted" : "empty") + "\"}";
   }
@@ -2532,17 +2649,21 @@ private:
   }
 
   void release_obs_source(const std::string &source_id) {
-    auto source = obs_sources_.find(source_id);
-    if (source != obs_sources_.end()) {
-      obs_source_release(source->second);
-      obs_sources_.erase(source);
-    }
+    // Scene items hold their own reference: erasing the bookkeeping without
+    // obs_sceneitem_remove leaves the old source rendering in the live scene
+    // while scene.list/source.remove deny it exists.
     for (auto it = obs_scene_items_.begin(); it != obs_scene_items_.end();) {
       if (it->first.size() > source_id.size() && it->first.ends_with("\n" + source_id)) {
+        if (it->second) obs_sceneitem_remove(it->second);
         it = obs_scene_items_.erase(it);
       } else {
         ++it;
       }
+    }
+    auto source = obs_sources_.find(source_id);
+    if (source != obs_sources_.end()) {
+      obs_source_release(source->second);
+      obs_sources_.erase(source);
     }
   }
 
@@ -2583,31 +2704,47 @@ private:
     if (source) obs_set_output_source(0, source);
   }
 
-  void mirror_source_create(const SourceModel &model) {
+  // Browser sources are never placeholder-substituted (same "no placeholder"
+  // invariant as plugin kinds): a build without obs-browser refuses at the
+  // verb, because libobs itself substitutes a silent dummy for unregistered
+  // ids and a color_source fallback would let a broken CEF payload pass a
+  // render smoke. Registration is probed via obs_source_get_display_name,
+  // which is null exactly when the type is absent.
+  bool mirror_source_create(const SourceModel &model) {
     auto scene = obs_scenes_.find(model.scene_id);
-    if (scene == obs_scenes_.end()) return;
-    release_obs_source(model.id);
+    if (scene == obs_scenes_.end()) return false;
+
+    // Transactional refusal: probe registration and create the replacement
+    // BEFORE releasing any existing same-id source (same-id recreation is the
+    // compose idempotency path), so a refusal leaves prior state intact.
+    ensure_cef_initialized_for_kind("browser_source");
+    if (!obs_source_get_display_name("browser_source")) return false;
 
     obs_data_t *settings = obs_data_create();
-    if (!settings) return;
+    if (!settings) return false;
     obs_data_set_string(settings, "url", model.url.c_str());
     obs_data_set_int(settings, "width", model.width);
     obs_data_set_int(settings, "height", model.height);
-    ensure_cef_initialized_for_kind("browser_source");
+    obs_data_set_bool(settings, "reroute_audio", model.reroute_audio);
     obs_source_t *source = obs_source_create("browser_source", model.id.c_str(), settings, nullptr);
-    if (!source) source = obs_source_create("color_source", model.id.c_str(), settings, nullptr);
     obs_data_release(settings);
-    if (!source) return;
+    if (!source) return false;
 
-    obs_sources_[model.id] = source;
+    release_obs_source(model.id);
     obs_sceneitem_t *item = obs_scene_add(scene->second, source);
-    if (item) obs_scene_items_[scene_item_key(model.scene_id, model.id)] = item;
+    if (!item) {
+      obs_source_release(source);
+      return false;
+    }
+    obs_sources_[model.id] = source;
+    obs_scene_items_[scene_item_key(model.scene_id, model.id)] = item;
 
     obs_source_t *filter = obs_source_create("color_filter_v2", "color-correction", nullptr, nullptr);
     if (filter) {
       obs_source_filter_add(source, filter);
       obs_source_release(filter);
     }
+    return true;
   }
 
   // NIF-V1: instantiate a LOADED user-plugin source type. No fallback source
@@ -6687,6 +6824,9 @@ private:
     add("program.captureFrame", [this](int fd, const std::string &id, const std::string &payload) {
       send_renderer_result(fd, id, renderer_.capture_program_frame(payload));
     });
+    add("program.captureAudio", [this](int fd, const std::string &id, const std::string &payload) {
+      send_renderer_result(fd, id, renderer_.capture_program_audio(payload));
+    });
     add("source.captureFrame", [this](int fd, const std::string &id, const std::string &payload) {
       send_renderer_result(fd, id, renderer_.capture_source_frame(payload));
     });
@@ -6841,12 +6981,22 @@ int main(int argc, char **argv) {
     // queued quit unwinds exec(). A server that finishes before exec() starts
     // is fine: the queued invocation is processed as soon as exec() runs.
     int result = kRuntimeExit;
-    std::thread server_thread([&server, &result, &qt_app] {
-      result = server.run();
+    // A throw escaping a std::thread entry point is std::terminate — the
+    // worker must never let one out. The exception is carried back and
+    // rethrown on this thread after join, restoring the non-Qt lane's
+    // behavior (main()'s catch logs host.exited).
+    std::exception_ptr server_error;
+    std::thread server_thread([&server, &result, &server_error, &qt_app] {
+      try {
+        result = server.run();
+      } catch (...) {
+        server_error = std::current_exception();
+      }
       QMetaObject::invokeMethod(&qt_app, &QCoreApplication::quit, Qt::QueuedConnection);
     });
     qt_app.exec();
     server_thread.join();
+    if (server_error) std::rethrow_exception(server_error);
 #else
     int result = server.run();
 #endif

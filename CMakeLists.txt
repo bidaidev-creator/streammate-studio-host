@@ -240,6 +240,14 @@ if(BUILD_TESTING)
     NAME plugin-crash-containment
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_plugin_crash_containment.py $<TARGET_FILE:studio-host>
   )
+  # #535 / B0-13 Phase A: CEF composition product path — scaffold lane proves
+  # the rerouteAudio model echo + program.captureAudio honest refusal; the
+  # packaged CI lane (STREAMMATE_EXPECT_CEF=1) proves real render/audio/helper
+  # facts and the no-placeholder browser refusal.
+  add_test(
+    NAME cef-composition
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_cef_composition.py $<TARGET_FILE:studio-host>
+  )
   add_test(
     NAME macos-packaging
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_macos_packaging.py
