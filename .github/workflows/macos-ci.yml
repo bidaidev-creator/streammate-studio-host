@@ -303,6 +303,18 @@ jobs:
           python3 tests/integration/test_plugin_crash_containment.py \
             dist/StreamMateStudioHost.app/Contents/MacOS/studio-host
 
+      # #535 / B0-13 Phase A: REAL CEF composition — a local page renders
+      # through obs-browser onto program video (frame-digest departure from a
+      # stable baseline), the packaged helpers spawn, the page's WebAudio tone
+      # reaches the program mix via reroute_audio (program.captureAudio
+      # nonSilent), and a bundle copy without obs-browser.plugin refuses
+      # browser sources with no placeholder substituted.
+      - name: Run CEF composition end-to-end against packaged app
+        run: |
+          STREAMMATE_EXPECT_LIBOBS=1 STREAMMATE_EXPECT_CEF=1 \
+          python3 tests/integration/test_cef_composition.py \
+            dist/StreamMateStudioHost.app/Contents/MacOS/studio-host
+
       - name: Verify inside-out ad-hoc signature before upload
         run: |
           app="dist/StreamMateStudioHost.app"
