@@ -67,7 +67,9 @@ jobs:
             -DENABLE_WEBRTC=OFF \
             -DENABLE_VST=OFF \
             -DENABLE_AJA=OFF \
-            -DENABLE_DECKLINK=OFF
+            -DENABLE_DECKLINK=OFF \
+            -DENABLE_BROWSER=ON \
+            -DENABLE_BROWSER_PANELS=OFF
 
       - name: Build libobs and required upstream modules
         run: |
@@ -81,7 +83,32 @@ jobs:
           cmake --build build/obs --config RelWithDebInfo --target coreaudio-encoder || true
           cmake --build build/obs --config RelWithDebInfo --target mac-videotoolbox || true
           cmake --build build/obs --config RelWithDebInfo --target obs-ffmpeg || true
-          cmake --build build/obs --config RelWithDebInfo --target obs-browser || true
+
+      # Spike #521 exit criterion 1: obs-browser MUST build against the pinned
+      # libobs with the pinned CEF distribution (downloaded and hash-verified by
+      # upstream's own buildspec machinery at configure time). No `|| true`.
+      - name: Build obs-browser and CEF helper apps
+        run: |
+          cmake --build build/obs --config RelWithDebInfo --target obs-frontend-api
+          cmake --build build/obs --config RelWithDebInfo --target obs-browser
+          cmake --build build/obs --config RelWithDebInfo --target browser-helper
+          cmake --build build/obs --config RelWithDebInfo --target browser-helper_gpu
+          cmake --build build/obs --config RelWithDebInfo --target browser-helper_plugin
+          cmake --build build/obs --config RelWithDebInfo --target browser-helper_renderer
+
+      - name: Survey CEF payload layout and linkage
+        run: |
+          set -x
+          ls external/obs-studio/.deps
+          find build/obs/plugins/obs-browser -maxdepth 3 \( -name '*.plugin' -o -name '*.app' \) -print
+          cef_root="$(find external/obs-studio/.deps -maxdepth 1 -type d -name 'cef_binary_*' | head -n 1)"
+          ls "$cef_root" "$cef_root/Release" || true
+          plugin_bin="$(find build/obs/plugins/obs-browser -path '*/obs-browser.plugin/Contents/MacOS/obs-browser' | head -n 1)"
+          otool -L "$plugin_bin"
+          otool -l "$plugin_bin" | grep -A2 LC_RPATH || true
+          helper_bin="$(find build/obs/plugins/obs-browser -path '*/OBS Helper.app/Contents/MacOS/OBS Helper' | head -n 1)"
+          otool -L "$helper_bin"
+          otool -l "$helper_bin" | grep -A2 LC_RPATH || true
 
       - name: Locate built libobs
         id: libobs
@@ -135,6 +162,25 @@ jobs:
           echo "graphics_module=$graphics_module" >> "$GITHUB_OUTPUT"
           echo "generated_include=$(dirname "$obs_config")" >> "$GITHUB_OUTPUT"
           echo "modules_dir=$module_stage" >> "$GITHUB_OUTPUT"
+          # CEF payload locations (spike streammate#521). Every path is
+          # REQUIRED: obs-browser is no longer optional in this workflow.
+          browser_plugin="$(find build/obs/plugins/obs-browser -path '*/obs-browser.plugin' -type d ! -path '*/EagerLinkingTBDs/*' | head -n 1)"
+          test -n "$browser_plugin"
+          helpers_dir="$(dirname "$browser_plugin")"
+          test -d "$helpers_dir/OBS Helper.app"
+          cef_framework="$(find external/obs-studio/.deps -maxdepth 3 -type d -path '*cef_binary_*/Release/Chromium Embedded Framework.framework' | head -n 1)"
+          test -n "$cef_framework"
+          frontend_api="$(find build/obs -name 'obs-frontend-api.dylib' -type f ! -path '*/EagerLinkingTBDs/*' | head -n 1)"
+          test -n "$frontend_api"
+          qt_root="$(find external/obs-studio/.deps -maxdepth 1 -type d -name 'obs-deps-qt6-*' | head -n 1)"
+          test -f "$qt_root/plugins/platforms/libqcocoa.dylib"
+          echo "browser_plugin=$browser_plugin" >> "$GITHUB_OUTPUT"
+          echo "cef_helpers_dir=$helpers_dir" >> "$GITHUB_OUTPUT"
+          echo "cef_framework=$cef_framework" >> "$GITHUB_OUTPUT"
+          echo "frontend_api=$frontend_api" >> "$GITHUB_OUTPUT"
+          echo "qt_lib_dir=$qt_root/lib" >> "$GITHUB_OUTPUT"
+          echo "qt_platform_plugin=$qt_root/plugins/platforms/libqcocoa.dylib" >> "$GITHUB_OUTPUT"
+          echo "qt_root=$qt_root" >> "$GITHUB_OUTPUT"
 
       - name: Configure obs_startup smoke against built libobs
         run: |
@@ -144,7 +190,9 @@ jobs:
             -DSTREAMMATE_OBS_DEPS_INCLUDE_DIR="$PWD/external/obs-studio/.deps/obs-deps-2025-08-23-universal/include" \
             -DSTREAMMATE_OBS_DEPS_LIBRARY_DIR="$PWD/external/obs-studio/.deps/obs-deps-2025-08-23-universal/lib" \
             -DSTREAMMATE_OBS_GENERATED_INCLUDE_DIR="$PWD/${{ steps.libobs.outputs.generated_include }}" \
-            -DSTREAMMATE_OBS_LIBRARY="$PWD/${{ steps.libobs.outputs.library }}"
+            -DSTREAMMATE_OBS_LIBRARY="$PWD/${{ steps.libobs.outputs.library }}" \
+            -DSTREAMMATE_ENABLE_CEF_QT_LOOP=ON \
+            -DCMAKE_PREFIX_PATH="$PWD/${{ steps.libobs.outputs.qt_root }}"
 
       - name: Build obs_startup smoke and studio-host
         run: cmake --build build/host --target studio-host-smoke studio-host
@@ -191,6 +239,12 @@ jobs:
             --obs-deps-lib-dir "$PWD/external/obs-studio/.deps/obs-deps-2025-08-23-universal/lib" \
             --obs-graphics-module "${{ steps.libobs.outputs.graphics_module }}" \
             --streammate-plugin build/host/streammate-native-overlay.plugin \
+            --obs-browser-plugin "${{ steps.libobs.outputs.browser_plugin }}" \
+            --obs-frontend-api "${{ steps.libobs.outputs.frontend_api }}" \
+            --cef-framework "${{ steps.libobs.outputs.cef_framework }}" \
+            --cef-helpers-dir "${{ steps.libobs.outputs.cef_helpers_dir }}" \
+            --qt-lib-dir "${{ steps.libobs.outputs.qt_lib_dir }}" \
+            --qt-platform-plugin "${{ steps.libobs.outputs.qt_platform_plugin }}" \
             --output-dir dist
 
       - name: Verify relocatable app artifact from scratch copy
@@ -283,6 +337,12 @@ jobs:
             --obs-deps-lib-dir "$PWD/external/obs-studio/.deps/obs-deps-2025-08-23-universal/lib" \
             --obs-graphics-module "${{ steps.libobs.outputs.graphics_module }}" \
             --streammate-plugin build/host/streammate-native-overlay.plugin \
+            --obs-browser-plugin "${{ steps.libobs.outputs.browser_plugin }}" \
+            --obs-frontend-api "${{ steps.libobs.outputs.frontend_api }}" \
+            --cef-framework "${{ steps.libobs.outputs.cef_framework }}" \
+            --cef-helpers-dir "${{ steps.libobs.outputs.cef_helpers_dir }}" \
+            --qt-lib-dir "${{ steps.libobs.outputs.qt_lib_dir }}" \
+            --qt-platform-plugin "${{ steps.libobs.outputs.qt_platform_plugin }}" \
             --output-dir dist-repack
           # Ad-hoc signatures are content-derived, so a second packaging of the
           # same build tree must produce byte-identical manifests.
@@ -298,6 +358,13 @@ jobs:
           cp -R build/host/streammate-test-source.plugin dist/test-plugins/
           cp -R build/host/streammate-test-filter.plugin dist/test-plugins/
           cp -R build/host/streammate-test-noop.plugin dist/test-plugins/
+
+      # actions/upload-artifact does not preserve symlinks, and the CEF/Qt
+      # frameworks (like libobs.framework before them) rely on their Versions/
+      # Current links. The tarball is the form that survives download intact —
+      # and is also the shape an npm-package extraction would consume.
+      - name: Tar app bundle for symlink-preserving download
+        run: tar -C dist -czf dist/StreamMateStudioHost.app.tar.gz StreamMateStudioHost.app sha256-manifest.txt
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

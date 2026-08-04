@@ -35,6 +35,20 @@ foreach(target studio-host studio-host-smoke)
   )
 endforeach()
 
+# CEF main-loop lane (spike bidaidev-creator/streammate#521): the upstream
+# obs-browser module on macOS is built with ENABLE_BROWSER_QT_LOOP, so CEF is
+# pumped from a Qt event loop that must run on the process main thread. When
+# this is ON, studio-host links Qt and main() runs QApplication::exec() with
+# the control server on a worker thread. The scaffold lane stays Qt-free.
+option(STREAMMATE_ENABLE_CEF_QT_LOOP "Run a Qt main-thread event loop for the obs-browser CEF module" OFF)
+if(STREAMMATE_ENABLE_CEF_QT_LOOP)
+  find_package(Qt6 REQUIRED COMPONENTS Core Gui Widgets)
+  # QT_NO_KEYWORDS: the host uses libobs signal-handler idioms (`signals` as an
+  # identifier), which Qt's keyword macros would otherwise rewrite.
+  target_compile_definitions(studio-host PRIVATE STREAMMATE_HAS_CEF_QT_LOOP=1 QT_NO_KEYWORDS)
+  target_link_libraries(studio-host PRIVATE Qt6::Core Qt6::Gui Qt6::Widgets)
+endif()
+
 if(STREAMMATE_REQUIRE_LIBOBS)
   if(NOT STREAMMATE_OBS_INCLUDE_DIR OR NOT STREAMMATE_OBS_LIBRARY)
     message(FATAL_ERROR "STREAMMATE_REQUIRE_LIBOBS=ON requires STREAMMATE_OBS_INCLUDE_DIR and STREAMMATE_OBS_LIBRARY")
