@@ -1360,7 +1360,10 @@ private:
     // before obs_startup/reset_video asks for default.effect and its peers.
     std::filesystem::path data = executable->parent_path() / "data" / "libobs";
     if (std::filesystem::is_directory(data)) {
-      std::string data_path = path_to_utf8(data);
+      // libobs' check_path concatenates <added path> + <file> with NO
+      // separator, so a data path MUST end with a slash or every lookup
+      // becomes "...libobsdefault.effect".
+      std::string data_path = path_to_utf8(data) + "/";
       obs_add_data_path(data_path.c_str());
     }
 #endif
