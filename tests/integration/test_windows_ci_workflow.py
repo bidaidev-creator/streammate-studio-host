@@ -13,6 +13,9 @@ class WindowsCiWorkflowTest(unittest.TestCase):
         self.assertIn("  windows-libobs:", workflow)
         self.assertEqual(workflow.count("    runs-on:"), 2)
         self.assertIn("runs-on: windows-latest", workflow)
+        # The libobs job is image-pinned: upstream OBS 32.1.2 needs a VS 2022
+        # generator, which the windows-latest (2025, VS 18-only) image lacks.
+        self.assertIn("runs-on: windows-2022", workflow)
         self.assertIn("timeout-minutes: 40", workflow)
         self.assertIn("timeout-minutes: 100", workflow)
         self.assertNotIn("    needs:", workflow)

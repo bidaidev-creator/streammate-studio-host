@@ -55,7 +55,13 @@ jobs:
 
   windows-libobs:
     name: Windows pinned libobs smoke
-    runs-on: windows-latest
+    # windows-2022, NOT windows-latest: the windows-latest (2025) image ships
+    # only Visual Studio 18 (2026), and upstream OBS 32.1.2 hard-requires a
+    # Visual Studio generator on Windows (cmake/windows/architecture.cmake
+    # fatals on any other generator and nests a Win32 child configure for the
+    # 32-bit capture hooks) — while our pinned CMake 3.28.4 has no VS 18
+    # generator. VS 2022 on windows-2022 is the toolchain OBS 32.1.2 supports.
+    runs-on: windows-2022
     timeout-minutes: 100
 
     steps:
