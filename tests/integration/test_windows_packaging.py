@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 import hashlib
+import os
 import re
 import subprocess
+import sys
 import tarfile
 import tempfile
 import unittest
@@ -9,6 +11,26 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PACKAGE_SCRIPT = REPO_ROOT / "packaging" / "windows" / "package-dist.sh"
+
+
+def bash_command() -> str:
+    """A REAL bash for running the packaging script.
+
+    On Windows a bare "bash" from a non-Actions-step process resolves through
+    the system PATH to the System32 WSL stub (which dies with "no installed
+    distributions" when WSL has no distro); Git-Bash's bin directory is not on
+    the system PATH. Prefer the Git for Windows bash explicitly.
+    """
+    if sys.platform != "win32":
+        return "bash"
+    for env_var in ("ProgramFiles", "ProgramFiles(x86)"):
+        base = os.environ.get(env_var)
+        if not base:
+            continue
+        candidate = Path(base) / "Git" / "bin" / "bash.exe"
+        if candidate.is_file():
+            return str(candidate)
+    return "bash"
 HOST_SOURCE = REPO_ROOT / "src" / "studio_host.cpp"
 
 REQUIRED_MODULES = ("obs-outputs", "obs-x264", "rtmp-services", "win-capture", "win-wasapi")
@@ -55,7 +77,7 @@ class WindowsPackagingTest(unittest.TestCase):
     def package(self, inputs: dict[str, Path], output: Path,
                 extra: list[str] | None = None) -> subprocess.CompletedProcess[str]:
         args = [
-            "bash", PACKAGE_SCRIPT.as_posix(),
+            bash_command(), PACKAGE_SCRIPT.as_posix(),
             "--host-bin", inputs["host"].as_posix(),
             "--smoke-bin", inputs["smoke"].as_posix(),
             "--obs-dll-dir", inputs["obs_dll_dir"].as_posix(),

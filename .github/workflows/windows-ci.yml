@@ -84,6 +84,22 @@ jobs:
         shell: bash
         run: git -C external/obs-studio fetch --tags --force --depth 1 origin tag 32.1.2
 
+      # Diagnostic: the first two runs died with CMake "could not find any
+      # instance of Visual Studio" under both bash and pwsh. Surface exactly
+      # what vswhere and cmake see before the configure attempts anything.
+      - name: Survey Visual Studio installation and cmake resolution
+        shell: pwsh
+        run: |
+          Get-Command cmake | Format-List Source, Version
+          cmake --version
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+          Write-Host "vswhere path: $vswhere (exists: $(Test-Path $vswhere))"
+          if (Test-Path $vswhere) {
+            & $vswhere -products '*' -format json -utf8 | Write-Host
+          }
+          Write-Host "VSINSTALLDIR=$env:VSINSTALLDIR"
+          Write-Host "VisualStudioVersion=$env:VisualStudioVersion"
+
       # pwsh, not bash: CMake's Visual Studio generator locates VS through
       # vswhere via the ProgramFiles(x86) environment variable, which MSYS
       # bash does not export — under bash the configure dies with "could not
