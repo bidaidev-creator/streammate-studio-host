@@ -48,7 +48,9 @@ def tree_digest(root: Path) -> str:
     for path in sorted(root.rglob("*")):
         if path.is_symlink() or not path.is_file():
             continue
-        digest.update(str(path.relative_to(root)).encode())
+        # The host digests generic (forward-slash) relative paths; mirror that
+        # wire form so the comparison holds on Windows too.
+        digest.update(path.relative_to(root).as_posix().encode())
         digest.update(path.read_bytes())
     return digest.hexdigest()
 
