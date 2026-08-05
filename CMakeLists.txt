@@ -57,6 +57,18 @@ if(STREAMMATE_REQUIRE_LIBOBS)
     message(FATAL_ERROR "STREAMMATE_REQUIRE_LIBOBS=ON requires STREAMMATE_OBS_INCLUDE_DIR and STREAMMATE_OBS_LIBRARY")
   endif()
 
+  set(STREAMMATE_OBS_LINK_LIBRARY "${STREAMMATE_OBS_LIBRARY}")
+  if(WIN32)
+    # Windows callers pass the obs.lib import library produced by the pinned
+    # upstream build. Keep it caller-selected and link its exact path; the
+    # runtime obs.dll location is supplied through PATH by CI/packaging.
+    get_filename_component(STREAMMATE_OBS_LINK_LIBRARY
+      "${STREAMMATE_OBS_LIBRARY}" ABSOLUTE BASE_DIR "${CMAKE_BINARY_DIR}")
+    if(NOT EXISTS "${STREAMMATE_OBS_LINK_LIBRARY}")
+      message(FATAL_ERROR "STREAMMATE_OBS_LIBRARY import library not found: ${STREAMMATE_OBS_LINK_LIBRARY}")
+    endif()
+  endif()
+
   foreach(target studio-host studio-host-smoke)
     target_compile_definitions(${target} PRIVATE STREAMMATE_HAS_LIBOBS=1)
     target_include_directories(${target} PRIVATE "${STREAMMATE_OBS_INCLUDE_DIR}")
@@ -66,7 +78,7 @@ if(STREAMMATE_REQUIRE_LIBOBS)
     if(STREAMMATE_OBS_GENERATED_INCLUDE_DIR)
       target_include_directories(${target} PRIVATE "${STREAMMATE_OBS_GENERATED_INCLUDE_DIR}")
     endif()
-    target_link_libraries(${target} PRIVATE "${STREAMMATE_OBS_LIBRARY}")
+    target_link_libraries(${target} PRIVATE "${STREAMMATE_OBS_LINK_LIBRARY}")
     if(APPLE)
       target_link_libraries(${target} PRIVATE "-framework CoreGraphics")
     endif()
@@ -83,9 +95,10 @@ if(STREAMMATE_REQUIRE_LIBOBS)
   # Spec 34 Capability 3 / chunk 34.H3 — the in-tree OBS plugin module for the
   # Phase B native renderer (ADR-0005 Decision 1: modules in our own source
   # tree, loaded by studio-host; never a submodule patch). A CMake MODULE
-  # library producing a <name>.plugin CFBundle that libobs loads through the
-  # host's normal module load path. The 34.H2 rasterizer core stays a plain
-  # shared library (native-overlay-renderer) linked here rather than forked, so
+  # library producing a <name>.plugin CFBundle on macOS or <name>.dll on
+  # Windows that libobs loads through the host's normal module load path. The
+  # 34.H2 rasterizer core stays a plain library (native-overlay-renderer)
+  # linked here rather than forked, so
   # either Q-121 packaging answer stays cheap. Built only under HAS_LIBOBS.
   set(STREAMMATE_OBS_INCLUDE_DIRS "${STREAMMATE_OBS_INCLUDE_DIR}")
   if(STREAMMATE_OBS_DEPS_INCLUDE_DIR)
@@ -97,14 +110,15 @@ if(STREAMMATE_REQUIRE_LIBOBS)
 
   add_library(streammate-native-overlay MODULE src/obs_module/native_overlay_obs_module.cpp)
   set_target_properties(streammate-native-overlay PROPERTIES
-    BUNDLE TRUE
-    BUNDLE_EXTENSION plugin
     PREFIX ""
     OUTPUT_NAME streammate-native-overlay
   )
+  if(APPLE)
+    set_target_properties(streammate-native-overlay PROPERTIES BUNDLE TRUE BUNDLE_EXTENSION plugin)
+  endif()
   target_compile_definitions(streammate-native-overlay PRIVATE STREAMMATE_HAS_LIBOBS=1)
   target_include_directories(streammate-native-overlay PRIVATE ${STREAMMATE_OBS_INCLUDE_DIRS})
-  target_link_libraries(streammate-native-overlay PRIVATE native-overlay-renderer "${STREAMMATE_OBS_LIBRARY}")
+  target_link_libraries(streammate-native-overlay PRIVATE native-overlay-renderer "${STREAMMATE_OBS_LINK_LIBRARY}")
 
   # HAS_LIBOBS smoke: loads the module through libobs, creates the registered
   # source, applies a fixture toast, drives one async render cycle, asserts a
@@ -112,7 +126,7 @@ if(STREAMMATE_REQUIRE_LIBOBS)
   add_executable(native-overlay-module-smoke src/obs_module/native_overlay_module_smoke.cpp)
   target_compile_definitions(native-overlay-module-smoke PRIVATE STREAMMATE_HAS_LIBOBS=1)
   target_include_directories(native-overlay-module-smoke PRIVATE ${STREAMMATE_OBS_INCLUDE_DIRS})
-  target_link_libraries(native-overlay-module-smoke PRIVATE native-overlay-renderer "${STREAMMATE_OBS_LIBRARY}")
+  target_link_libraries(native-overlay-module-smoke PRIVATE native-overlay-renderer "${STREAMMATE_OBS_LINK_LIBRARY}")
 
   if(APPLE AND STREAMMATE_STUDIO_HOST_RPATHS)
     # Both the dlopen-ed module and the smoke need to locate libobs.framework
@@ -132,14 +146,15 @@ if(STREAMMATE_REQUIRE_LIBOBS)
     string(REPLACE "-" "_" test_module_src "${test_module}")
     add_library(${test_module} MODULE src/obs_module/${test_module_src}_module.cpp)
     set_target_properties(${test_module} PROPERTIES
-      BUNDLE TRUE
-      BUNDLE_EXTENSION plugin
       PREFIX ""
       OUTPUT_NAME ${test_module}
     )
+    if(APPLE)
+      set_target_properties(${test_module} PROPERTIES BUNDLE TRUE BUNDLE_EXTENSION plugin)
+    endif()
     target_compile_definitions(${test_module} PRIVATE STREAMMATE_HAS_LIBOBS=1)
     target_include_directories(${test_module} PRIVATE ${STREAMMATE_OBS_INCLUDE_DIRS})
-    target_link_libraries(${test_module} PRIVATE "${STREAMMATE_OBS_LIBRARY}")
+    target_link_libraries(${test_module} PRIVATE "${STREAMMATE_OBS_LINK_LIBRARY}")
     if(APPLE AND STREAMMATE_STUDIO_HOST_RPATHS)
       set_target_properties(${test_module} PROPERTIES BUILD_RPATH "${STREAMMATE_STUDIO_HOST_RPATHS}")
     endif()
@@ -148,7 +163,7 @@ if(STREAMMATE_REQUIRE_LIBOBS)
   add_executable(user-plugin-module-smoke src/obs_module/user_plugin_module_smoke.cpp)
   target_compile_definitions(user-plugin-module-smoke PRIVATE STREAMMATE_HAS_LIBOBS=1)
   target_include_directories(user-plugin-module-smoke PRIVATE ${STREAMMATE_OBS_INCLUDE_DIRS})
-  target_link_libraries(user-plugin-module-smoke PRIVATE "${STREAMMATE_OBS_LIBRARY}")
+  target_link_libraries(user-plugin-module-smoke PRIVATE "${STREAMMATE_OBS_LINK_LIBRARY}")
   if(APPLE AND STREAMMATE_STUDIO_HOST_RPATHS)
     set_target_properties(user-plugin-module-smoke PROPERTIES BUILD_RPATH "${STREAMMATE_STUDIO_HOST_RPATHS}")
   endif()

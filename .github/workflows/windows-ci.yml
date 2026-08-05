@@ -52,3 +52,136 @@ jobs:
       - name: Enforce the upstream pin-set derivation guard against the pinned tree
         shell: bash
         run: STREAMMATE_REQUIRE_OBS_TREE=1 python tests/integration/test_upstream_pin_sets.py
+
+  windows-libobs:
+    name: Windows pinned libobs smoke
+    runs-on: windows-latest
+    timeout-minutes: 100
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install pinned CMake and Ninja
+        shell: pwsh
+        run: |
+          python -m venv "$env:RUNNER_TEMP\cmake-venv"
+          & "$env:RUNNER_TEMP\cmake-venv\Scripts\python.exe" -m pip install 'cmake==3.28.4' ninja
+          "$env:RUNNER_TEMP\cmake-venv\Scripts" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Enable the VS 2022 x64 compiler environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Verify upstream pin and fork guard
+        shell: bash
+        run: bash scripts/fork-guard.sh
+
+      - name: Fetch OBS version tag metadata for upstream CMake
+        shell: bash
+        run: git -C external/obs-studio fetch --tags --force --depth 1 origin tag 32.1.2
+
+      - name: Configure upstream OBS without Qt frontend or CEF
+        shell: bash
+        run: |
+          cmake -S external/obs-studio -B build/obs -G "Visual Studio 17 2022" -A x64 \
+            -DVIRTUALCAM_GUID=A3FCE0F5-3493-419F-958A-ABA1250EC20B \
+            -DENABLE_UI=OFF \
+            -DENABLE_SERVICE_UPDATES=OFF \
+            -DENABLE_SCRIPTING=OFF \
+            -DENABLE_WEBRTC=OFF \
+            -DENABLE_VST=OFF \
+            -DENABLE_AJA=OFF \
+            -DENABLE_DECKLINK=OFF \
+            -DENABLE_BROWSER=OFF
+
+      - name: Build libobs and required upstream modules
+        shell: bash
+        run: |
+          cmake --build build/obs --config RelWithDebInfo --target libobs
+          cmake --build build/obs --config RelWithDebInfo --target libobs-d3d11
+          cmake --build build/obs --config RelWithDebInfo --target libobs-opengl
+          cmake --build build/obs --config RelWithDebInfo --target obs-outputs
+          cmake --build build/obs --config RelWithDebInfo --target obs-x264
+          cmake --build build/obs --config RelWithDebInfo --target rtmp-services
+          cmake --build build/obs --config RelWithDebInfo --target win-capture
+          cmake --build build/obs --config RelWithDebInfo --target win-wasapi
+          cmake --build build/obs --config RelWithDebInfo --target obs-ffmpeg || true
+
+      - name: Locate built libobs and stage required modules
+        id: libobs
+        shell: bash
+        run: |
+          obs_import="$(find build/obs -type f -iname 'obs.lib' -print -quit)"
+          obs_dll="$(find build/obs -type f -iname 'obs.dll' -print -quit)"
+          graphics_module="$(find build/obs -type f -iname 'libobs-d3d11.dll' -print -quit)"
+          obs_config="$(find build/obs -type f -name 'obsconfig.h' -print -quit)"
+          deps_root="$(find external/obs-studio/.deps -maxdepth 1 -type d -name 'obs-deps-*-x64' -print -quit)"
+          if [[ -z "$obs_import" || -z "$obs_dll" || -z "$graphics_module" || -z "$obs_config" ]]; then
+            echo "required libobs build artifact missing" >&2
+            find build/obs -maxdepth 8 \( -iname 'obs.lib' -o -iname 'obs.dll' -o -iname 'libobs-*.dll' -o -name 'obsconfig.h' \) -print >&2
+            exit 1
+          fi
+          if [[ -z "$deps_root" || ! -d "$deps_root/include" || ! -d "$deps_root/bin" ]]; then
+            echo "downloaded Windows obs-deps include/bin layout not found" >&2
+            find external/obs-studio/.deps -maxdepth 3 -type d -print >&2
+            exit 1
+          fi
+
+          module_stage="$PWD/build/obs/streammate-plugin-stage"
+          mkdir -p "$module_stage/data"
+          plugin_bin_dir="build/obs/rundir/RelWithDebInfo/obs-plugins/64bit"
+          plugin_data_dir="build/obs/rundir/RelWithDebInfo/data/obs-plugins"
+          if [[ ! -d "$plugin_bin_dir" || ! -d "$plugin_data_dir" ]]; then
+            echo "upstream Windows plugin runtime layout not found" >&2
+            find build/obs/rundir -maxdepth 6 -print >&2
+            exit 1
+          fi
+          for module in obs-outputs obs-x264 rtmp-services win-capture win-wasapi; do
+            module_dll="$(find "$plugin_bin_dir" -maxdepth 1 -type f -iname "$module.dll" -print -quit)"
+            module_data="$plugin_data_dir/$module"
+            if [[ -z "$module_dll" || ! -d "$module_data" ]]; then
+              echo "required staged OBS plugin artifact missing: $module" >&2
+              find build/obs/rundir/RelWithDebInfo -maxdepth 6 \( -iname '*.dll' -o -type d -path '*/data/obs-plugins/*' \) -print >&2
+              exit 1
+            fi
+            cp "$module_dll" "$module_stage/$module.dll"
+            cp -R "$module_data" "$module_stage/data/$module"
+          done
+
+          echo "library=$PWD/$obs_import" >> "$GITHUB_OUTPUT"
+          echo "obs_dll_dir=$PWD/$(dirname "$obs_dll")" >> "$GITHUB_OUTPUT"
+          echo "graphics_module=$PWD/$graphics_module" >> "$GITHUB_OUTPUT"
+          echo "generated_include=$PWD/$(dirname "$obs_config")" >> "$GITHUB_OUTPUT"
+          echo "deps_include=$PWD/$deps_root/include" >> "$GITHUB_OUTPUT"
+          echo "deps_library=$PWD/$deps_root/lib" >> "$GITHUB_OUTPUT"
+          echo "deps_bin=$PWD/$deps_root/bin" >> "$GITHUB_OUTPUT"
+          echo "modules_dir=$module_stage" >> "$GITHUB_OUTPUT"
+
+      - name: Configure obs_startup smoke against built libobs
+        shell: bash
+        run: |
+          cmake -S . -B build/host -G Ninja \
+            -DSTREAMMATE_REQUIRE_LIBOBS=ON \
+            -DSTREAMMATE_OBS_INCLUDE_DIR="$PWD/external/obs-studio/libobs" \
+            -DSTREAMMATE_OBS_DEPS_INCLUDE_DIR="${{ steps.libobs.outputs.deps_include }}" \
+            -DSTREAMMATE_OBS_DEPS_LIBRARY_DIR="${{ steps.libobs.outputs.deps_library }}" \
+            -DSTREAMMATE_OBS_GENERATED_INCLUDE_DIR="${{ steps.libobs.outputs.generated_include }}" \
+            -DSTREAMMATE_OBS_LIBRARY="${{ steps.libobs.outputs.library }}"
+
+      - name: Build host and native-overlay HAS_LIBOBS targets
+        shell: bash
+        run: cmake --build build/host --target studio-host-smoke studio-host streammate-native-overlay native-overlay-module-smoke
+
+      - name: Run obs_startup smoke headlessly
+        shell: bash
+        run: |
+          export PATH="${{ steps.libobs.outputs.obs_dll_dir }}:${{ steps.libobs.outputs.deps_bin }}:$PATH"
+          ./build/host/studio-host-smoke.exe
+
+      # The packaged verb, user-plugin, and crash-containment libobs smokes are
+      # intentionally deferred to the Windows packaging leg; this job proves
+      # only HAS_LIBOBS compilation and obs_startup/obs_shutdown without CEF.

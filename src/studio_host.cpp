@@ -58,7 +58,9 @@
 #endif
 
 #if STREAMMATE_HAS_LIBOBS
+#if !defined(_WIN32)
 #include <dlfcn.h>
+#endif
 #include <obs.h>
 #include <callback/calldata.h>
 #include <callback/proc.h>
@@ -70,6 +72,71 @@
 #endif
 
 namespace {
+#if STREAMMATE_HAS_LIBOBS && defined(_WIN32)
+constexpr int RTLD_LAZY = 0;
+constexpr int RTLD_LOCAL = 0;
+thread_local const char *g_dynamic_load_error = nullptr;
+
+const char *sanitized_windows_load_error(DWORD error) {
+  switch (error) {
+  case ERROR_MOD_NOT_FOUND:
+  case ERROR_DLL_NOT_FOUND:
+    return "dependent-library-missing";
+  case ERROR_EXE_MACHINE_TYPE_MISMATCH:
+    return "wrong-architecture";
+  default:
+    return "dlopen-failed";
+  }
+}
+
+// Minimal dlfcn compatibility surface for the HAS_LIBOBS code below. Error
+// strings are classifications only: FormatMessage is deliberately not used
+// because its inserted module name can contain an absolute path.
+void *dlopen(const char *utf8_path, int) {
+  g_dynamic_load_error = nullptr;
+  if (utf8_path == nullptr) {
+    g_dynamic_load_error = "dlopen-failed";
+    return nullptr;
+  }
+  const int length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8_path, -1, nullptr, 0);
+  if (length <= 0) {
+    g_dynamic_load_error = "dlopen-failed";
+    return nullptr;
+  }
+  std::vector<wchar_t> wide_path(static_cast<std::size_t>(length));
+  if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8_path, -1,
+                          wide_path.data(), length) <= 0) {
+    g_dynamic_load_error = "dlopen-failed";
+    return nullptr;
+  }
+  HMODULE module = LoadLibraryW(wide_path.data());
+  if (module == nullptr) {
+    g_dynamic_load_error = sanitized_windows_load_error(GetLastError());
+  }
+  return reinterpret_cast<void *>(module);
+}
+
+void *dlsym(void *handle, const char *symbol) {
+  g_dynamic_load_error = nullptr;
+  FARPROC address = GetProcAddress(reinterpret_cast<HMODULE>(handle), symbol);
+  if (address == nullptr) g_dynamic_load_error = "symbol-not-found";
+  return reinterpret_cast<void *>(address);
+}
+
+int dlclose(void *handle) {
+  g_dynamic_load_error = nullptr;
+  if (FreeLibrary(reinterpret_cast<HMODULE>(handle))) return 0;
+  g_dynamic_load_error = "dlclose-failed";
+  return -1;
+}
+
+const char *dlerror() {
+  const char *error = g_dynamic_load_error;
+  g_dynamic_load_error = nullptr;
+  return error;
+}
+#endif
+
 constexpr const char *kVersion = STREAMMATE_STUDIO_HOST_VERSION;
 constexpr int kUsageExit = 64;
 constexpr int kRuntimeExit = 70;
@@ -177,6 +244,15 @@ std::filesystem::path path_from_utf8(const std::string &value) {
   return std::filesystem::path(std::u8string(value.begin(), value.end()));
 #else
   return std::filesystem::path(value);
+#endif
+}
+
+std::string path_to_utf8(const std::filesystem::path &value) {
+#if defined(_WIN32)
+  const std::u8string encoded = value.u8string();
+  return std::string(encoded.begin(), encoded.end());
+#else
+  return value.string();
 #endif
 }
 
@@ -1235,8 +1311,18 @@ private:
     if (!executable) {
       return {};
     }
+#if defined(__APPLE__)
     std::filesystem::path contents = executable->parent_path().parent_path();
     std::filesystem::path plugins = contents / "PlugIns" / "obs-plugins";
+#elif defined(_WIN32)
+    // Pin the Windows package shape to upstream OBS: an executable at
+    // <root>/bin/64bit and modules at <root>/obs-plugins/64bit. The packaging
+    // leg will stage the host and modules into this shape.
+    std::filesystem::path root = executable->parent_path().parent_path().parent_path();
+    std::filesystem::path plugins = root / "obs-plugins" / "64bit";
+#else
+    return {};
+#endif
     if (!std::filesystem::is_directory(plugins)) {
       return {};
     }
@@ -1248,14 +1334,31 @@ private:
     if (plugins.empty()) {
       return;
     }
-    std::string binary_pattern = (plugins / "%module%.plugin" / "Contents" / "MacOS").string();
-    std::string data_pattern = (plugins / "%module%.plugin" / "Contents" / "Resources").string();
+#if defined(__APPLE__)
+    std::filesystem::path binary = plugins / "%module%.plugin" / "Contents" / "MacOS";
+    std::filesystem::path data = plugins / "%module%.plugin" / "Contents" / "Resources";
+#elif defined(_WIN32)
+    // A directory pattern makes libobs enumerate <module>.dll files here.
+    std::filesystem::path binary = plugins;
+    std::filesystem::path data = plugins.parent_path().parent_path() / "data" / "obs-plugins" / "%module%";
+#else
+    return;
+#endif
+    std::string binary_pattern = path_to_utf8(binary);
+    std::string data_pattern = path_to_utf8(data);
     obs_add_module_path(binary_pattern.c_str(), data_pattern.c_str());
   }
 
   static bool reset_offscreen_video() {
     obs_video_info video = {};
+#if defined(__APPLE__)
     video.graphics_module = "@executable_path/../Frameworks/libobs-opengl.dylib";
+#elif defined(_WIN32)
+    // libobs-d3d11.dll is beside the executable in upstream's bin/64bit shape.
+    video.graphics_module = "libobs-d3d11.dll";
+#else
+    video.graphics_module = "libobs-opengl.so";
+#endif
     video.fps_num = 30;
     video.fps_den = 1;
     video.base_width = 1280;
@@ -4417,9 +4520,10 @@ std::array<std::set<std::string>, 6> snapshot_registered_types() {
   return out;
 }
 
-// Bundled-module stems ("mac-capture" from mac-capture.plugin etc.): the
+// Bundled-module stems ("mac-capture" from mac-capture.plugin or
+// "win-capture" from win-capture.dll): the
 // UNION of (a) modules libobs actually opened (obs_enum_modules) and (b) the
-// app bundle's Contents/PlugIns/obs-plugins directory listing — a bundled
+// packaged module directory listing — a bundled
 // module that failed to open/init is absent from (a) but must still shadow a
 // same-named user module (bundled wins even when broken). A user module
 // colliding with either is refused (duplicate_of_bundled) before any dlopen.
@@ -4438,7 +4542,11 @@ std::set<std::string> bundled_module_stems(const std::filesystem::path &bundle_p
     std::filesystem::directory_iterator it(bundle_plugins_dir, ec);
     for (std::filesystem::directory_iterator end; !ec && it != end; it.increment(ec)) {
       const std::filesystem::path entry = it->path();
+#if defined(_WIN32)
+      if (entry.extension() == ".dll") {
+#else
       if (entry.extension() == ".plugin") {
+#endif
         std::string stem = entry.stem().string();
         if (!stem.empty()) stems.insert(std::move(stem));
       }
@@ -4448,12 +4556,12 @@ std::set<std::string> bundled_module_stems(const std::filesystem::path &bundle_p
 }
 
 // Sanitized dlerror classification: NEVER the raw dlerror text (it embeds
-// absolute paths). "Library not loaded" appears ONLY when a dependent dylib
-// failed to resolve — a bare "image not found" also fires for a missing
-// CANDIDATE file, so it must not be treated as a dependency signal;
-// "architecture" => arch rejection at load. In the pinned libobs,
-// MODULE_FILE_NOT_FOUND is a deprecated alias of MODULE_FAILED_TO_OPEN (every
-// os_dlopen failure returns it), so ALL open failures route through here.
+// absolute paths). On macOS, "Library not loaded" appears only when a
+// dependent dylib failed to resolve, and "architecture" is an arch rejection.
+// The Windows shim returns only equivalent sanitized category strings. In the
+// pinned libobs, MODULE_FILE_NOT_FOUND is a deprecated alias of
+// MODULE_FAILED_TO_OPEN (every os_dlopen failure returns it), so ALL open
+// failures route through here.
 void classify_failed_dlopen(const std::filesystem::path &binary, UserPluginRecord &record) {
   std::error_code exists_ec;
   if (!std::filesystem::exists(binary, exists_ec) || exists_ec) {
@@ -4464,7 +4572,8 @@ void classify_failed_dlopen(const std::filesystem::path &binary, UserPluginRecor
   // Probe dlopen runs constructors if it unexpectedly succeeds; that only
   // happens after obs_open_module already failed on the same path, so the
   // side-effect window is accepted (the module was user-selected for load).
-  void *handle = dlopen(binary.c_str(), RTLD_LAZY | RTLD_LOCAL);
+  const std::string binary_utf8 = path_to_utf8(binary);
+  void *handle = dlopen(binary_utf8.c_str(), RTLD_LAZY | RTLD_LOCAL);
   if (handle != nullptr) {
     dlclose(handle);
     record.state = "module_load_failed";
@@ -4473,6 +4582,28 @@ void classify_failed_dlopen(const std::filesystem::path &binary, UserPluginRecor
   }
   const char *raw = dlerror();
   const std::string text = raw != nullptr ? raw : "";
+#if defined(_WIN32)
+  if (text == "dependent-library-missing") {
+    // ERROR_MOD_NOT_FOUND names the candidate or one of its dependencies.
+    // The candidate still existing after LoadLibraryW makes the dependency
+    // classification an observed fact rather than a guess.
+    std::error_code after_ec;
+    if (!std::filesystem::exists(binary, after_ec) || after_ec) {
+      record.state = "module_load_failed";
+      record.reason_detail = "file-not-found";
+      return;
+    }
+    record.state = "dependency_missing";
+    record.reason_detail = "library-not-loaded";
+    record.observed_dependencies = true;
+  } else if (text == "wrong-architecture") {
+    record.state = "architecture_mismatch";
+    record.reason_detail = "wrong-architecture";
+  } else {
+    record.state = "module_load_failed";
+    record.reason_detail = "dlopen-failed";
+  }
+#else
   if (text.find("Library not loaded") != std::string::npos) {
     record.state = "dependency_missing";
     record.reason_detail = "library-not-loaded";
@@ -4484,6 +4615,7 @@ void classify_failed_dlopen(const std::filesystem::path &binary, UserPluginRecor
     record.state = "module_load_failed";
     record.reason_detail = "dlopen-failed";
   }
+#endif
 }
 
 // NIF-H3: converts a hanging obs_open_module/obs_init_module into a bounded,
@@ -4598,7 +4730,9 @@ void load_user_plugin_candidates(UserPluginLoadPlan &plan,
       }
     }
 
-    const char *data_path = source.data_dir.empty() ? nullptr : source.data_dir.c_str();
+    const std::string binary_path = path_to_utf8(source.binary);
+    const std::string data_path_storage = path_to_utf8(source.data_dir);
+    const char *data_path = source.data_dir.empty() ? nullptr : data_path_storage.c_str();
     // NIF-H3: record the attempt BEFORE dlopen/init — a crash mid-load leaves
     // this loading record behind and the next boot attributes it. If the
     // record cannot be persisted, the attempt is REFUSED (codex F2): loading
@@ -4617,7 +4751,7 @@ void load_user_plugin_candidates(UserPluginLoadPlan &plan,
       watchdog->arm(record.module_ref);
     }
     obs_module_t *module = nullptr;
-    const int rc = obs_open_module(&module, source.binary.c_str(), data_path);
+    const int rc = obs_open_module(&module, binary_path.c_str(), data_path);
     if (rc == MODULE_SUCCESS) {
       record.observed_dependencies = true; // dlopen resolved every dependent library
       const bool init_ok = obs_init_module(module);
