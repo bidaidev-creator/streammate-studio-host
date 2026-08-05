@@ -1358,7 +1358,11 @@ class StudioHostLifecycleTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp_dir:
             state_file = Path(temp_dir) / "host-state.json"
             process, _, _ = start_host(state_file=state_file)
-            os.kill(process.pid, signal.SIGKILL)
+            if sys.platform == "win32":
+                # Popen.kill is TerminateProcess: the Windows hard-kill analogue.
+                process.kill()
+            else:
+                os.kill(process.pid, signal.SIGKILL)
             process.wait(timeout=5)
             state = json.loads(state_file.read_text())
             self.assertEqual(state["status"], "ready")

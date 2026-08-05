@@ -8,7 +8,7 @@ boot-frozen, deterministic per-module outcome record:
 
   - plan outcomes (both lanes, static facts only): selection gating
     (`not-selected`), exclusion, duplicate_in_roots, and a static
-    architecture_mismatch state read from the Mach-O header;
+    architecture_mismatch state read from the native binary header;
   - load outcomes (HAS_LIBOBS lane only): lifecycle loaded/load_failed,
     per-module registered-type DELTAS (all six kinds), and sanitized failure
     classes mapped from the module-open result (never raw dlerror text).
@@ -48,6 +48,9 @@ from test_plugin_discovery import (
     CPU_TYPE_X86_64,
     build_bundle,
     build_legacy,
+    legacy_file_name,
+    module_file_name,
+    platform_binary,
     recv_raw_text,
     rpc_raw,
     thin_macho64,
@@ -56,20 +59,20 @@ from test_plugin_discovery import (
 
 HOST_BIN = host.HOST_BIN
 IS_MACOS = sys.platform == "darwin"
+IS_WINDOWS = sys.platform == "win32"
 EXPECT_LIBOBS = os.environ.get("STREAMMATE_EXPECT_LIBOBS", "") == "1"
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
-HOST_CPU = CPU_TYPE_ARM64 if platform.machine() in ("arm64", "aarch64") else CPU_TYPE_X86_64
+HOST_CPU = CPU_TYPE_ARM64 if platform.machine().lower() in ("arm64", "aarch64") else CPU_TYPE_X86_64
 OTHER_CPU = CPU_TYPE_X86_64 if HOST_CPU == CPU_TYPE_ARM64 else CPU_TYPE_ARM64
 
 ALL_TYPE_KINDS = ("sources", "filters", "transitions", "outputs", "encoders", "services")
 
 
-def host_arch_macho() -> bytes:
-    """A binary whose Mach-O header matches the host CPU (the real host binary
-    on macOS, a fabricated thin header elsewhere)."""
-    return HOST_BIN.read_bytes() if IS_MACOS else thin_macho64(HOST_CPU)
+def host_arch_binary() -> bytes:
+    """A native image whose header matches the host CPU."""
+    return HOST_BIN.read_bytes() if IS_MACOS or IS_WINDOWS else platform_binary(HOST_CPU)
 
 
 def write_manifest(path: Path, roots: list[dict], selected, exclude) -> None:
@@ -107,12 +110,12 @@ class UserPluginLoadingPlanTest(unittest.TestCase):
 
         # root0: a selected host-arch candidate, an unselected host-arch
         # candidate, an excluded candidate, and a selected wrong-arch candidate.
-        build_bundle(self.root0, "alpha", host_arch_macho())
-        build_bundle(self.root0, "beta", thin_macho64(HOST_CPU))
-        build_bundle(self.root0, "excluded-mod", thin_macho64(HOST_CPU))
-        build_bundle(self.root0, "otherarch", thin_macho64(OTHER_CPU))
+        build_bundle(self.root0, "alpha", host_arch_binary())
+        build_bundle(self.root0, "beta", platform_binary(HOST_CPU))
+        build_bundle(self.root0, "excluded-mod", platform_binary(HOST_CPU))
+        build_bundle(self.root0, "otherarch", platform_binary(OTHER_CPU))
         # root1: a duplicate of alpha (first-root-wins).
-        build_bundle(self.root1, "alpha", thin_macho64(HOST_CPU))
+        build_bundle(self.root1, "alpha", platform_binary(HOST_CPU))
 
         self.manifest = self.base / "manifest.json"
         write_manifest(
@@ -224,10 +227,10 @@ class UserPluginLoadingPlanTest(unittest.TestCase):
         # never silently dropped, never inventory-poisoning, never loaded.
         root = self.base / "clamp-root"
         root.mkdir()
-        build_bundle(root, "_hidden", thin_macho64(HOST_CPU))
+        build_bundle(root, "_hidden", platform_binary(HOST_CPU))
         long_name = "a" * 130
-        build_bundle(root, long_name, thin_macho64(HOST_CPU))
-        build_bundle(root, "portable-mod", thin_macho64(HOST_CPU))
+        build_bundle(root, long_name, platform_binary(HOST_CPU))
+        build_bundle(root, "portable-mod", platform_binary(HOST_CPU))
         manifest = self.base / "clamp-manifest.json"
         write_manifest(manifest, [{"binaryDir": str(root)}], None, [])
 
@@ -253,7 +256,7 @@ class UserPluginLoadingPlanTest(unittest.TestCase):
     def test_discover_filenames_are_bare_names(self) -> None:
         # Mono contract (StudioPluginModuleRecord.fileName): bare bundle or
         # library file name, never a relative path with separators.
-        build_legacy(self.root1, "legacy-mod", thin_macho64(HOST_CPU), subdir="nested")
+        build_legacy(self.root1, "legacy-mod", platform_binary(HOST_CPU), subdir="nested")
         # The OBS fixture and STREAMMATE_HOME ride the env-only launch
         # contract (mirrors the Station harness: no config path in payloads).
         color = 0xFFFF8020
@@ -276,8 +279,8 @@ class UserPluginLoadingPlanTest(unittest.TestCase):
         self.addCleanup(sock.close)
         result = json.loads(rpc_raw(sock, 7, "plugins.discover", {}))["result"]
         names = {m["moduleRef"]: m["fileName"] for m in result["modules"]}
-        self.assertEqual(names["module:alpha"], "alpha.plugin")
-        self.assertEqual(names["module:legacy-mod"], "legacy-mod.so")
+        self.assertEqual(names["module:alpha"], module_file_name("alpha"))
+        self.assertEqual(names["module:legacy-mod"], legacy_file_name("legacy-mod"))
         for file_name in names.values():
             self.assertNotIn("/", file_name)
 

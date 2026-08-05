@@ -167,7 +167,7 @@ class HelloCapabilitiesTest(unittest.TestCase):
         body = _strip_cxx_comments(
             _brace_body(
                 SOURCE.read_text(encoding="utf-8"),
-                "void handle_message(int fd, const std::string &payload) {",
+                "void handle_message(socket_t fd, const std::string &payload) {",
             )
         )
         forbidden = [

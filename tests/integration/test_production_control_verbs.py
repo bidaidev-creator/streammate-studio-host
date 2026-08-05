@@ -47,6 +47,21 @@ def tree_files(root: Path) -> dict[str, bytes]:
 
 
 def host_tcp_peers(pid: int) -> list[str]:
+    if sys.platform == "win32":
+        result = subprocess.run(
+            ["netstat", "-ano", "-p", "tcp"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        peers: list[str] = []
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            if (len(parts) >= 5 and parts[0].upper() == "TCP" and
+                    parts[-1] == str(pid) and parts[-2].upper() == "ESTABLISHED"):
+                peers.append(parts[2])
+        return peers
     result = subprocess.run(
         ["lsof", "-nP", "-a", "-p", str(pid), "-iTCP"],
         text=True,

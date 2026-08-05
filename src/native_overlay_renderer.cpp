@@ -1,8 +1,5 @@
 #include "native_overlay_renderer.h"
 
-#include <CoreFoundation/CoreFoundation.h>
-#include <CoreGraphics/CoreGraphics.h>
-
 #include <algorithm>
 #include <array>
 #include <chrono>
@@ -589,22 +586,9 @@ uint64_t fnv1a64(const uint8_t *data, size_t len) {
 }
 
 struct NativeOverlayRenderer::Impl {
-  Impl()
-      : rgba(kSurfaceBytes, 0),
-        color_space(CGColorSpaceCreateDeviceRGB()),
-        context(CGBitmapContextCreate(rgba.data(), kOverlayWidth, kOverlayHeight, 8,
-                                      kOverlayWidth * kBytesPerPixel, color_space,
-                                      static_cast<CGBitmapInfo>(kCGImageAlphaPremultipliedLast) |
-                                          kCGBitmapByteOrder32Big)) {}
-
-  ~Impl() {
-    if (context) CGContextRelease(context);
-    if (color_space) CGColorSpaceRelease(color_space);
-  }
+  Impl() : rgba(kSurfaceBytes, 0) {}
 
   std::vector<uint8_t> rgba;
-  CGColorSpaceRef color_space = nullptr;
-  CGContextRef context = nullptr;
 };
 
 NativeOverlayRenderer::NativeOverlayRenderer() : impl_(std::make_unique<Impl>()) {}

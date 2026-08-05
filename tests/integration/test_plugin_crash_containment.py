@@ -36,12 +36,10 @@ from test_plugin_discovery import (
     build_bundle,
     recv_raw_text,
     rpc_raw,
-    thin_macho64,
     tree_digest,
 )
-from test_user_plugin_loading import HOST_CPU, host_arch_macho
+from test_user_plugin_loading import host_arch_binary
 
-IS_MACOS = sys.platform == "darwin"
 WATCHDOG_EXIT = 65
 SENTINEL_SCHEMA = "plugin-load-sentinel.v1"
 
@@ -75,8 +73,8 @@ class PluginCrashContainmentScaffoldTest(unittest.TestCase):
         self.base = Path(tmp.name)
         self.root = self.base / "root"
         self.root.mkdir()
-        build_bundle(self.root, "alpha", host_arch_macho())
-        build_bundle(self.root, "beta", host_arch_macho())
+        build_bundle(self.root, "alpha", host_arch_binary())
+        build_bundle(self.root, "beta", host_arch_binary())
         self.manifest = self.base / "manifest.json"
         write_manifest(
             self.manifest,

@@ -134,8 +134,9 @@ class ImportCustodyTest(unittest.TestCase):
             "STREAMMATE_HOME": str(self.home),
         }
         self.process, port, _ = lifecycle.start_host(env=env)
-        self.addCleanup(self.process.kill)
+        self.addCleanup(lifecycle.stop_process, self.process)
         self.sock = lifecycle.websocket_connect(port)
+        self.addCleanup(self.sock.close)
 
     _rpc_id = 6200
 

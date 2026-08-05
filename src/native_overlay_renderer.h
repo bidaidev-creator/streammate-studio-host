@@ -1,6 +1,6 @@
 // Phase B native OverlayAction renderer core (Spec 34 Capability 2 / chunk 34.H2).
 //
-// A plain host-repo library: a CoreGraphics-backed software rasterizer that
+// A plain host-repo library: a platform-neutral software rasterizer that
 // renders OverlayAction-shaped payloads for the eight budgeted Spec 07 parity
 // categories (PB-1..PB-8) at a fixed 1280x720 surface. It carries no product
 // logic, no policy, and no protocol/host concerns beyond interpreting the
@@ -13,6 +13,7 @@
 #ifndef STREAMMATE_NATIVE_OVERLAY_RENDERER_H
 #define STREAMMATE_NATIVE_OVERLAY_RENDERER_H
 
+#include <cstddef>
 #include <cstdint>
 #include <map>
 #include <memory>
@@ -42,9 +43,9 @@ struct OverlayRasterResult {
   uint64_t raster_hash = 0;             // FNV-1a-64 over the RGBA surface bytes
 };
 
-// A 1280x720 RGBA (non-premultiplied on read-back) software rasterizer backed by
-// a CoreGraphics CGBitmapContext surface. Not copyable; each opt-in native-overlay
-// source owns one instance so a session that never opts in constructs none.
+// A 1280x720 RGBA software rasterizer backed by an in-memory byte surface.
+// Not copyable; each opt-in native-overlay source owns one instance so a
+// session that never opts in constructs none.
 class NativeOverlayRenderer {
 public:
   NativeOverlayRenderer();

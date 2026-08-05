@@ -4,15 +4,16 @@
 `plugins.discover` enumerates candidate OBS user modules from the roots named
 in a `--user-plugins-manifest <absolute path>` file (schema
 user-plugins-manifest.v1), and computes a STATIC record per candidate: sha256
-of the binary bytes plus the Mach-O architecture list read straight from the
-header bytes. It must NEVER load anything (no dlopen / obs_open_module --
+of the binary bytes plus the architecture list read straight from the
+platform binary header bytes. It must NEVER load anything (no module loading --
 loading is chunk NIF-H2), enumeration must be read-only (roots byte-for-byte
 identical afterwards) and deterministic, and a malformed manifest is refused
 at launch with a SANITIZED reason that never contains the raw filesystem path.
 
-Both macOS layouts are inventoried:
+Native layouts are inventoried:
   (a) <root>/<name>.plugin CFBundle -> binary at Contents/MacOS/<name>
-  (b) legacy <root>/<name>/bin/**/<name>.{so,dylib}
+  (b) legacy <root>/<name>/bin/**/<name>.{so,dylib,dll}
+Windows also accepts a direct <root>/<name>.dll candidate.
 """
 from __future__ import annotations
 
@@ -29,6 +30,7 @@ import test_host_lifecycle as host
 
 HOST_BIN = host.HOST_BIN
 IS_MACOS = sys.platform == "darwin"
+IS_WINDOWS = sys.platform == "win32"
 
 # The host's launch-refusal convention: parse_args throws, main() logs
 # host.exited and returns kUsageExit. (This repo's "exit-code-2 semantics".)
@@ -36,6 +38,8 @@ USAGE_EXIT = 64
 
 CPU_TYPE_X86_64 = 0x01000007
 CPU_TYPE_ARM64 = 0x0100000C
+PE_MACHINE_AMD64 = 0x8664
+PE_MACHINE_ARM64 = 0xAA64
 
 
 def recv_raw_text(sock, timeout: float = 7.0) -> str:
@@ -98,6 +102,35 @@ def fat_macho(cputypes: list[int]) -> bytes:
     return prefix + b"\x00" * (4096 - len(prefix)) + blobs
 
 
+def pe64(machine: int) -> bytes:
+    """Minimal PE image through the complete COFF header (arch probe only)."""
+    dos = bytearray(0x80)
+    dos[0:2] = b"MZ"
+    struct.pack_into("<I", dos, 0x3C, 0x80)
+    coff = struct.pack("<HHIIIHH", machine, 0, 0, 0, 0, 0, 0)
+    return bytes(dos) + b"PE\x00\x00" + coff
+
+
+def platform_binary(cputype: int) -> bytes:
+    if IS_WINDOWS:
+        machine = PE_MACHINE_ARM64 if cputype == CPU_TYPE_ARM64 else PE_MACHINE_AMD64
+        return pe64(machine)
+    return thin_macho64(cputype)
+
+
+def platform_multiarch_binary(cputypes: list[int]) -> bytes:
+    # PE/COFF represents one machine per image; Mach-O can carry a fat table.
+    return platform_binary(cputypes[0]) if IS_WINDOWS else fat_macho(cputypes)
+
+
+def module_file_name(name: str) -> str:
+    return f"{name}.dll" if IS_WINDOWS else f"{name}.plugin"
+
+
+def legacy_file_name(name: str) -> str:
+    return f"{name}.dll" if IS_WINDOWS else f"{name}.so"
+
+
 def sha256_of(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
@@ -112,6 +145,11 @@ def tree_digest(root: Path) -> dict[str, str]:
 
 
 def build_bundle(root: Path, name: str, binary: bytes) -> Path:
+    if IS_WINDOWS:
+        root.mkdir(parents=True, exist_ok=True)
+        target = root / module_file_name(name)
+        target.write_bytes(binary)
+        return target
     macos = root / f"{name}.plugin" / "Contents" / "MacOS"
     macos.mkdir(parents=True)
     target = macos / name
@@ -124,7 +162,7 @@ def build_legacy(root: Path, name: str, binary: bytes, subdir: str = "") -> Path
     if subdir:
         bin_dir = bin_dir / subdir
     bin_dir.mkdir(parents=True)
-    target = bin_dir / f"{name}.so"
+    target = bin_dir / legacy_file_name(name)
     target.write_bytes(binary)
     return target
 
@@ -139,23 +177,20 @@ class PluginDiscoveryTest(unittest.TestCase):
         self.root0.mkdir()
         self.root1.mkdir()
 
-        # root0: a REAL Mach-O (the host binary itself, macOS only -- on other
-        # platforms the host binary is not Mach-O, so a fabricated thin arm64
-        # header stands in) in a CFBundle layout, an excluded fabricated arm64
-        # bundle, a nested legacy universal module, and an unsafe-named bundle
-        # that must be skipped.
-        alpha_bytes = HOST_BIN.read_bytes() if IS_MACOS else thin_macho64(CPU_TYPE_ARM64)
+        # root0: a real host image on macOS, otherwise a platform-appropriate
+        # fabricated arm64 image, plus exclusion/legacy/unsafe-name fixtures.
+        alpha_bytes = HOST_BIN.read_bytes() if IS_MACOS else platform_binary(CPU_TYPE_ARM64)
         self.alpha_bin = build_bundle(self.root0, "alpha", alpha_bytes)
-        self.excluded_bin = build_bundle(self.root0, "excluded-mod", thin_macho64(CPU_TYPE_ARM64))
+        self.excluded_bin = build_bundle(self.root0, "excluded-mod", platform_binary(CPU_TYPE_ARM64))
         self.legacy_bin = build_legacy(
-            self.root0, "legacy-mod", fat_macho([CPU_TYPE_X86_64, CPU_TYPE_ARM64]), subdir="nested"
+            self.root0, "legacy-mod", platform_multiarch_binary([CPU_TYPE_X86_64, CPU_TYPE_ARM64]), subdir="nested"
         )
-        build_bundle(self.root0, "bad name", thin_macho64(CPU_TYPE_ARM64))
+        build_bundle(self.root0, "bad name", platform_binary(CPU_TYPE_ARM64))
 
         # root1: a duplicate moduleRef (first-root-wins) and a wrong-arch
         # (x86_64-only) candidate fabricated from a thin header.
-        self.alpha_dup_bin = build_bundle(self.root1, "alpha", thin_macho64(CPU_TYPE_X86_64))
-        self.intel_bin = build_bundle(self.root1, "intel-only", thin_macho64(CPU_TYPE_X86_64))
+        self.alpha_dup_bin = build_bundle(self.root1, "alpha", platform_binary(CPU_TYPE_X86_64))
+        self.intel_bin = build_bundle(self.root1, "intel-only", platform_binary(CPU_TYPE_X86_64))
 
         self.manifest = self.base / "manifest.json"
         self.manifest.write_text(
@@ -240,7 +275,7 @@ class PluginDiscoveryTest(unittest.TestCase):
         alpha = by_key[("module:alpha", "root:0")]
         self.assertEqual(alpha["label"], "alpha")
         # Bare bundle name (mono contract: fileName never carries separators).
-        self.assertEqual(alpha["fileName"], "alpha.plugin")
+        self.assertEqual(alpha["fileName"], module_file_name("alpha"))
         self.assertEqual(alpha["lifecycle"], "discovered")
         self.assertEqual(alpha["sha256"], sha256_of(self.alpha_bin))
         if IS_MACOS:
@@ -257,9 +292,9 @@ class PluginDiscoveryTest(unittest.TestCase):
 
         legacy = by_key[("module:legacy-mod", "root:0")]
         self.assertEqual(legacy["lifecycle"], "discovered")
-        self.assertEqual(legacy["fileName"], "legacy-mod.so")
-        # Universal binary: slices reported in fat-file order.
-        self.assertEqual(legacy["arch"], ["x86_64", "arm64"])
+        self.assertEqual(legacy["fileName"], legacy_file_name("legacy-mod"))
+        # Universal Mach-O slices retain fat-file order; PE is single-machine.
+        self.assertEqual(legacy["arch"], ["x86_64"] if IS_WINDOWS else ["x86_64", "arm64"])
         self.assertEqual(legacy["sha256"], sha256_of(self.legacy_bin))
 
         duplicate = by_key[("module:alpha", "root:1")]
@@ -279,20 +314,28 @@ class PluginDiscoveryTest(unittest.TestCase):
         self.assertEqual(tree_digest(self.root0), before0)
         self.assertEqual(tree_digest(self.root1), before1)
 
-    # -- hardening: symlink confinement, walk bounds, Mach-O strictness ----
+    # -- hardening: symlink confinement, walk bounds, header strictness ----
 
     def test_symlink_escape_is_refused_without_disclosure(self) -> None:
         # A candidate binary that is a symlink (here: escaping the root) must
         # never be read or hashed -- its record says symlink-refused, and the
         # outside file's bytes are never disclosed (no sha256 anywhere).
         outside = self.base / "outside-secret.bin"
-        outside.write_bytes(b"OUTSIDE-SECRET-" + thin_macho64(CPU_TYPE_ARM64))
+        outside.write_bytes(b"OUTSIDE-SECRET-" + platform_binary(CPU_TYPE_ARM64))
         outside_sha = hashlib.sha256(outside.read_bytes()).hexdigest()
 
         root = self.base / "symroot"
-        macos = root / "sneaky.plugin" / "Contents" / "MacOS"
-        macos.mkdir(parents=True)
-        (macos / "sneaky").symlink_to(outside)
+        if IS_WINDOWS:
+            root.mkdir(parents=True)
+            candidate = root / "sneaky.dll"
+        else:
+            macos = root / "sneaky.plugin" / "Contents" / "MacOS"
+            macos.mkdir(parents=True)
+            candidate = macos / "sneaky"
+        try:
+            candidate.symlink_to(outside)
+        except OSError as exc:
+            self.skipTest(f"symlink creation unavailable for confinement proof: {exc}")
 
         manifest = self.base / "symlink-manifest.json"
         manifest.write_text(json.dumps({"version": 1, "roots": [{"binaryDir": str(root)}]}))
@@ -316,21 +359,26 @@ class PluginDiscoveryTest(unittest.TestCase):
         self.assertNotIn(outside_sha, raw)
         self.assertNotIn(str(outside), raw)
 
-    def test_truncated_macho_headers_report_unreadable(self) -> None:
+    def test_truncated_platform_headers_report_unreadable(self) -> None:
         # Strictness: arch facts must come only from fully-read structures.
         root = self.base / "shortroot"
         root.mkdir()
-        # FAT table claiming 2 entries but truncated mid-second-entry (only
-        # the second entry's cputype word is present, not the full fat_arch).
-        cut_fat = (
-            struct.pack(">II", 0xCAFEBABE, 2)
-            + struct.pack(">5I", CPU_TYPE_X86_64, 0, 4096, 32, 12)
-            + struct.pack(">I", CPU_TYPE_ARM64)
-        )
+        if IS_WINDOWS:
+            cut_fat = b"MZ" + b"\x00" * 6  # shorter than a complete DOS header
+            dos = bytearray(64)
+            dos[0:2] = b"MZ"
+            struct.pack_into("<I", dos, 0x3C, 64)
+            cut_thin = bytes(dos) + b"PE\x00\x00" + struct.pack("<H", PE_MACHINE_ARM64)
+        else:
+            # FAT table claiming 2 entries but truncated mid-second-entry.
+            cut_fat = (
+                struct.pack(">II", 0xCAFEBABE, 2)
+                + struct.pack(">5I", CPU_TYPE_X86_64, 0, 4096, 32, 12)
+                + struct.pack(">I", CPU_TYPE_ARM64)
+            )
+            # Thin file shorter than a complete mach_header_64.
+            cut_thin = struct.pack("<II", 0xFEEDFACF, CPU_TYPE_ARM64)
         fat_bin = build_bundle(root, "cut-fat", cut_fat)
-        # Thin file shorter than a complete mach_header_64 (magic + cputype
-        # only -- 8 of 32 bytes).
-        cut_thin = struct.pack("<II", 0xFEEDFACF, CPU_TYPE_ARM64)
         thin_bin = build_bundle(root, "cut-thin", cut_thin)
 
         manifest = self.base / "short-manifest.json"
@@ -344,7 +392,8 @@ class PluginDiscoveryTest(unittest.TestCase):
             ("module:cut-thin", thin_bin),
         ):
             record = by_ref[module_ref]
-            self.assertEqual(record["reasonDetail"], "unreadable-macho-header")
+            expected_reason = "unreadable-pe-header" if IS_WINDOWS else "unreadable-macho-header"
+            self.assertEqual(record["reasonDetail"], expected_reason)
             self.assertEqual(record["arch"], [])
             self.assertEqual(record["observed"], {"arch": False, "dependencies": False})
             # The file itself is readable and small: it is still hashed.
@@ -358,7 +407,7 @@ class PluginDiscoveryTest(unittest.TestCase):
         for i in range(10):
             deep = deep / f"d{i}"
         deep.mkdir(parents=True)
-        (deep / "deep-mod.so").write_bytes(thin_macho64(CPU_TYPE_ARM64))
+        (deep / legacy_file_name("deep-mod")).write_bytes(platform_binary(CPU_TYPE_ARM64))
 
         manifest = self.base / "deep-manifest.json"
         manifest.write_text(json.dumps({"version": 1, "roots": [{"binaryDir": str(root)}]}))
@@ -374,7 +423,7 @@ class PluginDiscoveryTest(unittest.TestCase):
         # A Station-side JSON serializer may \uXXXX-escape non-ASCII path
         # bytes; the manifest scanner must decode them to real UTF-8.
         root = self.base / "root-café"
-        build_bundle(root, "uni-mod", thin_macho64(CPU_TYPE_ARM64))
+        build_bundle(root, "uni-mod", platform_binary(CPU_TYPE_ARM64))
 
         manifest = self.base / "unicode-manifest.json"
         manifest_text = json.dumps(

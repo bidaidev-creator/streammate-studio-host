@@ -5,6 +5,9 @@ project(streammate-studio-host VERSION 0.0.0 LANGUAGES CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
+if(MSVC)
+  add_compile_options(/utf-8)
+endif()
 
 option(STREAMMATE_REQUIRE_LIBOBS "Require a built libobs SDK and call obs_startup/obs_shutdown" ON)
 set(STREAMMATE_OBS_INCLUDE_DIR "" CACHE PATH "Path to libobs headers, typically external/obs-studio/libobs")
@@ -16,18 +19,18 @@ set(STREAMMATE_OBS_GENERATED_INCLUDE_DIR "" CACHE PATH "Path to generated OBS he
 # Phase B native OverlayAction renderer core (Spec 34 Capability 2 / chunk 34.H2).
 # A plain host-repo library, separable from the host dispatch and from the future
 # 34.H3 in-tree OBS plugin module (keeps either Q-121 packaging answer cheap).
-# It runs fully in scaffold mode (no libobs); on Apple it is backed by a
-# CoreGraphics CGBitmapContext surface.
+# It runs fully in scaffold mode (no libobs) on a platform-neutral in-memory
+# RGBA surface.
 add_library(native-overlay-renderer STATIC src/native_overlay_renderer.cpp)
 target_include_directories(native-overlay-renderer PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/src")
-if(APPLE)
-  target_link_libraries(native-overlay-renderer PUBLIC "-framework CoreGraphics" "-framework CoreFoundation")
-endif()
 
 add_executable(studio-host src/studio_host.cpp)
 add_executable(studio-host-smoke src/studio_host_smoke.cpp)
 
 target_link_libraries(studio-host PRIVATE native-overlay-renderer)
+if(WIN32)
+  target_link_libraries(studio-host PRIVATE ws2_32)
+endif()
 
 foreach(target studio-host studio-host-smoke)
   target_compile_definitions(${target} PRIVATE
@@ -215,7 +218,7 @@ if(BUILD_TESTING)
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_hello_capabilities.py $<TARGET_FILE:studio-host>
   )
   # Chunk NIF-H1: user plugin discovery + static probe (manifest-driven
-  # inventory; sha256 + Mach-O arch read from header bytes; no loading).
+  # inventory; sha256 + native binary arch read from header bytes; no loading).
   add_test(
     NAME plugin-discovery
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_plugin_discovery.py $<TARGET_FILE:studio-host>
@@ -248,13 +251,23 @@ if(BUILD_TESTING)
     NAME cef-composition
     COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_cef_composition.py $<TARGET_FILE:studio-host>
   )
+  if(APPLE)
+    add_test(
+      NAME macos-packaging
+      COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_macos_packaging.py
+    )
+    add_test(
+      NAME macos-ci-workflow
+      COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_macos_ci_workflow.py
+    )
+  elseif(WIN32)
+    # Loud configure-time disposition: these exercise codesign, frameworks,
+    # and the macOS-only workflow, so they are not registered on Windows.
+    message(STATUS "Windows scaffold: not registering macos-packaging or macos-ci-workflow (macOS-only contracts)")
+  endif()
   add_test(
-    NAME macos-packaging
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_macos_packaging.py
-  )
-  add_test(
-    NAME macos-ci-workflow
-    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_macos_ci_workflow.py
+    NAME windows-ci-workflow
+    COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_windows_ci_workflow.py
   )
   add_test(
     NAME native-overlay-module

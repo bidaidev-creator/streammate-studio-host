@@ -1,0 +1,54 @@
+name: windows-ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-scaffold:
+    name: Windows scaffold
+    runs-on: windows-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install pinned CMake and Ninja
+        shell: pwsh
+        run: |
+          python -m venv "$env:RUNNER_TEMP\cmake-venv"
+          & "$env:RUNNER_TEMP\cmake-venv\Scripts\python.exe" -m pip install 'cmake==3.28.4' ninja
+          "$env:RUNNER_TEMP\cmake-venv\Scripts" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Enable the VS 2022 x64 compiler environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Verify upstream pin and fork guard
+        shell: bash
+        run: bash scripts/fork-guard.sh
+
+      - name: Configure scaffold smoke without libobs
+        run: cmake -S . -B build/scaffold -G Ninja -DSTREAMMATE_REQUIRE_LIBOBS=OFF
+
+      - name: Build scaffold host and smoke
+        run: cmake --build build/scaffold --target studio-host studio-host-smoke native-overlay-renderer-test user-plugin-portability-test
+
+      - name: Run scaffold smoke
+        run: .\build\scaffold\studio-host-smoke.exe
+
+      - name: Run scaffold test ladder
+        run: ctest --test-dir build/scaffold --output-on-failure
+
+      - name: Enforce the upstream pin-set derivation guard against the pinned tree
+        shell: bash
+        run: STREAMMATE_REQUIRE_OBS_TREE=1 python tests/integration/test_upstream_pin_sets.py
