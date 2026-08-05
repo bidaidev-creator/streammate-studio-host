@@ -101,7 +101,8 @@ class UserPluginLoadingPlanTest(unittest.TestCase):
 
     def setUp(self) -> None:
         tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
+        # Windows: loaded-DLL locks can lag the terminated host (see helper).
+        self.addCleanup(host.cleanup_tempdir_with_retry, tmp)
         self.base = Path(tmp.name)
         self.root0 = self.base / "root0"
         self.root1 = self.base / "root1"
@@ -341,7 +342,8 @@ class UserPluginLoadingLibobsTest(unittest.TestCase):
 
     def setUp(self) -> None:
         tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
+        # Windows: loaded-DLL locks can lag the terminated host (see helper).
+        self.addCleanup(host.cleanup_tempdir_with_retry, tmp)
         self.base = Path(tmp.name)
         self.root = self.base / "user-plugins"
         self.root.mkdir()

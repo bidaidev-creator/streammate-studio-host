@@ -70,6 +70,26 @@ def stop_process(process: subprocess.Popen[str]) -> None:
         process.wait(timeout=5)
 
 
+def cleanup_tempdir_with_retry(tmp: tempfile.TemporaryDirectory, attempts: int = 20, delay: float = 0.5) -> None:
+    """TemporaryDirectory cleanup that tolerates Windows lock-release lag.
+
+    A DLL a host process loaded stays file-locked until the process dies
+    (libobs deliberately never dlcloses a missing-exports module), and on
+    Windows CI the lock can outlive the terminated process by a beat
+    (deferred kernel handle release / antivirus scans). Retry briefly and
+    still fail loudly: a dir that stays locked past the window means a
+    leaked process, which must never be swallowed.
+    """
+    for attempt in range(attempts):
+        try:
+            tmp.cleanup()
+            return
+        except OSError:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(delay)
+
+
 def websocket_connect(port: int, token: str = TOKEN) -> socket.socket:
     sock = socket.create_connection(("127.0.0.1", port), timeout=5)
     key = base64.b64encode(os.urandom(16)).decode("ascii")

@@ -69,7 +69,8 @@ class PluginCrashContainmentScaffoldTest(unittest.TestCase):
 
     def setUp(self) -> None:
         tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
+        # Windows: loaded-DLL locks can lag the terminated host (see helper).
+        self.addCleanup(host.cleanup_tempdir_with_retry, tmp)
         self.base = Path(tmp.name)
         self.root = self.base / "root"
         self.root.mkdir()
@@ -415,7 +416,8 @@ class PluginCrashContainmentLibobsTest(unittest.TestCase):
         import shutil
 
         tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
+        # Windows: loaded-DLL locks can lag the terminated host (see helper).
+        self.addCleanup(host.cleanup_tempdir_with_retry, tmp)
         self.base = Path(tmp.name)
         self.root = self.base / "user-plugins"
         self.root.mkdir()
