@@ -84,32 +84,47 @@ jobs:
         shell: bash
         run: git -C external/obs-studio fetch --tags --force --depth 1 origin tag 32.1.2
 
+      # pwsh, not bash: CMake's Visual Studio generator locates VS through
+      # vswhere via the ProgramFiles(x86) environment variable, which MSYS
+      # bash does not export — under bash the configure dies with "could not
+      # find any instance of Visual Studio".
       - name: Configure upstream OBS without Qt frontend or CEF
-        shell: bash
+        shell: pwsh
         run: |
-          cmake -S external/obs-studio -B build/obs -G "Visual Studio 17 2022" -A x64 \
-            -DVIRTUALCAM_GUID=A3FCE0F5-3493-419F-958A-ABA1250EC20B \
-            -DENABLE_UI=OFF \
-            -DENABLE_SERVICE_UPDATES=OFF \
-            -DENABLE_SCRIPTING=OFF \
-            -DENABLE_WEBRTC=OFF \
-            -DENABLE_VST=OFF \
-            -DENABLE_AJA=OFF \
-            -DENABLE_DECKLINK=OFF \
+          cmake -S external/obs-studio -B build/obs -G "Visual Studio 17 2022" -A x64 `
+            -DVIRTUALCAM_GUID=A3FCE0F5-3493-419F-958A-ABA1250EC20B `
+            -DENABLE_UI=OFF `
+            -DENABLE_SERVICE_UPDATES=OFF `
+            -DENABLE_SCRIPTING=OFF `
+            -DENABLE_WEBRTC=OFF `
+            -DENABLE_VST=OFF `
+            -DENABLE_AJA=OFF `
+            -DENABLE_DECKLINK=OFF `
             -DENABLE_BROWSER=OFF
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Build libobs and required upstream modules
-        shell: bash
+        shell: pwsh
         run: |
+          $ErrorActionPreference = "Stop"
           cmake --build build/obs --config RelWithDebInfo --target libobs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cmake --build build/obs --config RelWithDebInfo --target libobs-d3d11
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cmake --build build/obs --config RelWithDebInfo --target libobs-opengl
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cmake --build build/obs --config RelWithDebInfo --target obs-outputs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cmake --build build/obs --config RelWithDebInfo --target obs-x264
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cmake --build build/obs --config RelWithDebInfo --target rtmp-services
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cmake --build build/obs --config RelWithDebInfo --target win-capture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cmake --build build/obs --config RelWithDebInfo --target win-wasapi
-          cmake --build build/obs --config RelWithDebInfo --target obs-ffmpeg || true
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build build/obs --config RelWithDebInfo --target obs-ffmpeg
+          exit 0
 
       - name: Locate built libobs and stage required modules
         id: libobs
@@ -135,7 +150,8 @@ jobs:
           mkdir -p "$module_stage/data"
           plugin_bin_dir="build/obs/rundir/RelWithDebInfo/obs-plugins/64bit"
           plugin_data_dir="build/obs/rundir/RelWithDebInfo/data/obs-plugins"
-          if [[ ! -d "$plugin_bin_dir" || ! -d "$plugin_data_dir" ]]; then
+          libobs_data_dir="build/obs/rundir/RelWithDebInfo/data/libobs"
+          if [[ ! -d "$plugin_bin_dir" || ! -d "$plugin_data_dir" || ! -f "$libobs_data_dir/default.effect" ]]; then
             echo "upstream Windows plugin runtime layout not found" >&2
             find build/obs/rundir -maxdepth 6 -print >&2
             exit 1
@@ -160,6 +176,7 @@ jobs:
           echo "deps_library=$PWD/$deps_root/lib" >> "$GITHUB_OUTPUT"
           echo "deps_bin=$PWD/$deps_root/bin" >> "$GITHUB_OUTPUT"
           echo "modules_dir=$module_stage" >> "$GITHUB_OUTPUT"
+          echo "libobs_data_dir=$PWD/$libobs_data_dir" >> "$GITHUB_OUTPUT"
 
       - name: Configure obs_startup smoke against built libobs
         shell: bash
@@ -182,6 +199,82 @@ jobs:
           export PATH="${{ steps.libobs.outputs.obs_dll_dir }}:${{ steps.libobs.outputs.deps_bin }}:$PATH"
           ./build/host/studio-host-smoke.exe
 
-      # The packaged verb, user-plugin, and crash-containment libobs smokes are
-      # intentionally deferred to the Windows packaging leg; this job proves
-      # only HAS_LIBOBS compilation and obs_startup/obs_shutdown without CEF.
+      - name: Build user-plugin test modules
+        shell: bash
+        run: cmake --build build/host --target streammate-test-source streammate-test-filter streammate-test-noop streammate-test-crash streammate-test-hang user-plugin-module-smoke
+
+      - name: Package bare-root Windows distribution
+        shell: bash
+        run: |
+          packaging/windows/package-dist.sh \
+            --host-bin build/host/studio-host.exe \
+            --smoke-bin build/host/studio-host-smoke.exe \
+            --obs-dll-dir "${{ steps.libobs.outputs.obs_dll_dir }}" \
+            --deps-bin-dir "${{ steps.libobs.outputs.deps_bin }}" \
+            --graphics-module "${{ steps.libobs.outputs.graphics_module }}" \
+            --obs-modules-dir "${{ steps.libobs.outputs.modules_dir }}" \
+            --streammate-plugin build/host/streammate-native-overlay.dll \
+            --libobs-data-dir "${{ steps.libobs.outputs.libobs_data_dir }}" \
+            --output-dir dist
+
+      - name: Verify packaged smoke and checksum manifest without PATH augmentation
+        shell: bash
+        run: |
+          dist/StreamMateStudioHost/studio-host-smoke.exe --version
+          (cd dist/StreamMateStudioHost && sha256sum -c ../sha256-manifest.txt)
+
+      - name: Run HAS_LIBOBS production-control verb smoke against packaged dist
+        shell: bash
+        run: |
+          STREAMMATE_EXPECT_LIBOBS=1 \
+          STREAMMATE_TEST_SOURCE_PLUGIN="$PWD/build/host/streammate-test-source.dll" \
+          STREAMMATE_TEST_FILTER_PLUGIN="$PWD/build/host/streammate-test-filter.dll" \
+          python tests/integration/test_production_control_verbs.py \
+            dist/StreamMateStudioHost/studio-host.exe
+
+      - name: Run real user-plugin loading end-to-end against packaged dist
+        shell: bash
+        run: |
+          echo "Windows dependency-missing fixture SKIPPED: this lane does not yet build a test DLL with a deliberately unresolved import."
+          STREAMMATE_EXPECT_LIBOBS=1 \
+          STREAMMATE_TEST_SOURCE_PLUGIN="$PWD/build/host/streammate-test-source.dll" \
+          STREAMMATE_TEST_FILTER_PLUGIN="$PWD/build/host/streammate-test-filter.dll" \
+          STREAMMATE_TEST_NOOP_PLUGIN="$PWD/build/host/streammate-test-noop.dll" \
+          STREAMMATE_NOEXPORTS_DYLIB="$PWD/dist/StreamMateStudioHost/obs.dll" \
+          python tests/integration/test_user_plugin_loading.py \
+            dist/StreamMateStudioHost/studio-host.exe
+
+      - name: Run seeded crash and hang containment against packaged dist
+        shell: bash
+        run: |
+          STREAMMATE_EXPECT_LIBOBS=1 \
+          STREAMMATE_TEST_SOURCE_PLUGIN="$PWD/build/host/streammate-test-source.dll" \
+          STREAMMATE_TEST_CRASH_PLUGIN="$PWD/build/host/streammate-test-crash.dll" \
+          STREAMMATE_TEST_HANG_PLUGIN="$PWD/build/host/streammate-test-hang.dll" \
+          python tests/integration/test_plugin_crash_containment.py \
+            dist/StreamMateStudioHost/studio-host.exe
+
+      - name: Verify Windows repack determinism
+        shell: bash
+        run: |
+          packaging/windows/package-dist.sh \
+            --host-bin build/host/studio-host.exe \
+            --smoke-bin build/host/studio-host-smoke.exe \
+            --obs-dll-dir "${{ steps.libobs.outputs.obs_dll_dir }}" \
+            --deps-bin-dir "${{ steps.libobs.outputs.deps_bin }}" \
+            --graphics-module "${{ steps.libobs.outputs.graphics_module }}" \
+            --obs-modules-dir "${{ steps.libobs.outputs.modules_dir }}" \
+            --streammate-plugin build/host/streammate-native-overlay.dll \
+            --libobs-data-dir "${{ steps.libobs.outputs.libobs_data_dir }}" \
+            --output-dir dist-repack
+          diff dist/sha256-manifest.txt dist-repack/sha256-manifest.txt
+          cmp dist/StreamMateStudioHost-windows-x64.tar.gz \
+            dist-repack/StreamMateStudioHost-windows-x64.tar.gz
+
+      - name: Upload Windows distribution artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: streammate-studio-host-windows-x64
+          path: |
+            dist/StreamMateStudioHost-windows-x64.tar.gz
+            dist/sha256-manifest.txt

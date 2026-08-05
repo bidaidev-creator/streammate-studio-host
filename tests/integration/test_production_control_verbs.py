@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import socket
 import struct
 import subprocess
@@ -21,6 +22,7 @@ SOURCE_ID = "station-overlay"
 SCENE_ID = "control-scene"
 FILTER_ID = "color-correction"
 SECRET_SHAPED = "stm_studio-host_AbCdEfGhIjKlMnOpQrStUvWxYz012345"
+WINDOWS_LIBOBS = sys.platform == "win32" and os.environ.get("STREAMMATE_EXPECT_LIBOBS", "") == "1"
 
 
 def send_raw_text(sock: socket.socket, raw: str) -> None:
@@ -88,7 +90,34 @@ def is_loopback_peer(peer: str) -> bool:
 class ProductionControlVerbTest(unittest.TestCase):
     def _connect(self, home: Path | None = None) -> tuple[subprocess.Popen[str], socket.socket]:
         env = {"STREAMMATE_HOME": str(home)} if home is not None else None
-        process, port, _ = host.start_host(env=env)
+        host_args: list[str] = []
+        if WINDOWS_LIBOBS:
+            # This Windows package intentionally has no obs-browser/CEF. Use
+            # the real in-tree source+filter modules so every production verb
+            # still runs against actual libobs objects (never placeholders).
+            fixture = tempfile.TemporaryDirectory()
+            self.addCleanup(fixture.cleanup)
+            root = Path(fixture.name) / "plugins"
+            root.mkdir()
+            for env_key, name in (
+                ("STREAMMATE_TEST_SOURCE_PLUGIN", "streammate-test-source.dll"),
+                ("STREAMMATE_TEST_FILTER_PLUGIN", "streammate-test-filter.dll"),
+            ):
+                source = os.environ.get(env_key, "")
+                self.assertTrue(source and Path(source).is_file(), f"{env_key} must name a DLL")
+                shutil.copy2(source, root / name)
+            manifest = Path(fixture.name) / "manifest.json"
+            manifest.write_text(
+                json.dumps({
+                    "version": 1,
+                    "roots": [{"binaryDir": str(root)}],
+                    "selected": ["module:streammate-test-source", "module:streammate-test-filter"],
+                    "exclude": [],
+                }),
+                encoding="utf-8",
+            )
+            host_args.extend(("--user-plugins-manifest", str(manifest)))
+        process, port, _ = host.start_host(*host_args, env=env)
         self.addCleanup(host.stop_process, process)
         sock = host.websocket_connect(port)
         self.addCleanup(sock.close)
@@ -97,19 +126,27 @@ class ProductionControlVerbTest(unittest.TestCase):
     def _synthetic_scene(self, sock: socket.socket) -> None:
         loaded = host.rpc(sock, 400, "scene.load", {"sceneId": SCENE_ID, "width": 64, "height": 36})["result"]
         self.assertEqual(loaded["sceneId"], SCENE_ID)
-        created = host.rpc(
-            sock,
-            401,
-            "source.create",
-            {
+        if WINDOWS_LIBOBS:
+            source_params = {
+                "sceneId": SCENE_ID,
+                "sourceId": SOURCE_ID,
+                "kind": "streammate_test_source",
+                "settings": {"color": 0xFF2080FF},
+                "pluginFilterKind": "streammate_test_filter",
+                "filterId": FILTER_ID,
+                "width": 64,
+                "height": 36,
+            }
+        else:
+            source_params = {
                 "sceneId": SCENE_ID,
                 "sourceId": SOURCE_ID,
                 "kind": "browser",
                 "url": "https://station.localhost/overlay/control-surface",
                 "width": 64,
                 "height": 36,
-            },
-        )["result"]
+            }
+        created = host.rpc(sock, 401, "source.create", source_params)["result"]
         self.assertEqual(created["sourceId"], SOURCE_ID)
 
     def _assert_rpc_error(self, sock: socket.socket, rpc_id: int, method: str, params: dict, code: int = -32602) -> dict:
@@ -151,15 +188,12 @@ class ProductionControlVerbTest(unittest.TestCase):
         self.assertEqual(ordered, {"ok": True, "sceneId": SCENE_ID, "itemId": SOURCE_ID, "position": 0})
 
         listed = host.rpc(sock, 412, "filter.list", {"sourceId": SOURCE_ID})["result"]
-        self.assertEqual(
-            listed,
-            {
-                "sourceId": SOURCE_ID,
-                "filters": [
-                    {"filterId": FILTER_ID, "filterKind": "color_filter_v2", "label": "Color Correction", "enabled": True}
-                ],
-            },
+        expected_filter = (
+            {"filterId": FILTER_ID, "filterKind": "streammate_test_filter", "label": FILTER_ID, "enabled": True}
+            if WINDOWS_LIBOBS
+            else {"filterId": FILTER_ID, "filterKind": "color_filter_v2", "label": "Color Correction", "enabled": True}
         )
+        self.assertEqual(listed, {"sourceId": SOURCE_ID, "filters": [expected_filter]})
 
         disabled = host.rpc(sock, 413, "filter.setEnabled", {"sourceId": SOURCE_ID, "filterId": FILTER_ID, "enabled": False})[
             "result"

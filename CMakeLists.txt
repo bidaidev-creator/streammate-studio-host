@@ -275,10 +275,15 @@ if(BUILD_TESTING)
       NAME macos-ci-workflow
       COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_macos_ci_workflow.py
     )
+    message(STATUS "macOS: not registering windows-packaging (Windows-only contract)")
   elseif(WIN32)
     # Loud configure-time disposition: these exercise codesign, frameworks,
     # and the macOS-only workflow, so they are not registered on Windows.
     message(STATUS "Windows scaffold: not registering macos-packaging or macos-ci-workflow (macOS-only contracts)")
+    add_test(
+      NAME windows-packaging
+      COMMAND ${Python3_EXECUTABLE} ${CMAKE_CURRENT_SOURCE_DIR}/tests/integration/test_windows_packaging.py
+    )
   endif()
   add_test(
     NAME windows-ci-workflow

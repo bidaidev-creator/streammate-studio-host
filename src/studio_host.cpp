@@ -1229,6 +1229,7 @@ public:
   bool start(const std::optional<user_plugins::Manifest> &user_plugins_manifest,
              const PluginContainment &containment = {}) {
 #if STREAMMATE_HAS_LIBOBS
+    add_bundle_data_path();
     if (!obs_startup("en-US", nullptr, nullptr)) {
       return false;
     }
@@ -1315,11 +1316,9 @@ private:
     std::filesystem::path contents = executable->parent_path().parent_path();
     std::filesystem::path plugins = contents / "PlugIns" / "obs-plugins";
 #elif defined(_WIN32)
-    // Pin the Windows package shape to upstream OBS: an executable at
-    // <root>/bin/64bit and modules at <root>/obs-plugins/64bit. The packaging
-    // leg will stage the host and modules into this shape.
-    std::filesystem::path root = executable->parent_path().parent_path().parent_path();
-    std::filesystem::path plugins = root / "obs-plugins" / "64bit";
+    // The distributable is a bare-root payload: both executables and their
+    // runtime DLLs sit at <root>, with bundled modules below obs-plugins/64bit.
+    std::filesystem::path plugins = executable->parent_path() / "obs-plugins" / "64bit";
 #else
     return {};
 #endif
@@ -1349,12 +1348,30 @@ private:
     obs_add_module_path(binary_pattern.c_str(), data_pattern.c_str());
   }
 
+  static void add_bundle_data_path() {
+#if defined(_WIN32)
+    auto executable = executable_path();
+    if (!executable) {
+      return;
+    }
+    // Upstream's Windows fallback searches ../../data/libobs relative to the
+    // process working directory. Station may launch the bare-root executable
+    // from any directory, so add the packaged core-effect directory explicitly
+    // before obs_startup/reset_video asks for default.effect and its peers.
+    std::filesystem::path data = executable->parent_path() / "data" / "libobs";
+    if (std::filesystem::is_directory(data)) {
+      std::string data_path = path_to_utf8(data);
+      obs_add_data_path(data_path.c_str());
+    }
+#endif
+  }
+
   static bool reset_offscreen_video() {
     obs_video_info video = {};
 #if defined(__APPLE__)
     video.graphics_module = "@executable_path/../Frameworks/libobs-opengl.dylib";
 #elif defined(_WIN32)
-    // libobs-d3d11.dll is beside the executable in upstream's bin/64bit shape.
+    // libobs-d3d11.dll is beside the executable in the bare-root payload.
     video.graphics_module = "libobs-d3d11.dll";
 #else
     video.graphics_module = "libobs-opengl.so";

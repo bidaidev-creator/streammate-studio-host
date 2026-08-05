@@ -332,10 +332,11 @@ class UserPluginLoadingLibobsTest(unittest.TestCase):
 
     Env contract (set by the CI step):
       STREAMMATE_TEST_SOURCE_PLUGIN / STREAMMATE_TEST_FILTER_PLUGIN /
-      STREAMMATE_TEST_NOOP_PLUGIN   — built .plugin bundle directories
+      STREAMMATE_TEST_NOOP_PLUGIN   — built .plugin bundle directories on
+                                      macOS or flat .dll files on Windows
       STREAMMATE_DEP_MISSING_PLUGIN — test-source copy whose libobs load
                                       command was rewritten to a nonexistent
-                                      dylib (then re-signed)
+                                      dylib (then re-signed; macOS only)
     """
 
     def setUp(self) -> None:
@@ -345,46 +346,63 @@ class UserPluginLoadingLibobsTest(unittest.TestCase):
         self.root = self.base / "user-plugins"
         self.root.mkdir()
 
-        for env_key, name in (
+        plugin_inputs = (
             ("STREAMMATE_TEST_SOURCE_PLUGIN", "streammate-test-source"),
             ("STREAMMATE_TEST_FILTER_PLUGIN", "streammate-test-filter"),
             ("STREAMMATE_TEST_NOOP_PLUGIN", "streammate-test-noop"),
-            ("STREAMMATE_DEP_MISSING_PLUGIN", "depmiss"),
-        ):
-            bundle = os.environ.get(env_key, "")
-            self.assertTrue(bundle and Path(bundle).is_dir(), f"{env_key} must name a bundle dir")
-            shutil.copytree(bundle, self.root / f"{name}.plugin", symlinks=False)
-        # depmiss bundle binary must carry the module name inside MacOS/.
-        depmiss_macos = self.root / "depmiss.plugin" / "Contents" / "MacOS"
-        binaries = sorted(depmiss_macos.iterdir())
-        self.assertTrue(binaries)
-        if binaries[0].name != "depmiss":
-            binaries[0].rename(depmiss_macos / "depmiss")
+        )
+        for env_key, name in plugin_inputs:
+            plugin = os.environ.get(env_key, "")
+            if IS_WINDOWS:
+                self.assertTrue(plugin and Path(plugin).is_file(), f"{env_key} must name a DLL")
+                shutil.copy2(plugin, self.root / f"{name}.dll")
+            else:
+                self.assertTrue(plugin and Path(plugin).is_dir(), f"{env_key} must name a bundle dir")
+                shutil.copytree(plugin, self.root / f"{name}.plugin", symlinks=False)
+
+        self.depmiss_enabled = not IS_WINDOWS
+        if self.depmiss_enabled:
+            depmiss = os.environ.get("STREAMMATE_DEP_MISSING_PLUGIN", "")
+            self.assertTrue(depmiss and Path(depmiss).is_dir(),
+                            "STREAMMATE_DEP_MISSING_PLUGIN must name a bundle dir")
+            shutil.copytree(depmiss, self.root / "depmiss.plugin", symlinks=False)
+            # The copied bundle binary must carry the candidate module name.
+            depmiss_macos = self.root / "depmiss.plugin" / "Contents" / "MacOS"
+            binaries = sorted(depmiss_macos.iterdir())
+            self.assertTrue(binaries)
+            if binaries[0].name != "depmiss":
+                binaries[0].rename(depmiss_macos / "depmiss")
+        else:
+            print("Windows dependency-missing fixture SKIPPED: no deliberately unresolved-import DLL is built")
 
         # A user module colliding with a bundled upstream module id: bundled
         # wins, never loaded (uses the test-source binary under the taken name).
-        mac_capture = self.root / "mac-capture.plugin" / "Contents" / "MacOS"
-        mac_capture.mkdir(parents=True)
-        shutil.copy2(
-            self.root / "streammate-test-source.plugin" / "Contents" / "MacOS" / "streammate-test-source",
-            mac_capture / "mac-capture",
-        )
-        # Broken module: a VALID host-arch Mach-O header (so the static plan
-        # admits it) followed by nothing loadable — the dlopen itself fails.
-        broken = self.root / "broken.plugin" / "Contents" / "MacOS"
-        broken.mkdir(parents=True)
-        (broken / "broken").write_bytes(thin_macho64(HOST_CPU) + b"\x00" * 4096)
+        if IS_WINDOWS:
+            shutil.copy2(self.root / "streammate-test-source.dll", self.root / "win-capture.dll")
+        else:
+            mac_capture = self.root / "mac-capture.plugin" / "Contents" / "MacOS"
+            mac_capture.mkdir(parents=True)
+            shutil.copy2(
+                self.root / "streammate-test-source.plugin" / "Contents" / "MacOS" / "streammate-test-source",
+                mac_capture / "mac-capture",
+            )
+        # Broken module: a valid host-arch native header (so the static plan
+        # admits it) followed by nothing loadable — the loader itself fails.
+        build_bundle(self.root, "broken", platform_binary(HOST_CPU) + b"\x00" * 4096)
 
         # Missing-exports: a real loadable dylib that is NOT an OBS module
         # (supplied by CI; the packaged app's libobs-opengl.dylib).
         noexports_dylib = os.environ.get("STREAMMATE_NOEXPORTS_DYLIB", "")
         self.assertTrue(noexports_dylib and Path(noexports_dylib).is_file(),
                         "STREAMMATE_NOEXPORTS_DYLIB must name a loadable dylib")
-        noexports = self.root / "noexports.plugin" / "Contents" / "MacOS"
-        noexports.mkdir(parents=True)
-        shutil.copy2(noexports_dylib, noexports / "noexports")
+        if IS_WINDOWS:
+            shutil.copy2(noexports_dylib, self.root / "noexports.dll")
+        else:
+            noexports = self.root / "noexports.plugin" / "Contents" / "MacOS"
+            noexports.mkdir(parents=True)
+            shutil.copy2(noexports_dylib, noexports / "noexports")
         # Wrong-arch candidate: never attempted.
-        build_bundle(self.root, "otherarch", thin_macho64(OTHER_CPU))
+        build_bundle(self.root, "otherarch", platform_binary(OTHER_CPU))
 
         self.manifest = self.base / "manifest.json"
         write_manifest(self.manifest, [{"binaryDir": str(self.root)}], None, [])
@@ -693,12 +711,13 @@ class UserPluginLoadingLibobsTest(unittest.TestCase):
         self.assertEqual(noexports["state"], "module_load_failed")
         self.assertEqual(noexports["reasonDetail"], "missing-exports")
 
-        depmiss = by_ref["module:depmiss"]
-        self.assertEqual(depmiss["lifecycle"], "load_failed")
-        self.assertEqual(depmiss["state"], "dependency_missing")
-        self.assertIs(depmiss["observed"]["dependencies"], True)
+        if self.depmiss_enabled:
+            depmiss = by_ref["module:depmiss"]
+            self.assertEqual(depmiss["lifecycle"], "load_failed")
+            self.assertEqual(depmiss["state"], "dependency_missing")
+            self.assertIs(depmiss["observed"]["dependencies"], True)
 
-        collided = by_ref["module:mac-capture"]
+        collided = by_ref["module:win-capture" if IS_WINDOWS else "module:mac-capture"]
         self.assertEqual(collided["lifecycle"], "duplicate_of_bundled")
         self.assertNotIn("registeredTypes", collided)
 

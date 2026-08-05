@@ -62,8 +62,14 @@ class WindowsCiWorkflowTest(unittest.TestCase):
             "win-wasapi",
         ):
             self.assertIn(f"--target {target}", workflow)
-            self.assertNotIn(f"--target {target} || true", workflow)
-        self.assertIn("--target obs-ffmpeg || true", workflow)
+            # Required targets fail the pwsh step on a non-zero exit code.
+            self.assertIn(
+                f"--target {target}\n          if ($LASTEXITCODE -ne 0) {{ exit $LASTEXITCODE }}",
+                workflow,
+            )
+        # obs-ffmpeg stays optional: it is the LAST build line, with no exit-code
+        # guard after it, and the step ends in exit 0 so its failure never gates.
+        self.assertIn("--target obs-ffmpeg\n          exit 0", workflow)
 
     def test_libobs_artifacts_feed_the_host_smoke(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
@@ -77,7 +83,43 @@ class WindowsCiWorkflowTest(unittest.TestCase):
         self.assertIn("steps.libobs.outputs.deps_bin", workflow)
         self.assertIn("streammate-native-overlay native-overlay-module-smoke", workflow)
         self.assertIn("./build/host/studio-host-smoke.exe", workflow)
-        self.assertIn("deferred to the Windows packaging leg", workflow)
+
+    def test_libobs_job_packages_the_bare_root_runtime(self) -> None:
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn("packaging/windows/package-dist.sh", workflow)
+        for argument in (
+            "--host-bin", "--smoke-bin", "--obs-dll-dir", "--deps-bin-dir",
+            "--graphics-module", "--obs-modules-dir", "--streammate-plugin",
+            "--libobs-data-dir", "--output-dir dist",
+        ):
+            self.assertIn(argument, workflow)
+        self.assertIn("libobs_data_dir/default.effect", workflow)
+        self.assertIn("dist/StreamMateStudioHost/studio-host.exe", workflow)
+        self.assertIn("sha256sum -c ../sha256-manifest.txt", workflow)
+
+    def test_packaged_dist_runs_real_control_plugin_and_containment_e2es(self) -> None:
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        self.assertGreaterEqual(workflow.count("STREAMMATE_EXPECT_LIBOBS=1"), 3)
+        self.assertIn("test_production_control_verbs.py", workflow)
+        self.assertIn("test_user_plugin_loading.py", workflow)
+        self.assertIn("test_plugin_crash_containment.py", workflow)
+        for plugin in (
+            "streammate-test-source.dll", "streammate-test-filter.dll",
+            "streammate-test-noop.dll", "streammate-test-crash.dll",
+            "streammate-test-hang.dll",
+        ):
+            self.assertIn(plugin, workflow)
+        self.assertIn("dependency-missing fixture SKIPPED", workflow)
+        self.assertIn("STREAMMATE_NOEXPORTS_DYLIB", workflow)
+
+    def test_repack_and_upload_are_pinned(self) -> None:
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn("--output-dir dist-repack", workflow)
+        self.assertIn("diff dist/sha256-manifest.txt dist-repack/sha256-manifest.txt", workflow)
+        self.assertIn("cmp dist/StreamMateStudioHost-windows-x64.tar.gz", workflow)
+        self.assertIn("uses: actions/upload-artifact@v4", workflow)
+        self.assertIn("name: streammate-studio-host-windows-x64", workflow)
+        self.assertIn("dist/StreamMateStudioHost-windows-x64.tar.gz", workflow)
 
     def test_repository_pins_lf_for_windows_checkout(self) -> None:
         attributes = (REPO_ROOT / ".gitattributes").read_text(encoding="utf-8")
@@ -90,6 +132,12 @@ class WindowsCiWorkflowTest(unittest.TestCase):
         self.assertIn("elseif(WIN32)", cmake)
         self.assertIn(
             "Windows scaffold: not registering macos-packaging or macos-ci-workflow",
+            cmake,
+        )
+        self.assertIn("NAME windows-packaging", cmake)
+        self.assertIn("test_windows_packaging.py", cmake)
+        self.assertIn(
+            "macOS: not registering windows-packaging (Windows-only contract)",
             cmake,
         )
 
