@@ -190,8 +190,23 @@ jobs:
             cp -R "$module_data" "$module_stage/data/$module"
           done
 
+          # obs.dll depends on w32-pthreads.dll, which the VS build leaves in a
+          # SIBLING directory (deps/w32-pthreads/RelWithDebInfo) — loading
+          # obs.dll without it fails (bash surfaces the DLL-load failure as
+          # exit 127). Stage the complete libobs runtime DLL closure into one
+          # directory: it feeds both the smoke PATH and the packaged dist.
+          w32_pthreads_dll="$(find build/obs -type f -iname 'w32-pthreads.dll' -print -quit)"
+          if [[ -z "$w32_pthreads_dll" ]]; then
+            echo "w32-pthreads.dll not found in the OBS build tree" >&2
+            find build/obs -maxdepth 6 -iname '*pthread*' -print >&2
+            exit 1
+          fi
+          runtime_dll_stage="$PWD/build/obs/streammate-runtime-dll-stage"
+          mkdir -p "$runtime_dll_stage"
+          cp "$obs_dll" "$w32_pthreads_dll" "$runtime_dll_stage/"
+
           echo "library=$PWD/$obs_import" >> "$GITHUB_OUTPUT"
-          echo "obs_dll_dir=$PWD/$(dirname "$obs_dll")" >> "$GITHUB_OUTPUT"
+          echo "obs_dll_dir=$runtime_dll_stage" >> "$GITHUB_OUTPUT"
           echo "graphics_module=$PWD/$graphics_module" >> "$GITHUB_OUTPUT"
           echo "generated_include=$PWD/$(dirname "$obs_config")" >> "$GITHUB_OUTPUT"
           echo "deps_include=$PWD/$deps_root/include" >> "$GITHUB_OUTPUT"

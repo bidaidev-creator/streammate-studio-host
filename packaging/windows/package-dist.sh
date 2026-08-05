@@ -133,7 +133,11 @@ manifest_tmp="$output_dir/.sha256-manifest.tmp"
 (
   cd "$stage"
   if command -v sha256sum >/dev/null 2>&1; then
-    find . -type f -print0 | sort -z | xargs -0 sha256sum
+    # Windows coreutils defaults to binary mode and emits "HASH *path"; the
+    # sed rewrites only that one-space-asterisk marker to the canonical
+    # two-space form. Digests are computed on raw bytes either way.
+    find . -type f -print0 | sort -z | xargs -0 sha256sum \
+      | sed -e 's/^\([0-9a-f]\{64\}\) \*/\1  /'
   else
     # Local macOS contract tests use shasum; its output is byte-compatible
     # with sha256sum (digest, two spaces, relative path).
