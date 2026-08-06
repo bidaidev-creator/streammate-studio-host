@@ -70,6 +70,25 @@ def stop_process(process: subprocess.Popen[str]) -> None:
         process.wait(timeout=5)
 
 
+def path_disclosure_forms(path) -> list[str]:
+    """Every spelling a leaked `path` could take in a payload under test.
+
+    A bare `assertNotIn(str(path), payload)` is VACUOUS on Windows: the host
+    JSON-escapes backslashes, so a genuinely leaked `C:\\Users\\x` arrives as
+    `C:\\\\Users\\\\x` and the substring never matches — a path-disclosure
+    regression would go green on Windows while failing on macOS. Assert
+    against all forms instead: native, JSON-escaped, and forward-slash.
+    """
+    native = str(path)
+    return sorted({native, native.replace("\\", "\\\\"), native.replace("\\", "/")})
+
+
+def assert_no_path_disclosure(test_case, path, payload: str, msg: str | None = None) -> None:
+    """Fail if `path` appears in `payload` under ANY of its encodings."""
+    for form in path_disclosure_forms(path):
+        test_case.assertNotIn(form, payload, msg)
+
+
 def cleanup_tempdir_with_retry(tmp: tempfile.TemporaryDirectory, attempts: int = 20, delay: float = 0.5) -> None:
     """TemporaryDirectory cleanup that tolerates Windows lock-release lag.
 
@@ -438,7 +457,7 @@ class StudioHostLifecycleTest(unittest.TestCase):
                 },
             )
             self.assertNotIn(fixture_secret, json.dumps(scan))
-            self.assertNotIn(str(obs_dir), json.dumps(scan))
+            assert_no_path_disclosure(self, obs_dir, json.dumps(scan))
 
             loaded = rpc(sock, 101, "import.load", {"collectionId": "fixture-main"})
             self.assertEqual(loaded["result"]["report"], expected_import_report())

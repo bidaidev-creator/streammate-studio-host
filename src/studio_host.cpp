@@ -82,6 +82,10 @@ const char *sanitized_windows_load_error(DWORD error) {
   case ERROR_MOD_NOT_FOUND:
   case ERROR_DLL_NOT_FOUND:
     return "dependent-library-missing";
+  // LoadLibraryW reports a machine-type mismatch as ERROR_BAD_EXE_FORMAT;
+  // ERROR_EXE_MACHINE_TYPE_MISMATCH comes from CreateProcess-family image
+  // activation. Both map here so the arch arm is actually reachable.
+  case ERROR_BAD_EXE_FORMAT:
   case ERROR_EXE_MACHINE_TYPE_MISMATCH:
     return "wrong-architecture";
   default:
@@ -191,9 +195,15 @@ bool set_socket_nonblocking(socket_t fd) {
   return ioctlsocket(fd, FIONBIO, &enabled) == 0;
 }
 
+// NOT SO_REUSEADDR: on Windows that option lets an unrelated process bind the
+// SAME loopback address, and the kernel then delivers connections to an
+// indeterminate socket — a squatter could receive Station's token-bearing
+// handshake, and our bind would succeed where POSIX refuses loudly.
+// SO_EXCLUSIVEADDRUSE is the documented Windows equivalent of the POSIX
+// intent here (fail closed when the address is already taken).
 bool set_socket_reuse_address(socket_t fd) {
   const int enabled = 1;
-  return setsockopt(fd, SOL_SOCKET, SO_REUSEADDR,
+  return setsockopt(fd, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
                     reinterpret_cast<const char *>(&enabled), sizeof(enabled)) == 0;
 }
 #else
@@ -245,6 +255,30 @@ std::filesystem::path path_from_utf8(const std::string &value) {
 #else
   return std::filesystem::path(value);
 #endif
+}
+
+// NTFS is case-insensitive, so a user module may legitimately be named
+// `MyPlugin.DLL`. MSVC's path::operator== compares the native string case
+// SENSITIVELY, which would silently drop such a file from the inventory —
+// and "silently dropped" is exactly what the discovery contract forbids.
+// These two helpers fold case on Windows only; POSIX matching stays exact.
+bool equals_ignoring_windows_case(const std::string &left, const std::string &right) {
+#if defined(_WIN32)
+  if (left.size() != right.size()) return false;
+  for (std::size_t i = 0; i < left.size(); ++i) {
+    if (std::tolower(static_cast<unsigned char>(left[i])) !=
+        std::tolower(static_cast<unsigned char>(right[i]))) {
+      return false;
+    }
+  }
+  return true;
+#else
+  return left == right;
+#endif
+}
+
+bool has_windows_module_extension(const std::filesystem::path &path) {
+  return equals_ignoring_windows_case(path.extension().string(), ".dll");
 }
 
 std::string path_to_utf8(const std::filesystem::path &value) {
@@ -4168,7 +4202,8 @@ void walk_legacy_bin_dir(const std::filesystem::path &dir, int depth, const std:
     if (std::filesystem::is_regular_file(status) || std::filesystem::is_symlink(status)) {
       const std::string file_name = entry.filename().string();
       if (file_name == so_name || file_name == dylib_name ||
-          (!dll_name.empty() && file_name == dll_name)) matches.push_back(entry);
+          (!dll_name.empty() && equals_ignoring_windows_case(file_name, dll_name)))
+        matches.push_back(entry);
     } else if (std::filesystem::is_directory(status)) {
       walk_legacy_bin_dir(entry, depth + 1, so_name, dylib_name, dll_name, matches, visited,
                           truncated);
@@ -4246,7 +4281,7 @@ UserPluginRootScan scan_user_plugin_root(const std::filesystem::path &root) {
 
     std::optional<UserPluginCandidate> candidate;
 #if defined(_WIN32)
-    if (path.extension() == ".dll" && std::filesystem::is_regular_file(path, entry_ec) && !entry_ec) {
+    if (has_windows_module_extension(path) && std::filesystem::is_regular_file(path, entry_ec) && !entry_ec) {
       const std::string name = path.stem().string();
       if (!is_safe_protocol_id(name)) continue;
       candidate = UserPluginCandidate{name, path, entry_name, false, false};
@@ -4547,13 +4582,26 @@ std::array<std::set<std::string>, 6> snapshot_registered_types() {
 // module that failed to open/init is absent from (a) but must still shadow a
 // same-named user module (bundled wins even when broken). A user module
 // colliding with either is refused (duplicate_of_bundled) before any dlopen.
+// The key both sides of the collision test are folded through: identity on
+// POSIX, lowercase on Windows (NTFS is case-insensitive, so `WIN-CAPTURE` and
+// `win-capture` name the same file and must collide).
+std::string bundled_collision_key(const std::string &stem) {
+#if defined(_WIN32)
+  std::string key = stem;
+  for (char &c : key) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  return key;
+#else
+  return stem;
+#endif
+}
+
 std::set<std::string> bundled_module_stems(const std::filesystem::path &bundle_plugins_dir) {
   std::set<std::string> stems;
   obs_enum_modules(
       [](void *param, obs_module_t *module) {
         const char *file = obs_get_module_file_name(module);
         if (file == nullptr) return;
-        std::string stem = std::filesystem::path(file).stem().string();
+        std::string stem = bundled_collision_key(std::filesystem::path(file).stem().string());
         if (!stem.empty()) static_cast<std::set<std::string> *>(param)->insert(std::move(stem));
       },
       &stems);
@@ -4563,11 +4611,11 @@ std::set<std::string> bundled_module_stems(const std::filesystem::path &bundle_p
     for (std::filesystem::directory_iterator end; !ec && it != end; it.increment(ec)) {
       const std::filesystem::path entry = it->path();
 #if defined(_WIN32)
-      if (entry.extension() == ".dll") {
+      if (has_windows_module_extension(entry)) {
 #else
       if (entry.extension() == ".plugin") {
 #endif
-        std::string stem = entry.stem().string();
+        std::string stem = bundled_collision_key(entry.stem().string());
         if (!stem.empty()) stems.insert(std::move(stem));
       }
     }
@@ -4725,10 +4773,13 @@ void load_user_plugin_candidates(UserPluginLoadPlan &plan,
     UserPluginRecord &record = plan.inventory.modules[index];
     const UserPluginModuleSource &source = plan.sources[index];
 
-    // Stem comparison is deliberately case-sensitive: APFS defaults are
-    // case-insensitive, but libobs module ids are exact-match, and a
-    // case-variant name that survives here still fails obs_open_module.
-    if (bundled.count(record.label) != 0) {
+    // Stem comparison is case-sensitive on POSIX (libobs module ids are
+    // exact-match) but MUST fold case on Windows: NTFS is always
+    // case-insensitive, so `WIN-CAPTURE.dll` is an ordinary working name for
+    // a bundled module — and obs_open_module dedupes by exact bin_path, so a
+    // case-variant would be dlopened, exactly what this pre-dlopen guard
+    // exists to prevent.
+    if (bundled.count(bundled_collision_key(record.label)) != 0) {
       record.lifecycle = "duplicate_of_bundled"; // bundled upstream wins, never dlopened
       continue;
     }

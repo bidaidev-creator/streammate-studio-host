@@ -120,7 +120,7 @@ class RecordReplayScaffoldTest(unittest.TestCase):
             # No absolute host path leaks in any response.
             for response in (started, stopped, recording, after):
                 serialized = json.dumps(response)
-                self.assertNotIn(str(home), serialized)
+                host.assert_no_path_disclosure(self, home, serialized)
                 self.assertNotIn("/Users/", serialized)
 
     def test_record_started_and_stopped_events_are_journaled(self) -> None:
@@ -198,7 +198,7 @@ class RecordReplayScaffoldTest(unittest.TestCase):
                 rejected = host.rpc(sock, 330, "record.start", {"recordId": "confine", "destination": bad})
                 self.assertEqual(rejected["error"]["code"], -32602, bad)
                 self.assertIn("relative path under the state directory", rejected["error"]["message"], bad)
-                self.assertNotIn(str(home), json.dumps(rejected))
+                host.assert_no_path_disclosure(self, home, json.dumps(rejected))
 
             replay_absolute = r"C:\Windows\Temp\streammate-replay-evil.mkv" if sys.platform == "win32" else "/tmp/evil.mkv"
             replay_rejected = host.rpc(

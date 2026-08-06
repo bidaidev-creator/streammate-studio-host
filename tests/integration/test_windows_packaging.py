@@ -31,6 +31,8 @@ def bash_command() -> str:
         if candidate.is_file():
             return str(candidate)
     return "bash"
+
+
 HOST_SOURCE = REPO_ROOT / "src" / "studio_host.cpp"
 
 REQUIRED_MODULES = ("obs-outputs", "obs-x264", "rtmp-services", "win-capture", "win-wasapi")
@@ -138,7 +140,8 @@ class WindowsPackagingTest(unittest.TestCase):
                 digest, relative = line.split("  ", 1)
                 payload = output / "StreamMateStudioHost" / relative.removeprefix("./")
                 self.assertEqual(hashlib.sha256(payload.read_bytes()).hexdigest(), digest)
-                self.assertNotIn(str(root), line)
+                for form in {str(root), str(root).replace(chr(92), '/')}:
+                    self.assertNotIn(form, line)
                 self.assertNotIn("StreamMateStudioHost/", relative)
 
     def test_tarball_has_bare_files_at_archive_root_and_is_repack_deterministic(self) -> None:

@@ -357,7 +357,7 @@ class PluginDiscoveryTest(unittest.TestCase):
         # Non-disclosure: neither the hash nor the path of the outside file
         # appears anywhere in the raw response.
         self.assertNotIn(outside_sha, raw)
-        self.assertNotIn(str(outside), raw)
+        host.assert_no_path_disclosure(self, outside, raw)
 
     def test_truncated_platform_headers_report_unreadable(self) -> None:
         # Strictness: arch facts must come only from fully-read structures.

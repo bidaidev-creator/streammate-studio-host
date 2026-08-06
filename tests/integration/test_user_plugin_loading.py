@@ -728,7 +728,7 @@ class UserPluginLoadingLibobsTest(unittest.TestCase):
         self.assertEqual(otherarch["state"], "architecture_mismatch")
 
         # Sanitized failure detail only: no raw path or dlerror text anywhere.
-        self.assertNotIn(str(self.root), raw_first)
+        host.assert_no_path_disclosure(self, self.root, raw_first)
 
         # Restart-stable: a second boot with the same manifest is byte-identical.
         raw_second = boot_and_report_raw(self.manifest, self.addCleanup)

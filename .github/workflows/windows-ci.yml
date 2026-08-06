@@ -205,6 +205,19 @@ jobs:
           mkdir -p "$runtime_dll_stage"
           cp "$obs_dll" "$w32_pthreads_dll" "$runtime_dll_stage/"
 
+          # The user-plugin no-exports fixture: a real DLL that is NOT an OBS
+          # module. It must not be obs.dll — Windows keys loaded modules by
+          # path, so a copy would put a SECOND libobs (duplicate statics) into
+          # a host that already has one resident. macOS uses libobs-opengl for
+          # exactly this reason; mirror it.
+          opengl_dll="$(find build/obs -type f -iname 'libobs-opengl.dll' -print -quit)"
+          if [[ -z "$opengl_dll" ]]; then
+            echo "libobs-opengl.dll not found for the no-exports fixture" >&2
+            find build/obs -maxdepth 6 -iname 'libobs-*.dll' -print >&2
+            exit 1
+          fi
+          echo "noexports_dll=$PWD/$opengl_dll" >> "$GITHUB_OUTPUT"
+
           echo "library=$PWD/$obs_import" >> "$GITHUB_OUTPUT"
           echo "obs_dll_dir=$runtime_dll_stage" >> "$GITHUB_OUTPUT"
           echo "graphics_module=$PWD/$graphics_module" >> "$GITHUB_OUTPUT"
@@ -272,12 +285,14 @@ jobs:
       - name: Run real user-plugin loading end-to-end against packaged dist
         shell: bash
         run: |
-          echo "Windows dependency-missing fixture SKIPPED: this lane does not yet build a test DLL with a deliberately unresolved import."
+          echo "Windows coverage gaps in this lane, declared:"
+          echo "  1. dependency-missing fixture SKIPPED - no test DLL with a deliberately unresolved import is built yet."
+          echo "  2. wrong-architecture load-failure arm UNPROVEN - the static PE probe refuses mismatched binaries before dlopen, so the loader arm is unreachable from this fixture set."
           STREAMMATE_EXPECT_LIBOBS=1 \
           STREAMMATE_TEST_SOURCE_PLUGIN="$PWD/build/host/streammate-test-source.dll" \
           STREAMMATE_TEST_FILTER_PLUGIN="$PWD/build/host/streammate-test-filter.dll" \
           STREAMMATE_TEST_NOOP_PLUGIN="$PWD/build/host/streammate-test-noop.dll" \
-          STREAMMATE_NOEXPORTS_DYLIB="$PWD/dist/StreamMateStudioHost/obs.dll" \
+          STREAMMATE_NOEXPORTS_DYLIB="${{ steps.libobs.outputs.noexports_dll }}" \
           python tests/integration/test_user_plugin_loading.py \
             dist/StreamMateStudioHost/studio-host.exe
 
