@@ -82,10 +82,13 @@ const char *sanitized_windows_load_error(DWORD error) {
   case ERROR_MOD_NOT_FOUND:
   case ERROR_DLL_NOT_FOUND:
     return "dependent-library-missing";
-  // LoadLibraryW reports a machine-type mismatch as ERROR_BAD_EXE_FORMAT;
-  // ERROR_EXE_MACHINE_TYPE_MISMATCH comes from CreateProcess-family image
-  // activation. Both map here so the arch arm is actually reachable.
+  // ERROR_BAD_EXE_FORMAT only says "not a valid image for this loader" — it
+  // covers corrupt images as well as machine-type mismatches, so it cannot
+  // claim wrong-architecture by itself; the caller disambiguates against the
+  // PE machine field. ERROR_EXE_MACHINE_TYPE_MISMATCH (CreateProcess-family
+  // image activation) is an explicit machine-type verdict.
   case ERROR_BAD_EXE_FORMAT:
+    return "bad-image";
   case ERROR_EXE_MACHINE_TYPE_MISMATCH:
     return "wrong-architecture";
   default:
@@ -4667,6 +4670,22 @@ void classify_failed_dlopen(const std::filesystem::path &binary, UserPluginRecor
   } else if (text == "wrong-architecture") {
     record.state = "architecture_mismatch";
     record.reason_detail = "wrong-architecture";
+  } else if (text == "bad-image") {
+    // ERROR_BAD_EXE_FORMAT does not distinguish a corrupt image from a
+    // mismatched machine type; only a parsed PE machine field that excludes
+    // the host arch makes architecture_mismatch an observed fact.
+    const UserPluginBinaryProbe probe = probe_user_plugin_binary(binary);
+    std::optional<std::vector<std::string>> archs;
+    if (probe.readable) archs = parse_user_plugin_archs(probe.header);
+    if (archs && kHostCpuArch[0] != '\0' &&
+        std::find(archs->begin(), archs->end(), std::string(kHostCpuArch)) ==
+            archs->end()) {
+      record.state = "architecture_mismatch";
+      record.reason_detail = "wrong-architecture";
+    } else {
+      record.state = "module_load_failed";
+      record.reason_detail = "dlopen-failed";
+    }
   } else {
     record.state = "module_load_failed";
     record.reason_detail = "dlopen-failed";
