@@ -315,6 +315,38 @@ class WindowsPackagingTest(unittest.TestCase):
                 self.assertNotEqual(result.returncode, 0, result.stdout)
                 self.assertIn("debug crt", result.stdout.lower())
 
+    def test_debug_crt_scan_failure_is_not_mistaken_for_clean(self) -> None:
+        # A broken scanner (grep exiting 2/127) must fail packaging, not pass
+        # it — otherwise the gate silently disarms. The shim makes every grep
+        # invocation fail; the tar-flavor probe degrades to the BSD branch,
+        # which still packages, so the first hard stop is the CRT scan itself.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            inputs = self.build_input_tree(root)
+            shim_dir = root / "shim"
+            shim_dir.mkdir()
+            shim = shim_dir / "grep"
+            shim.write_text("#!/bin/sh\nexit 2\n", encoding="utf-8")
+            shim.chmod(0o755)
+            env = dict(os.environ)
+            env["PATH"] = f"{shim_dir}{os.pathsep}{env['PATH']}"
+            result = subprocess.run(
+                [bash_command(), PACKAGE_SCRIPT.as_posix(),
+                 "--host-bin", inputs["host"].as_posix(),
+                 "--smoke-bin", inputs["smoke"].as_posix(),
+                 "--obs-dll-dir", inputs["obs_dll_dir"].as_posix(),
+                 "--deps-bin-dir", inputs["deps_bin_dir"].as_posix(),
+                 "--graphics-module", inputs["graphics"].as_posix(),
+                 "--obs-modules-dir", inputs["modules"].as_posix(),
+                 "--streammate-plugin", inputs["streammate"].as_posix(),
+                 "--libobs-data-dir", inputs["libobs_data"].as_posix(),
+                 "--output-dir", (root / "broken-grep").as_posix()],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                check=False, env=env,
+            )
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn("debug-crt scan failed", result.stdout.lower())
+
     def test_script_pins_all_arguments_and_deterministic_tools(self) -> None:
         script = PACKAGE_SCRIPT.read_text(encoding="utf-8")
         for argument in (

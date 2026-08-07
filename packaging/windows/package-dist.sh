@@ -217,8 +217,15 @@ done
 for built_binary in "$stage/studio-host.exe" "$stage/studio-host-smoke.exe" \
   "$plugins/streammate-native-overlay.dll"; do
   for debug_crt in ucrtbased.dll vcruntime140d.dll msvcp140d.dll; do
-    if grep -aiq "$debug_crt" "$built_binary"; then
+    # Explicit status handling: only 1 (no match) passes. 0 is the rejection;
+    # anything else is a scanner error and must not be mistaken for clean.
+    scan_status=0
+    grep -aiq "$debug_crt" "$built_binary" || scan_status=$?
+    if [[ "$scan_status" -eq 0 ]]; then
       echo "staged binary imports the debug CRT ($debug_crt): $built_binary" >&2
+      exit 1
+    elif [[ "$scan_status" -ne 1 ]]; then
+      echo "debug-CRT scan failed (grep exit $scan_status) on: $built_binary" >&2
       exit 1
     fi
   done
