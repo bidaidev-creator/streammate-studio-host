@@ -38,7 +38,7 @@ class WindowsCiWorkflowTest(unittest.TestCase):
         self.assertIn("ctest --test-dir build/scaffold --output-on-failure", workflow)
         self.assertIn("STREAMMATE_REQUIRE_OBS_TREE=1", workflow)
 
-    def test_libobs_build_is_pinned_and_browser_enabled_without_qt_panels(self) -> None:
+    def test_libobs_build_is_pinned_and_browser_enabled_with_qt_panels(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
         self.assertIn("origin tag 32.1.2", workflow)
         self.assertIn('-G "Visual Studio 17 2022" -A x64', workflow)
@@ -54,7 +54,11 @@ class WindowsCiWorkflowTest(unittest.TestCase):
         ):
             self.assertIn(f"-D{flag}=OFF", workflow)
         self.assertIn("-DENABLE_BROWSER=ON", workflow)
-        self.assertIn("-DENABLE_BROWSER_PANELS=OFF", workflow)
+        # Panels ON is the only upstream-supported Windows obs-browser
+        # configuration (its unconditional sources include Qt headers and only
+        # feature-panels.cmake links Qt on Windows). The HOST still never runs
+        # a Qt loop: STREAMMATE_ENABLE_CEF_QT_LOOP must stay unset.
+        self.assertIn("-DENABLE_BROWSER_PANELS=ON", workflow)
         self.assertNotIn("-DENABLE_BROWSER=OFF", workflow)
         self.assertNotIn("STREAMMATE_ENABLE_CEF_QT_LOOP=ON", workflow)
         for target in (
@@ -98,6 +102,8 @@ class WindowsCiWorkflowTest(unittest.TestCase):
         self.assertIn("-iname 'obs-frontend-api.dll'", workflow)
         self.assertIn("cef_binary_*_windows_x64", workflow)
         self.assertIn("browser_data_dir=", workflow)
+        self.assertIn("obs-deps-qt6-", workflow)
+        self.assertIn("qt_bin_dir=", workflow)
         self.assertIn("streammate-native-overlay native-overlay-module-smoke", workflow)
         self.assertIn("./build/host/studio-host-smoke.exe", workflow)
 
@@ -109,7 +115,7 @@ class WindowsCiWorkflowTest(unittest.TestCase):
             "--graphics-module", "--obs-modules-dir", "--streammate-plugin",
             "--libobs-data-dir", "--obs-browser-plugin", "--obs-browser-page",
             "--cef-release-dir", "--cef-resources-dir", "--obs-frontend-api",
-            "--obs-browser-data-dir", "--output-dir dist",
+            "--obs-browser-data-dir", "--qt-bin-dir", "--output-dir dist",
         ):
             self.assertIn(argument, workflow)
         self.assertIn("libobs_data_dir/default.effect", workflow)

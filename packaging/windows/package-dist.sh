@@ -21,6 +21,7 @@ cef_release_dir=""
 cef_resources_dir=""
 obs_frontend_api=""
 obs_browser_data_dir=""
+qt_bin_dir=""
 output_dir="dist"
 
 usage() {
@@ -29,7 +30,8 @@ usage: package-dist.sh --host-bin PATH --smoke-bin PATH \
   --obs-dll-dir PATH --deps-bin-dir PATH --graphics-module PATH \
   --obs-modules-dir PATH --streammate-plugin PATH --libobs-data-dir PATH \
   [--obs-browser-plugin PATH --obs-browser-page PATH --cef-release-dir PATH \
-   --cef-resources-dir PATH --obs-frontend-api PATH --obs-browser-data-dir PATH] \
+   --cef-resources-dir PATH --obs-frontend-api PATH --obs-browser-data-dir PATH \
+   --qt-bin-dir PATH] \
   [--output-dir PATH]
 USAGE
 }
@@ -50,6 +52,7 @@ while [[ $# -gt 0 ]]; do
     --cef-resources-dir) cef_resources_dir="${2:-}"; shift 2 ;;
     --obs-frontend-api) obs_frontend_api="${2:-}"; shift 2 ;;
     --obs-browser-data-dir) obs_browser_data_dir="${2:-}"; shift 2 ;;
+    --qt-bin-dir) qt_bin_dir="${2:-}"; shift 2 ;;
     --output-dir) output_dir="${2:-}"; shift 2 ;;
     -h|--help) usage; exit 0 ;;
     *) echo "unknown argument: $1" >&2; usage; exit 2 ;;
@@ -101,7 +104,8 @@ require_dir "OBS module data directory" "$obs_modules_dir/data"
 # resources, frontend API dependency, and module data must travel together.
 cef_enabled=0
 if [[ -n "$obs_browser_plugin" || -n "$obs_browser_page" || -n "$cef_release_dir" ||
-      -n "$cef_resources_dir" || -n "$obs_frontend_api" || -n "$obs_browser_data_dir" ]]; then
+      -n "$cef_resources_dir" || -n "$obs_frontend_api" || -n "$obs_browser_data_dir" ||
+      -n "$qt_bin_dir" ]]; then
   cef_enabled=1
   require_file "obs-browser plugin" "$obs_browser_plugin"
   require_file "obs-browser page executable" "$obs_browser_page"
@@ -109,6 +113,12 @@ if [[ -n "$obs_browser_plugin" || -n "$obs_browser_page" || -n "$cef_release_dir
   require_dir "CEF Resources directory" "$cef_resources_dir"
   require_file "obs-frontend-api DLL" "$obs_frontend_api"
   require_dir "obs-browser module data directory" "$obs_browser_data_dir"
+  # Windows obs-browser is built in the panels configuration (the only
+  # upstream-supported one), so it load-depends on the Qt runtime.
+  require_dir "Qt runtime bin directory" "$qt_bin_dir"
+  for qt_dll in Qt6Core.dll Qt6Gui.dll Qt6Widgets.dll; do
+    require_file "Qt runtime DLL $qt_dll" "$qt_bin_dir/$qt_dll"
+  done
   if [[ "$(basename "$obs_browser_plugin" | tr '[:upper:]' '[:lower:]')" != "obs-browser.dll" ]]; then
     echo "obs-browser plugin must be obs-browser.dll: $obs_browser_plugin" >&2
     exit 1
@@ -183,6 +193,11 @@ if [[ "$cef_enabled" -eq 1 ]]; then
   mkdir -p "$plugins/locales" "$plugin_data/obs-browser"
   cp -R "$cef_resources_dir/locales/." "$plugins/locales/"
   cp -R "$obs_browser_data_dir/." "$plugin_data/obs-browser/"
+  # Beside obs-browser.dll: libobs loads modules with LOAD_WITH_ALTERED_SEARCH_PATH,
+  # so the module's own directory resolves its Qt load-time dependents.
+  for qt_dll in Qt6Core.dll Qt6Gui.dll Qt6Widgets.dll; do
+    cp "$qt_bin_dir/$qt_dll" "$plugins/$qt_dll"
+  done
 fi
 
 required_modules=(obs-outputs obs-x264 rtmp-services win-capture win-wasapi)
@@ -221,13 +236,17 @@ archive_list="$output_dir/.archive-files"
 (
   cd "$stage"
   find . -type f -print0 | sort -z > "$archive_list"
+  # gzip -n, via an explicit pipe: tar -z lets the compressor stamp the gzip
+  # header MTIME (BSD tar stamps the current second, so two packagings that
+  # straddle a second boundary differed byte-wise even with identical tar
+  # contents). gzip -n on a stream writes MTIME 0 and no name on both paths.
   if tar --version 2>&1 | grep -q 'GNU tar'; then
     COPYFILE_DISABLE=1 tar --sort=name --mtime='UTC 1980-01-01' \
-      --owner=0 --group=0 --numeric-owner -czf "$PWD/../StreamMateStudioHost-windows-x64.tar.gz" \
-      --null -T "$archive_list"
+      --owner=0 --group=0 --numeric-owner -cf - \
+      --null -T "$archive_list" | gzip -n > "$PWD/../StreamMateStudioHost-windows-x64.tar.gz"
   else
     COPYFILE_DISABLE=1 tar --uid 0 --gid 0 --uname root --gname root \
-      -czf "$PWD/../StreamMateStudioHost-windows-x64.tar.gz" --null -T "$archive_list"
+      -cf - --null -T "$archive_list" | gzip -n > "$PWD/../StreamMateStudioHost-windows-x64.tar.gz"
   fi
 )
 rm -f "$archive_list"

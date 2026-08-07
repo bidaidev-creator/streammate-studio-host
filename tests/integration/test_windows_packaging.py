@@ -84,6 +84,10 @@ class WindowsPackagingTest(unittest.TestCase):
         self.write_fixture(cef_resources / "not-staged.txt")
         browser_data = inputs / "browser-data"
         self.write_fixture(browser_data / "locale" / "en-US.ini")
+        qt_bin = inputs / "qt" / "bin"
+        for name in ("Qt6Core.dll", "Qt6Gui.dll", "Qt6Widgets.dll"):
+            self.write_fixture(qt_bin / name)
+        self.write_fixture(qt_bin / "Qt6Network.dll")
         return {
             "host": host,
             "smoke": smoke,
@@ -99,6 +103,7 @@ class WindowsPackagingTest(unittest.TestCase):
             "cef_release": cef_release,
             "cef_resources": cef_resources,
             "browser_data": browser_data,
+            "qt_bin": qt_bin,
         }
 
     def package(self, inputs: dict[str, Path], output: Path,
@@ -122,6 +127,7 @@ class WindowsPackagingTest(unittest.TestCase):
                 "--cef-resources-dir", inputs["cef_resources"].as_posix(),
                 "--obs-frontend-api", inputs["frontend_api"].as_posix(),
                 "--obs-browser-data-dir", inputs["browser_data"].as_posix(),
+                "--qt-bin-dir", inputs["qt_bin"].as_posix(),
             ])
         args.extend(["--output-dir", output.as_posix()])
         if extra:
@@ -155,10 +161,13 @@ class WindowsPackagingTest(unittest.TestCase):
                 "chrome_elf.dll", "libEGL.dll", "libGLESv2.dll",
                 "v8_context_snapshot.bin", "chrome_100_percent.pak",
                 "chrome_200_percent.pak", "icudtl.dat", "resources.pak",
+                "Qt6Core.dll", "Qt6Gui.dll", "Qt6Widgets.dll",
             ):
                 self.assertTrue((plugins / name).is_file(), name)
             self.assertTrue((plugins / "locales" / "en-US.pak").is_file())
             self.assertFalse((plugins / "not-staged.txt").exists())
+            # Only the load-bearing Qt runtime travels, not the whole Qt bin dir.
+            self.assertFalse((plugins / "Qt6Network.dll").exists())
             for module in (*REQUIRED_MODULES, "obs-ffmpeg"):
                 self.assertTrue(
                     (stage / "data" / "obs-plugins" / module / "locale" / "en-US.ini").is_file(),
@@ -213,6 +222,7 @@ class WindowsPackagingTest(unittest.TestCase):
             self.assertIn("obs-plugins/64bit/obs-browser.dll", names)
             self.assertIn("obs-plugins/64bit/libcef.dll", names)
             self.assertIn("obs-plugins/64bit/locales/en-US.pak", names)
+            self.assertIn("obs-plugins/64bit/Qt6Widgets.dll", names)
             self.assertIn("data/obs-plugins/obs-browser/locale/en-US.ini", names)
             self.assertIn("obs-frontend-api.dll", names)
             self.assertFalse(any(name.startswith("StreamMateStudioHost/") for name in names))
@@ -259,6 +269,7 @@ class WindowsPackagingTest(unittest.TestCase):
             "--cef-resources-dir": "cef_resources",
             "--obs-frontend-api": "frontend_api",
             "--obs-browser-data-dir": "browser_data",
+            "--qt-bin-dir": "qt_bin",
         }
         for argument, input_key in cef_arguments.items():
             with self.subTest(argument=argument), tempfile.TemporaryDirectory() as temp_dir:
@@ -291,7 +302,7 @@ class WindowsPackagingTest(unittest.TestCase):
             "--graphics-module", "--obs-modules-dir", "--streammate-plugin",
             "--libobs-data-dir", "--obs-browser-plugin", "--obs-browser-page",
             "--cef-release-dir", "--cef-resources-dir", "--obs-frontend-api",
-            "--obs-browser-data-dir", "--output-dir",
+            "--obs-browser-data-dir", "--qt-bin-dir", "--output-dir",
         ):
             self.assertIn(argument, script)
         self.assertIn("sha256sum", script)
@@ -299,6 +310,11 @@ class WindowsPackagingTest(unittest.TestCase):
         self.assertIn("tar --sort=name", script)
         self.assertIn("--uid 0 --gid 0", script)
         self.assertIn("touch -t 198001010000.00", script)
+        # Explicit gzip -n pipe: tar -z lets the compressor stamp the gzip
+        # header MTIME (BSD tar uses the current second), breaking byte
+        # determinism across seconds.
+        self.assertIn("| gzip -n", script)
+        self.assertNotIn("-czf", script)
 
     def test_host_resolves_windows_modules_and_core_data_from_executable_root(self) -> None:
         source = HOST_SOURCE.read_text(encoding="utf-8")
