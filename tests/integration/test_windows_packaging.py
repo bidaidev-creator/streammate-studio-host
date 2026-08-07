@@ -295,6 +295,58 @@ class WindowsPackagingTest(unittest.TestCase):
             self.assertFalse((stage / "obs-frontend-api.dll").exists())
             self.assertFalse((stage / "obs-plugins" / "64bit" / "obs-browser.dll").exists())
 
+    def test_debug_crt_binaries_are_refused(self) -> None:
+        # A debug-CRT PE launches on dev/CI machines (Visual Studio ships the
+        # debug runtime) but dies with STATUS_DLL_NOT_FOUND on user hardware;
+        # the first owner-hardware studio-host.exe launch caught exactly this.
+        for input_key, marker in (
+            ("host", "ucrtbased.dll"),
+            ("smoke", "VCRUNTIME140D.dll"),
+            ("streammate", "MSVCP140D.dll"),
+        ):
+            with self.subTest(binary=input_key), tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                inputs = self.build_input_tree(root)
+                self.write_fixture(
+                    inputs[input_key],
+                    f"pe fixture importing {marker} for {inputs[input_key].name}\n",
+                )
+                result = self.package(inputs, root / "debug-crt")
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("debug crt", result.stdout.lower())
+
+    def test_debug_crt_scan_failure_is_not_mistaken_for_clean(self) -> None:
+        # A broken scanner (grep exiting 2/127) must fail packaging, not pass
+        # it — otherwise the gate silently disarms. The shim is a BASH_ENV
+        # function, not a PATH entry: Git-Bash's bin/bash.exe wrapper prepends
+        # /usr/bin ahead of any inherited PATH, so a PATH shim never wins on
+        # Windows, while a function outranks PATH lookup everywhere. The
+        # tar-flavor probe degrades to the BSD branch, which still packages,
+        # so the first hard stop is the CRT scan itself.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            inputs = self.build_input_tree(root)
+            bash_env = root / "broken-grep-env.sh"
+            bash_env.write_text("grep() { return 2; }\n", encoding="utf-8")
+            env = dict(os.environ)
+            env["BASH_ENV"] = bash_env.as_posix()
+            result = subprocess.run(
+                [bash_command(), PACKAGE_SCRIPT.as_posix(),
+                 "--host-bin", inputs["host"].as_posix(),
+                 "--smoke-bin", inputs["smoke"].as_posix(),
+                 "--obs-dll-dir", inputs["obs_dll_dir"].as_posix(),
+                 "--deps-bin-dir", inputs["deps_bin_dir"].as_posix(),
+                 "--graphics-module", inputs["graphics"].as_posix(),
+                 "--obs-modules-dir", inputs["modules"].as_posix(),
+                 "--streammate-plugin", inputs["streammate"].as_posix(),
+                 "--libobs-data-dir", inputs["libobs_data"].as_posix(),
+                 "--output-dir", (root / "broken-grep").as_posix()],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                check=False, env=env,
+            )
+            self.assertNotEqual(result.returncode, 0, result.stdout)
+            self.assertIn("debug-crt scan failed", result.stdout.lower())
+
     def test_script_pins_all_arguments_and_deterministic_tools(self) -> None:
         script = PACKAGE_SCRIPT.read_text(encoding="utf-8")
         for argument in (

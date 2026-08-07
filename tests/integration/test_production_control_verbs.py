@@ -390,6 +390,34 @@ class ProductionControlVerbTest(unittest.TestCase):
             time.sleep(0.05)
         self.assertTrue(all(is_loopback_peer(peer) for peer in peers), peers)
 
+    def test_win_capture_compat_updater_is_denied(self) -> None:
+        # Pinned win-capture (32.1.2) defines ENABLE_COMPAT_UPDATES but never
+        # references it, so it creates its obsproject.com updater at load
+        # unconditionally. The host denies it a cache directory by stationing
+        # a regular FILE at the module's config path; update_info_create()
+        # then returns before any network activity. The loopback-egress test
+        # above only catches the fetch when netstat samples mid-connection —
+        # this asserts the denial itself, deterministically.
+        if not WINDOWS_LIBOBS:
+            self.skipTest("win-capture is only packaged on the Windows libobs lane")
+        process, sock = self._connect()
+        self._synthetic_scene(sock)
+        # Mirror GetTempPath2W's resolution order (TMP, TEMP, USERPROFILE);
+        # the harness merges os.environ into the host env, so both processes
+        # resolve the same base.
+        temp_base = next(
+            (os.environ[key] for key in ("TMP", "TEMP", "USERPROFILE") if os.environ.get(key)),
+            tempfile.gettempdir(),
+        )
+        sentinel = (
+            Path(temp_base) / "streammate-studio-host" / f"obs-module-config-{process.pid}" / "win-capture"
+        )
+        self.assertTrue(sentinel.is_file(), f"updater-denial sentinel absent or not a file: {sentinel}")
+        self.assertFalse(
+            (Path.cwd() / "win-capture").exists(),
+            "win-capture module config leaked into the launch CWD",
+        )
+
     def test_new_verbs_write_no_journal_and_persist_no_secret_shaped_material(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
             home = Path(temp_dir) / "streammate-home"

@@ -39,6 +39,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -508,7 +509,19 @@ class UserPluginLoadingLibobsTest(unittest.TestCase):
         hidden_toggle = host.rpc(sock, 9432, "sceneItem.setVisible",
                                  {"sceneId": "slice", "itemId": "slice-src", "visible": False})
         self.assertTrue(hidden_toggle["result"]["ok"])
-        pcap_hidden = host.rpc(sock, 9433, "program.captureFrame", {})
+        # Poll for the departure: the visibility change lands on the compositor
+        # asynchronously, and a single capture can win the race against it —
+        # the frame handed to the very next capture may have been composited
+        # before the hide. (Latent since NIF-V1; first lost on the optimized
+        # RelWithDebInfo host, whose RPC round-trip no longer out-slept it.)
+        deadline = time.time() + 10
+        rpc_id = 9480  # own id range: the poll must not collide with 9434+
+        pcap_hidden = host.rpc(sock, rpc_id, "program.captureFrame", {})
+        while (pcap_hidden["result"]["frameSha256"] == pcap1["result"]["frameSha256"]
+               and time.time() < deadline):
+            time.sleep(0.25)
+            rpc_id += 1
+            pcap_hidden = host.rpc(sock, rpc_id, "program.captureFrame", {})
         self.assertNotEqual(pcap_hidden["result"]["frameSha256"], pcap1["result"]["frameSha256"],
                             msg="hiding the source must change the real program pixels")
         shown_toggle = host.rpc(sock, 9434, "sceneItem.setVisible",

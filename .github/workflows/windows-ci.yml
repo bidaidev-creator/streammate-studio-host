@@ -276,10 +276,17 @@ jobs:
           echo "browser_data_dir=$PWD/$browser_data_dir" >> "$GITHUB_OUTPUT"
           echo "qt_bin_dir=$PWD/$qt_bin_dir" >> "$GITHUB_OUTPUT"
 
+      # CMAKE_BUILD_TYPE is explicit: an unset build type let Ninja+MSVC emit a
+      # debug-CRT studio-host.exe (VCRUNTIME140D/MSVCP140D/ucrtbased imports)
+      # that launched on every CI image (VS ships the debug CRT) but died with
+      # STATUS_DLL_NOT_FOUND on real user hardware — caught by the first
+      # owner-hardware launch (streammate#536). package-dist.sh now also
+      # refuses debug-CRT imports fail-closed.
       - name: Configure obs_startup smoke against built libobs
         shell: bash
         run: |
           cmake -S . -B build/host -G Ninja \
+            -DCMAKE_BUILD_TYPE=RelWithDebInfo \
             -DSTREAMMATE_REQUIRE_LIBOBS=ON \
             -DSTREAMMATE_OBS_INCLUDE_DIR="$PWD/external/obs-studio/libobs" \
             -DSTREAMMATE_OBS_DEPS_INCLUDE_DIR="${{ steps.libobs.outputs.deps_include }}" \
