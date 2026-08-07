@@ -17,7 +17,7 @@ class WindowsCiWorkflowTest(unittest.TestCase):
         # generator, which the windows-latest (2025, VS 18-only) image lacks.
         self.assertIn("runs-on: windows-2022", workflow)
         self.assertIn("timeout-minutes: 40", workflow)
-        self.assertIn("timeout-minutes: 100", workflow)
+        self.assertIn("timeout-minutes: 150", workflow)
         self.assertNotIn("    needs:", workflow)
 
     def test_checkout_and_pinned_build_tools_are_wired(self) -> None:
@@ -38,7 +38,7 @@ class WindowsCiWorkflowTest(unittest.TestCase):
         self.assertIn("ctest --test-dir build/scaffold --output-on-failure", workflow)
         self.assertIn("STREAMMATE_REQUIRE_OBS_TREE=1", workflow)
 
-    def test_libobs_build_is_pinned_and_browser_free(self) -> None:
+    def test_libobs_build_is_pinned_and_browser_enabled_with_qt_panels(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
         self.assertIn("origin tag 32.1.2", workflow)
         self.assertIn('-G "Visual Studio 17 2022" -A x64', workflow)
@@ -51,9 +51,16 @@ class WindowsCiWorkflowTest(unittest.TestCase):
             "ENABLE_VST",
             "ENABLE_AJA",
             "ENABLE_DECKLINK",
-            "ENABLE_BROWSER",
         ):
             self.assertIn(f"-D{flag}=OFF", workflow)
+        self.assertIn("-DENABLE_BROWSER=ON", workflow)
+        # Panels ON is the only upstream-supported Windows obs-browser
+        # configuration (its unconditional sources include Qt headers and only
+        # feature-panels.cmake links Qt on Windows). The HOST still never runs
+        # a Qt loop: STREAMMATE_ENABLE_CEF_QT_LOOP must stay unset.
+        self.assertIn("-DENABLE_BROWSER_PANELS=ON", workflow)
+        self.assertNotIn("-DENABLE_BROWSER=OFF", workflow)
+        self.assertNotIn("STREAMMATE_ENABLE_CEF_QT_LOOP=ON", workflow)
         for target in (
             "libobs",
             "libobs-d3d11",
@@ -63,6 +70,9 @@ class WindowsCiWorkflowTest(unittest.TestCase):
             "rtmp-services",
             "win-capture",
             "win-wasapi",
+            "obs-frontend-api",
+            "obs-browser",
+            "obs-browser-helper",
         ):
             self.assertIn(f"--target {target}", workflow)
             # Required targets fail the pwsh step on a non-zero exit code.
@@ -70,9 +80,12 @@ class WindowsCiWorkflowTest(unittest.TestCase):
                 f"--target {target}\n          if ($LASTEXITCODE -ne 0) {{ exit $LASTEXITCODE }}",
                 workflow,
             )
-        # obs-ffmpeg stays optional: it is the LAST build line, with no exit-code
-        # guard after it, and the step ends in exit 0 so its failure never gates.
-        self.assertIn("--target obs-ffmpeg\n          exit 0", workflow)
+        # obs-ffmpeg stays optional: its build has no exit-code guard before
+        # the hard-fail browser target ladder begins.
+        self.assertIn(
+            "--target obs-ffmpeg\n          cmake --build build/obs --config RelWithDebInfo --target obs-frontend-api",
+            workflow,
+        )
 
     def test_libobs_artifacts_feed_the_host_smoke(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
@@ -84,6 +97,13 @@ class WindowsCiWorkflowTest(unittest.TestCase):
         self.assertIn("-DSTREAMMATE_REQUIRE_LIBOBS=ON", workflow)
         self.assertIn("steps.libobs.outputs.obs_dll_dir", workflow)
         self.assertIn("steps.libobs.outputs.deps_bin", workflow)
+        self.assertIn("-iname 'obs-browser.dll'", workflow)
+        self.assertIn("-iname 'obs-browser-page.exe'", workflow)
+        self.assertIn("-iname 'obs-frontend-api.dll'", workflow)
+        self.assertIn("cef_binary_*_windows_x64", workflow)
+        self.assertIn("browser_data_dir=", workflow)
+        self.assertIn("obs-deps-qt6-", workflow)
+        self.assertIn("qt_bin_dir=", workflow)
         self.assertIn("streammate-native-overlay native-overlay-module-smoke", workflow)
         self.assertIn("./build/host/studio-host-smoke.exe", workflow)
 
@@ -93,7 +113,9 @@ class WindowsCiWorkflowTest(unittest.TestCase):
         for argument in (
             "--host-bin", "--smoke-bin", "--obs-dll-dir", "--deps-bin-dir",
             "--graphics-module", "--obs-modules-dir", "--streammate-plugin",
-            "--libobs-data-dir", "--output-dir dist",
+            "--libobs-data-dir", "--obs-browser-plugin", "--obs-browser-page",
+            "--cef-release-dir", "--cef-resources-dir", "--obs-frontend-api",
+            "--obs-browser-data-dir", "--qt-bin-dir", "--output-dir dist",
         ):
             self.assertIn(argument, workflow)
         self.assertIn("libobs_data_dir/default.effect", workflow)
@@ -106,6 +128,8 @@ class WindowsCiWorkflowTest(unittest.TestCase):
         self.assertIn("test_production_control_verbs.py", workflow)
         self.assertIn("test_user_plugin_loading.py", workflow)
         self.assertIn("test_plugin_crash_containment.py", workflow)
+        self.assertIn("test_cef_composition.py", workflow)
+        self.assertIn("STREAMMATE_EXPECT_LIBOBS=1 STREAMMATE_EXPECT_CEF=1", workflow)
         for plugin in (
             "streammate-test-source.dll", "streammate-test-filter.dll",
             "streammate-test-noop.dll", "streammate-test-crash.dll",

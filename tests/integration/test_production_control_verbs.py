@@ -23,6 +23,7 @@ SCENE_ID = "control-scene"
 FILTER_ID = "color-correction"
 SECRET_SHAPED = "stm_studio-host_AbCdEfGhIjKlMnOpQrStUvWxYz012345"
 WINDOWS_LIBOBS = sys.platform == "win32" and os.environ.get("STREAMMATE_EXPECT_LIBOBS", "") == "1"
+FILTER_SOURCE_ID = "filter-fixture" if WINDOWS_LIBOBS else SOURCE_ID
 
 
 def send_raw_text(sock: socket.socket, raw: str) -> None:
@@ -92,11 +93,11 @@ class ProductionControlVerbTest(unittest.TestCase):
         env = {"STREAMMATE_HOME": str(home)} if home is not None else None
         host_args: list[str] = []
         if WINDOWS_LIBOBS:
-            # This Windows package intentionally has no obs-browser/CEF. Use
-            # the real in-tree source+filter modules so every production verb
-            # still runs against actual libobs objects (never placeholders).
+            # Windows still uses the in-tree source+filter fixtures for the
+            # filter-specific assertions because this lane does not stage
+            # obs-filters. The production source remains packaged obs-browser.
             fixture = tempfile.TemporaryDirectory()
-            self.addCleanup(fixture.cleanup)
+            self.addCleanup(host.cleanup_tempdir_with_retry, fixture)
             root = Path(fixture.name) / "plugins"
             root.mkdir()
             for env_key, name in (
@@ -126,28 +127,33 @@ class ProductionControlVerbTest(unittest.TestCase):
     def _synthetic_scene(self, sock: socket.socket) -> None:
         loaded = host.rpc(sock, 400, "scene.load", {"sceneId": SCENE_ID, "width": 64, "height": 36})["result"]
         self.assertEqual(loaded["sceneId"], SCENE_ID)
-        if WINDOWS_LIBOBS:
-            source_params = {
-                "sceneId": SCENE_ID,
-                "sourceId": SOURCE_ID,
-                "kind": "streammate_test_source",
-                "settings": {"color": 0xFF2080FF},
-                "pluginFilterKind": "streammate_test_filter",
-                "filterId": FILTER_ID,
-                "width": 64,
-                "height": 36,
-            }
-        else:
-            source_params = {
-                "sceneId": SCENE_ID,
-                "sourceId": SOURCE_ID,
-                "kind": "browser",
-                "url": "https://station.localhost/overlay/control-surface",
-                "width": 64,
-                "height": 36,
-            }
+        source_params = {
+            "sceneId": SCENE_ID,
+            "sourceId": SOURCE_ID,
+            "kind": "browser",
+            "url": "https://station.localhost/overlay/control-surface",
+            "width": 64,
+            "height": 36,
+        }
         created = host.rpc(sock, 401, "source.create", source_params)["result"]
         self.assertEqual(created["sourceId"], SOURCE_ID)
+        if WINDOWS_LIBOBS:
+            filter_fixture = host.rpc(
+                sock,
+                402,
+                "source.create",
+                {
+                    "sceneId": SCENE_ID,
+                    "sourceId": FILTER_SOURCE_ID,
+                    "kind": "streammate_test_source",
+                    "settings": {"color": 0xFF2080FF},
+                    "pluginFilterKind": "streammate_test_filter",
+                    "filterId": FILTER_ID,
+                    "width": 64,
+                    "height": 36,
+                },
+            )["result"]
+            self.assertEqual(filter_fixture["sourceId"], FILTER_SOURCE_ID)
 
     def _assert_rpc_error(self, sock: socket.socket, rpc_id: int, method: str, params: dict, code: int = -32602) -> dict:
         response = host.rpc(sock, rpc_id, method, params)
@@ -187,27 +193,27 @@ class ProductionControlVerbTest(unittest.TestCase):
         )["result"]
         self.assertEqual(ordered, {"ok": True, "sceneId": SCENE_ID, "itemId": SOURCE_ID, "position": 0})
 
-        listed = host.rpc(sock, 412, "filter.list", {"sourceId": SOURCE_ID})["result"]
+        listed = host.rpc(sock, 412, "filter.list", {"sourceId": FILTER_SOURCE_ID})["result"]
         expected_filter = (
             {"filterId": FILTER_ID, "filterKind": "streammate_test_filter", "label": FILTER_ID, "enabled": True}
             if WINDOWS_LIBOBS
             else {"filterId": FILTER_ID, "filterKind": "color_filter_v2", "label": "Color Correction", "enabled": True}
         )
-        self.assertEqual(listed, {"sourceId": SOURCE_ID, "filters": [expected_filter]})
+        self.assertEqual(listed, {"sourceId": FILTER_SOURCE_ID, "filters": [expected_filter]})
 
-        disabled = host.rpc(sock, 413, "filter.setEnabled", {"sourceId": SOURCE_ID, "filterId": FILTER_ID, "enabled": False})[
+        disabled = host.rpc(sock, 413, "filter.setEnabled", {"sourceId": FILTER_SOURCE_ID, "filterId": FILTER_ID, "enabled": False})[
             "result"
         ]
-        self.assertEqual(disabled, {"ok": True, "sourceId": SOURCE_ID, "filterId": FILTER_ID, "enabled": False})
+        self.assertEqual(disabled, {"ok": True, "sourceId": FILTER_SOURCE_ID, "filterId": FILTER_ID, "enabled": False})
 
         settings = {"brightness": 0.125, "relative": False, "key_color_type": "green"}
         applied = host.rpc(
             sock,
             414,
             "filter.setSettings",
-            {"sourceId": SOURCE_ID, "filterId": FILTER_ID, "settings": settings, "idempotencyToken": "filter-1"},
+            {"sourceId": FILTER_SOURCE_ID, "filterId": FILTER_ID, "settings": settings, "idempotencyToken": "filter-1"},
         )["result"]
-        self.assertEqual(applied, {"ok": True, "sourceId": SOURCE_ID, "filterId": FILTER_ID, "settings": settings})
+        self.assertEqual(applied, {"ok": True, "sourceId": FILTER_SOURCE_ID, "filterId": FILTER_ID, "settings": settings})
 
         volume = host.rpc(sock, 415, "audio.setVolume", {"sourceId": SOURCE_ID, "volumeDb": -12.5})["result"]
         self.assertEqual(volume, {"ok": True, "sourceId": SOURCE_ID, "volumeDb": -12.5})
@@ -262,7 +268,8 @@ class ProductionControlVerbTest(unittest.TestCase):
             sock,
             430,
             "filter.setSettings",
-            {"sourceId": SOURCE_ID, "filterId": FILTER_ID, "settings": {"contrast": 0.1, "plugin_binary_path": "/tmp/x"}},
+            {"sourceId": FILTER_SOURCE_ID, "filterId": FILTER_ID,
+             "settings": {"contrast": 0.1, "plugin_binary_path": "/tmp/x"}},
         )
         self.assertEqual(refused["error"]["code"], -32602)
         self.assertIn("unknown filter-settings key", refused["error"]["message"])
@@ -275,7 +282,7 @@ class ProductionControlVerbTest(unittest.TestCase):
             sock,
             431,
             "filter.setSettings",
-            {"sourceId": SOURCE_ID, "filterId": FILTER_ID, "settings": {"brightness": 1000000.1}},
+            {"sourceId": FILTER_SOURCE_ID, "filterId": FILTER_ID, "settings": {"brightness": 1000000.1}},
         )
 
     def test_filter_settings_refuse_url_path_and_secret_shaped_strings(self) -> None:
@@ -296,7 +303,7 @@ class ProductionControlVerbTest(unittest.TestCase):
                     sock,
                     offset,
                     "filter.setSettings",
-                    {"sourceId": SOURCE_ID, "filterId": FILTER_ID, "settings": {"key_color_type": value}},
+                    {"sourceId": FILTER_SOURCE_ID, "filterId": FILTER_ID, "settings": {"key_color_type": value}},
                 )
 
     def test_malformed_new_verb_requests_fail_closed_and_keep_host_alive(self) -> None:
@@ -307,7 +314,7 @@ class ProductionControlVerbTest(unittest.TestCase):
             ("sceneItem.setVisible", {"sceneId": "missing-scene", "itemId": SOURCE_ID, "visible": True}),
             ("sceneItem.setVisible", {"sceneId": SCENE_ID, "itemId": "missing-item", "visible": True}),
             ("filter.list", {"sourceId": "missing-source"}),
-            ("filter.setEnabled", {"sourceId": SOURCE_ID, "filterId": "missing-filter", "enabled": True}),
+            ("filter.setEnabled", {"sourceId": FILTER_SOURCE_ID, "filterId": "missing-filter", "enabled": True}),
             ("sceneItem.setVisible", {"sceneId": SCENE_ID, "itemId": SOURCE_ID, "visible": "false"}),
             (
                 "sceneItem.setOrder",
@@ -333,27 +340,27 @@ class ProductionControlVerbTest(unittest.TestCase):
         raw_cases = [
             (
                 580,
-                f'{{"jsonrpc":"2.0","id":580,"method":"filter.setSettings","params":{{"sourceId":"{SOURCE_ID}",'
+                f'{{"jsonrpc":"2.0","id":580,"method":"filter.setSettings","params":{{"sourceId":"{FILTER_SOURCE_ID}",'
                 f'"filterId":"{FILTER_ID}","settings":{{"key_color_type":"green}}}}}}',
             ),
             (
                 581,
-                f'{{"jsonrpc":"2.0","id":581,"method":"filter.setSettings","params":{{"sourceId":"{SOURCE_ID}",'
+                f'{{"jsonrpc":"2.0","id":581,"method":"filter.setSettings","params":{{"sourceId":"{FILTER_SOURCE_ID}",'
                 f'"filterId":"{FILTER_ID}","settings":{{"brightness" 0.25}}}}}}',
             ),
             (
                 582,
-                f'{{"jsonrpc":"2.0","id":582,"method":"filter.setSettings","params":{{"sourceId":"{SOURCE_ID}",'
+                f'{{"jsonrpc":"2.0","id":582,"method":"filter.setSettings","params":{{"sourceId":"{FILTER_SOURCE_ID}",'
                 f'"filterId":"{FILTER_ID}","settings":{{"key_color_type":"green\\q"}}}}}}',
             ),
             (
                 583,
-                f'{{"jsonrpc":"2.0","id":583,"method":"filter.setSettings","params":{{"sourceId":"{SOURCE_ID}",'
+                f'{{"jsonrpc":"2.0","id":583,"method":"filter.setSettings","params":{{"sourceId":"{FILTER_SOURCE_ID}",'
                 f'"filterId":"{FILTER_ID}","settings":{{,"brightness":1}}}}}}',
             ),
             (
                 584,
-                f'{{"jsonrpc":"2.0","id":584,"method":"filter.setSettings","params":{{"sourceId":"{SOURCE_ID}",'
+                f'{{"jsonrpc":"2.0","id":584,"method":"filter.setSettings","params":{{"sourceId":"{FILTER_SOURCE_ID}",'
                 f'"filterId":"{FILTER_ID}","settings":{{"brightness":1,,"contrast":2}}}}}}',
             ),
         ]
@@ -371,7 +378,7 @@ class ProductionControlVerbTest(unittest.TestCase):
         self._synthetic_scene(sock)
 
         host.rpc(sock, 440, "sceneItem.setVisible", {"sceneId": SCENE_ID, "itemId": SOURCE_ID, "visible": True})
-        host.rpc(sock, 441, "filter.setEnabled", {"sourceId": SOURCE_ID, "filterId": FILTER_ID, "enabled": True})
+        host.rpc(sock, 441, "filter.setEnabled", {"sourceId": FILTER_SOURCE_ID, "filterId": FILTER_ID, "enabled": True})
         host.rpc(sock, 442, "media.control", {"sourceId": SOURCE_ID, "action": "restart"})
 
         deadline = time.time() + 2
@@ -398,12 +405,13 @@ class ProductionControlVerbTest(unittest.TestCase):
                 "sceneItem.setOrder",
                 {"sceneId": SCENE_ID, "itemId": SOURCE_ID, "position": 0, "idempotencyToken": "disk-1"},
             )
-            host.rpc(sock, 452, "filter.setEnabled", {"sourceId": SOURCE_ID, "filterId": FILTER_ID, "enabled": False})
+            host.rpc(sock, 452, "filter.setEnabled", {"sourceId": FILTER_SOURCE_ID, "filterId": FILTER_ID, "enabled": False})
             refused_secret = host.rpc(
                 sock,
                 453,
                 "filter.setSettings",
-                {"sourceId": SOURCE_ID, "filterId": FILTER_ID, "settings": {"key_color_type": SECRET_SHAPED}},
+                {"sourceId": FILTER_SOURCE_ID, "filterId": FILTER_ID,
+                 "settings": {"key_color_type": SECRET_SHAPED}},
             )
             self.assertEqual(refused_secret["error"]["code"], -32602)
             host.rpc(sock, 454, "audio.setVolume", {"sourceId": SOURCE_ID, "volumeDb": -6})

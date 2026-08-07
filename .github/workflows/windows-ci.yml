@@ -62,7 +62,7 @@ jobs:
     # 32-bit capture hooks) — while our pinned CMake 3.28.4 has no VS 18
     # generator. VS 2022 on windows-2022 is the toolchain OBS 32.1.2 supports.
     runs-on: windows-2022
-    timeout-minutes: 100
+    timeout-minutes: 150
 
     steps:
       - name: Checkout
@@ -110,7 +110,14 @@ jobs:
       # vswhere via the ProgramFiles(x86) environment variable, which MSYS
       # bash does not export — under bash the configure dies with "could not
       # find any instance of Visual Studio".
-      - name: Configure upstream OBS without Qt frontend or CEF
+      # ENABLE_BROWSER_PANELS stays ON here (unlike the macOS lane): Windows
+      # obs-browser hard-includes Qt headers in sources that compile in every
+      # configuration, and os-windows.cmake links no Qt of its own — the Qt
+      # find/link only arrives via the panels feature, making panels-ON the
+      # sole upstream-supported Windows browser configuration. (os-macos.cmake
+      # finds and links Qt6 itself, which is why macOS builds panels-OFF.)
+      # The host never constructs a Qt application, so the panel code is inert.
+      - name: Configure upstream OBS with obs-browser and CEF, without Qt frontend
         shell: pwsh
         run: |
           cmake -S external/obs-studio -B build/obs -G "Visual Studio 17 2022" -A x64 `
@@ -122,7 +129,8 @@ jobs:
             -DENABLE_VST=OFF `
             -DENABLE_AJA=OFF `
             -DENABLE_DECKLINK=OFF `
-            -DENABLE_BROWSER=OFF
+            -DENABLE_BROWSER=ON `
+            -DENABLE_BROWSER_PANELS=ON
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Build libobs and required upstream modules
@@ -146,7 +154,12 @@ jobs:
           cmake --build build/obs --config RelWithDebInfo --target win-wasapi
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cmake --build build/obs --config RelWithDebInfo --target obs-ffmpeg
-          exit 0
+          cmake --build build/obs --config RelWithDebInfo --target obs-frontend-api
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build build/obs --config RelWithDebInfo --target obs-browser
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build build/obs --config RelWithDebInfo --target obs-browser-helper
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Locate built libobs and stage required modules
         id: libobs
@@ -190,6 +203,34 @@ jobs:
             cp -R "$module_data" "$module_stage/data/$module"
           done
 
+          # CEF payload locations (#536). Upstream stages the module, helper,
+          # and module data in its rundir; the versioned CEF root itself is
+          # discovered from the pinned submodule rather than duplicated here.
+          browser_plugin="$(find "$plugin_bin_dir" -maxdepth 1 -type f -iname 'obs-browser.dll' -print -quit)"
+          test -n "$browser_plugin"
+          test -f "$browser_plugin"
+          browser_page="$(find "$plugin_bin_dir" -maxdepth 1 -type f -iname 'obs-browser-page.exe' -print -quit)"
+          test -n "$browser_page"
+          test -f "$browser_page"
+          frontend_api="$(find build/obs -type f -iname 'obs-frontend-api.dll' -print -quit)"
+          test -n "$frontend_api"
+          test -f "$frontend_api"
+          cef_root="$(find external/obs-studio/.deps -maxdepth 1 -type d -name 'cef_binary_*_windows_x64' -print -quit)"
+          test -n "$cef_root"
+          cef_release_dir="$cef_root/Release"
+          cef_resources_dir="$cef_root/Resources"
+          test -d "$cef_release_dir"
+          test -d "$cef_resources_dir"
+          browser_data_dir="$plugin_data_dir/obs-browser"
+          test -d "$browser_data_dir"
+          # obs-browser links Qt6::Widgets on Windows (panels configuration);
+          # its runtime DLLs ship in the pinned obs-deps qt6 package.
+          qt_bin_dir="$(find external/obs-studio/.deps -maxdepth 2 -type d -path '*obs-deps-qt6-*' -name bin -print -quit)"
+          test -n "$qt_bin_dir"
+          for qt_dll in Qt6Core.dll Qt6Gui.dll Qt6Widgets.dll; do
+            test -f "$qt_bin_dir/$qt_dll"
+          done
+
           # obs.dll depends on w32-pthreads.dll, which the VS build leaves in a
           # SIBLING directory (deps/w32-pthreads/RelWithDebInfo) — loading
           # obs.dll without it fails (bash surfaces the DLL-load failure as
@@ -227,6 +268,13 @@ jobs:
           echo "deps_bin=$PWD/$deps_root/bin" >> "$GITHUB_OUTPUT"
           echo "modules_dir=$module_stage" >> "$GITHUB_OUTPUT"
           echo "libobs_data_dir=$PWD/$libobs_data_dir" >> "$GITHUB_OUTPUT"
+          echo "browser_plugin=$PWD/$browser_plugin" >> "$GITHUB_OUTPUT"
+          echo "browser_page=$PWD/$browser_page" >> "$GITHUB_OUTPUT"
+          echo "frontend_api=$PWD/$frontend_api" >> "$GITHUB_OUTPUT"
+          echo "cef_release_dir=$PWD/$cef_release_dir" >> "$GITHUB_OUTPUT"
+          echo "cef_resources_dir=$PWD/$cef_resources_dir" >> "$GITHUB_OUTPUT"
+          echo "browser_data_dir=$PWD/$browser_data_dir" >> "$GITHUB_OUTPUT"
+          echo "qt_bin_dir=$PWD/$qt_bin_dir" >> "$GITHUB_OUTPUT"
 
       - name: Configure obs_startup smoke against built libobs
         shell: bash
@@ -265,6 +313,13 @@ jobs:
             --obs-modules-dir "${{ steps.libobs.outputs.modules_dir }}" \
             --streammate-plugin build/host/streammate-native-overlay.dll \
             --libobs-data-dir "${{ steps.libobs.outputs.libobs_data_dir }}" \
+            --obs-browser-plugin "${{ steps.libobs.outputs.browser_plugin }}" \
+            --obs-browser-page "${{ steps.libobs.outputs.browser_page }}" \
+            --cef-release-dir "${{ steps.libobs.outputs.cef_release_dir }}" \
+            --cef-resources-dir "${{ steps.libobs.outputs.cef_resources_dir }}" \
+            --obs-frontend-api "${{ steps.libobs.outputs.frontend_api }}" \
+            --obs-browser-data-dir "${{ steps.libobs.outputs.browser_data_dir }}" \
+            --qt-bin-dir "${{ steps.libobs.outputs.qt_bin_dir }}" \
             --output-dir dist
 
       - name: Verify packaged smoke and checksum manifest without PATH augmentation
@@ -306,6 +361,13 @@ jobs:
           python tests/integration/test_plugin_crash_containment.py \
             dist/StreamMateStudioHost/studio-host.exe
 
+      - name: Run CEF composition end-to-end against packaged dist
+        shell: bash
+        run: |
+          STREAMMATE_EXPECT_LIBOBS=1 STREAMMATE_EXPECT_CEF=1 \
+          python tests/integration/test_cef_composition.py \
+            dist/StreamMateStudioHost/studio-host.exe
+
       - name: Verify Windows repack determinism
         shell: bash
         run: |
@@ -318,6 +380,13 @@ jobs:
             --obs-modules-dir "${{ steps.libobs.outputs.modules_dir }}" \
             --streammate-plugin build/host/streammate-native-overlay.dll \
             --libobs-data-dir "${{ steps.libobs.outputs.libobs_data_dir }}" \
+            --obs-browser-plugin "${{ steps.libobs.outputs.browser_plugin }}" \
+            --obs-browser-page "${{ steps.libobs.outputs.browser_page }}" \
+            --cef-release-dir "${{ steps.libobs.outputs.cef_release_dir }}" \
+            --cef-resources-dir "${{ steps.libobs.outputs.cef_resources_dir }}" \
+            --obs-frontend-api "${{ steps.libobs.outputs.frontend_api }}" \
+            --obs-browser-data-dir "${{ steps.libobs.outputs.browser_data_dir }}" \
+            --qt-bin-dir "${{ steps.libobs.outputs.qt_bin_dir }}" \
             --output-dir dist-repack
           diff dist/sha256-manifest.txt dist-repack/sha256-manifest.txt
           cmp dist/StreamMateStudioHost-windows-x64.tar.gz \

@@ -10,8 +10,8 @@ CEF end-to-end class (STREAMMATE_EXPECT_CEF=1, CI packaged-app lane): a real
 local page renders through obs-browser onto program video (frame-digest
 departure from a stable baseline), the packaged CEF helpers spawn, the page's
 WebAudio tone reaches the program mix through `reroute_audio`
-(program.captureAudio nonSilent against a silent baseline), and a bundle copy
-without obs-browser.plugin refuses browser sources with no placeholder.
+(program.captureAudio nonSilent against a silent baseline), and a packaged
+copy without the obs-browser module refuses browser sources with no placeholder.
 """
 from __future__ import annotations
 
@@ -27,7 +27,10 @@ from pathlib import Path
 import test_host_lifecycle as host
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
-WORKFLOW = REPO_ROOT / ".github" / "workflows" / "macos-ci.yml"
+WORKFLOWS = (
+    REPO_ROOT / ".github" / "workflows" / "macos-ci.yml",
+    REPO_ROOT / ".github" / "workflows" / "windows-ci.yml",
+)
 
 EXPECT_LIBOBS = os.environ.get("STREAMMATE_EXPECT_LIBOBS", "") == "1"
 EXPECT_CEF = os.environ.get("STREAMMATE_EXPECT_CEF", "") == "1"
@@ -123,9 +126,11 @@ class CefCompositionScaffoldParityTest(unittest.TestCase):
         self.assertIn("refuses honestly", response["error"]["message"])
 
     def test_ci_workflow_keeps_the_cef_lane_wired(self) -> None:
-        workflow = WORKFLOW.read_text(encoding="utf-8")
-        self.assertIn("STREAMMATE_EXPECT_CEF=1", workflow)
-        self.assertIn("test_cef_composition.py", workflow)
+        for workflow_path in WORKFLOWS:
+            with self.subTest(workflow=workflow_path.name):
+                workflow = workflow_path.read_text(encoding="utf-8")
+                self.assertIn("STREAMMATE_EXPECT_CEF=1", workflow)
+                self.assertIn("test_cef_composition.py", workflow)
 
 
 @unittest.skipUnless(EXPECT_CEF, "CEF lane only (STREAMMATE_EXPECT_CEF=1)")
@@ -134,7 +139,12 @@ class CefCompositionLibobsTest(unittest.TestCase):
 
     def setUp(self) -> None:
         tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
+        # CEF subprocess/DLL handles can take a beat to clear on Windows; this
+        # bounded cleanup retries and still fails loudly if a process leaked.
+        if sys.platform == "win32":
+            self.addCleanup(host.cleanup_tempdir_with_retry, tmp)
+        else:
+            self.addCleanup(tmp.cleanup)
         self.tmp = Path(tmp.name)
         page = self.tmp / "composition.html"
         page.write_text(COMPOSITION_PAGE, encoding="utf-8")
@@ -152,10 +162,37 @@ class CefCompositionLibobsTest(unittest.TestCase):
                 encoding="utf-8",
             )
             port, _ = host.wait_ready(process)
-        self.addCleanup(host.stop_process, process)
+        if sys.platform == "win32":
+            self.addCleanup(self._stop_process_and_wait_for_helpers, process)
+        else:
+            self.addCleanup(host.stop_process, process)
         sock = host.websocket_connect(port)
         self.addCleanup(sock.close)
         return process, sock
+
+    @staticmethod
+    def _windows_browser_page_processes() -> str:
+        result = subprocess.run(
+            ["tasklist", "/FI", "IMAGENAME eq obs-browser-page.exe"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=False,
+        )
+        return result.stdout
+
+    def _stop_process_and_wait_for_helpers(self, process: subprocess.Popen[str]) -> None:
+        host.stop_process(process)
+        if sys.platform != "win32":
+            return
+        deadline = time.time() + 10
+        last_output = ""
+        while time.time() < deadline:
+            last_output = self._windows_browser_page_processes()
+            if "obs-browser-page.exe" not in last_output.lower():
+                return
+            time.sleep(0.5)
+        self.fail(f"obs-browser-page.exe leaked after host shutdown: {last_output}")
 
     def _program_scene(self, sock) -> None:
         loaded = host.rpc(sock, 600, "scene.load",
@@ -203,11 +240,18 @@ class CefCompositionLibobsTest(unittest.TestCase):
             time.sleep(1)
         self.assertIsNotNone(departed, "program video digest never departed the baseline (no CEF pixels)")
 
-        helpers = subprocess.run(
-            ["pgrep", "-f", "studio-host Helper"],
-            text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False,
-        )
-        self.assertTrue(helpers.stdout.strip(), "no packaged CEF helper processes spawned")
+        if sys.platform == "win32":
+            helpers = self._windows_browser_page_processes()
+            self.assertIn(
+                "obs-browser-page.exe", helpers.lower(),
+                "no packaged obs-browser-page.exe process spawned",
+            )
+        else:
+            helpers = subprocess.run(
+                ["pgrep", "-f", "studio-host Helper"],
+                text=True, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, check=False,
+            )
+            self.assertTrue(helpers.stdout.strip(), "no packaged CEF helper processes spawned")
 
         audible: dict | None = None
         deadline = time.time() + 45
@@ -256,15 +300,28 @@ class CefCompositionLibobsTest(unittest.TestCase):
         self.assertIs(audio["nonSilent"], False, f"program mix carried audio without reroute_audio: {audio}")
 
     def test_browser_source_refuses_without_obs_browser_plugin(self) -> None:
-        bundle = host.HOST_BIN.parents[2]
-        self.assertEqual(bundle.suffix, ".app", f"CEF lane expects a packaged .app bundle, got {host.HOST_BIN}")
-        stripped = self.tmp / bundle.name
-        shutil.copytree(bundle, stripped, symlinks=True)
-        browser_plugin = stripped / "Contents" / "PlugIns" / "obs-plugins" / "obs-browser.plugin"
-        self.assertTrue(browser_plugin.exists(), "packaged bundle is missing obs-browser.plugin")
-        shutil.rmtree(browser_plugin)
+        if sys.platform == "win32":
+            package_root = host.HOST_BIN.parent
+            stripped = self.tmp / package_root.name
+            shutil.copytree(package_root, stripped, symlinks=True)
+            browser_plugin = stripped / "obs-plugins" / "64bit" / "obs-browser.dll"
+            self.assertTrue(browser_plugin.is_file(), "packaged dist is missing obs-browser.dll")
+            browser_plugin.unlink()
+            stripped_host = stripped / host.HOST_BIN.name
+        else:
+            package_root = host.HOST_BIN.parents[2]
+            self.assertEqual(
+                package_root.suffix, ".app",
+                f"CEF lane expects a packaged .app bundle, got {host.HOST_BIN}",
+            )
+            stripped = self.tmp / package_root.name
+            shutil.copytree(package_root, stripped, symlinks=True)
+            browser_plugin = stripped / "Contents" / "PlugIns" / "obs-plugins" / "obs-browser.plugin"
+            self.assertTrue(browser_plugin.exists(), "packaged bundle is missing obs-browser.plugin")
+            shutil.rmtree(browser_plugin)
+            stripped_host = stripped / "Contents" / "MacOS" / host.HOST_BIN.name
 
-        _, sock = self._connect(stripped / "Contents" / "MacOS" / host.HOST_BIN.name)
+        _, sock = self._connect(stripped_host)
         self._program_scene(sock)
         response = host.rpc(
             sock,
