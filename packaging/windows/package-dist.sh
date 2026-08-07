@@ -206,6 +206,24 @@ for module in "${required_modules[@]}"; do
   require_dir "required OBS module data $module" "$plugin_data/$module"
 done
 
+# No debug-CRT binaries in a shipped dist: a debug-CRT PE launches on dev and
+# CI machines (Visual Studio ships the debug runtime) but dies with
+# STATUS_DLL_NOT_FOUND on user hardware — the first owner-hardware launch of
+# studio-host.exe caught exactly this (streammate#536). Import names are plain
+# ASCII in the PE import table, so a string scan is a faithful detector. Scope:
+# the binaries THIS repo builds; the obs/CEF/Qt payloads are release binaries
+# from the pinned upstream build and scanning huge third-party blobs invites
+# string false positives.
+for built_binary in "$stage/studio-host.exe" "$stage/studio-host-smoke.exe" \
+  "$plugins/streammate-native-overlay.dll"; do
+  for debug_crt in ucrtbased.dll vcruntime140d.dll msvcp140d.dll; do
+    if grep -aiq "$debug_crt" "$built_binary"; then
+      echo "staged binary imports the debug CRT ($debug_crt): $built_binary" >&2
+      exit 1
+    fi
+  done
+done
+
 # Normalize archive-visible metadata. Modes are fixed explicitly; mtimes use
 # the ZIP epoch because it is representable on Windows and every Unix runner.
 find "$stage" -type d -exec chmod 755 {} +

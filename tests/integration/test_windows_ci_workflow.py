@@ -95,6 +95,9 @@ class WindowsCiWorkflowTest(unittest.TestCase):
         self.assertIn("streammate-plugin-stage", workflow)
         self.assertIn("obs-deps-*-x64", workflow)
         self.assertIn("-DSTREAMMATE_REQUIRE_LIBOBS=ON", workflow)
+        # Explicit build type: an unset CMAKE_BUILD_TYPE let Ninja+MSVC emit a
+        # debug-CRT host that only launches where Visual Studio is installed.
+        self.assertIn("-DCMAKE_BUILD_TYPE=RelWithDebInfo", workflow)
         self.assertIn("steps.libobs.outputs.obs_dll_dir", workflow)
         self.assertIn("steps.libobs.outputs.deps_bin", workflow)
         self.assertIn("-iname 'obs-browser.dll'", workflow)

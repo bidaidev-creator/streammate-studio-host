@@ -295,6 +295,26 @@ class WindowsPackagingTest(unittest.TestCase):
             self.assertFalse((stage / "obs-frontend-api.dll").exists())
             self.assertFalse((stage / "obs-plugins" / "64bit" / "obs-browser.dll").exists())
 
+    def test_debug_crt_binaries_are_refused(self) -> None:
+        # A debug-CRT PE launches on dev/CI machines (Visual Studio ships the
+        # debug runtime) but dies with STATUS_DLL_NOT_FOUND on user hardware;
+        # the first owner-hardware studio-host.exe launch caught exactly this.
+        for input_key, marker in (
+            ("host", "ucrtbased.dll"),
+            ("smoke", "VCRUNTIME140D.dll"),
+            ("streammate", "MSVCP140D.dll"),
+        ):
+            with self.subTest(binary=input_key), tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                inputs = self.build_input_tree(root)
+                self.write_fixture(
+                    inputs[input_key],
+                    f"pe fixture importing {marker} for {inputs[input_key].name}\n",
+                )
+                result = self.package(inputs, root / "debug-crt")
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("debug crt", result.stdout.lower())
+
     def test_script_pins_all_arguments_and_deterministic_tools(self) -> None:
         script = PACKAGE_SCRIPT.read_text(encoding="utf-8")
         for argument in (
