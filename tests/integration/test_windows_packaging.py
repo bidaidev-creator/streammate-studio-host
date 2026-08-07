@@ -317,19 +317,19 @@ class WindowsPackagingTest(unittest.TestCase):
 
     def test_debug_crt_scan_failure_is_not_mistaken_for_clean(self) -> None:
         # A broken scanner (grep exiting 2/127) must fail packaging, not pass
-        # it — otherwise the gate silently disarms. The shim makes every grep
-        # invocation fail; the tar-flavor probe degrades to the BSD branch,
-        # which still packages, so the first hard stop is the CRT scan itself.
+        # it — otherwise the gate silently disarms. The shim is a BASH_ENV
+        # function, not a PATH entry: Git-Bash's bin/bash.exe wrapper prepends
+        # /usr/bin ahead of any inherited PATH, so a PATH shim never wins on
+        # Windows, while a function outranks PATH lookup everywhere. The
+        # tar-flavor probe degrades to the BSD branch, which still packages,
+        # so the first hard stop is the CRT scan itself.
         with tempfile.TemporaryDirectory() as temp_dir:
             root = Path(temp_dir)
             inputs = self.build_input_tree(root)
-            shim_dir = root / "shim"
-            shim_dir.mkdir()
-            shim = shim_dir / "grep"
-            shim.write_text("#!/bin/sh\nexit 2\n", encoding="utf-8")
-            shim.chmod(0o755)
+            bash_env = root / "broken-grep-env.sh"
+            bash_env.write_text("grep() { return 2; }\n", encoding="utf-8")
             env = dict(os.environ)
-            env["PATH"] = f"{shim_dir}{os.pathsep}{env['PATH']}"
+            env["BASH_ENV"] = bash_env.as_posix()
             result = subprocess.run(
                 [bash_command(), PACKAGE_SCRIPT.as_posix(),
                  "--host-bin", inputs["host"].as_posix(),
