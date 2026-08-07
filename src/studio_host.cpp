@@ -1369,7 +1369,9 @@ private:
     }
 #endif
     module_config_root_ = root;
-    return root.generic_string();
+    // libobs consumes this as UTF-8; generic_string() would narrow through
+    // the locale code page and mis-encode non-ASCII temp paths on Windows.
+    return path_to_utf8(root);
   }
 
   std::filesystem::path module_config_root_;
