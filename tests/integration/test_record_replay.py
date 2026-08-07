@@ -28,6 +28,21 @@ WORKFLOW = Path(__file__).resolve().parents[2] / ".github" / "workflows" / "maco
 
 def host_tcp_peers(pid: int) -> list[str]:
     """Every remote TCP endpoint the host process currently holds open."""
+    if sys.platform == "win32":
+        result = subprocess.run(
+            ["netstat", "-ano", "-p", "tcp"],
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            check=False,
+        )
+        peers: list[str] = []
+        for line in result.stdout.splitlines():
+            parts = line.split()
+            if (len(parts) >= 5 and parts[0].upper() == "TCP" and
+                    parts[-1] == str(pid) and parts[-2].upper() == "ESTABLISHED"):
+                peers.append(parts[2])
+        return peers
     # `-a` ANDs the -p and -iTCP selectors; without it lsof ORs them and returns
     # every TCP connection on the host, not just this process's.
     result = subprocess.run(
@@ -105,7 +120,7 @@ class RecordReplayScaffoldTest(unittest.TestCase):
             # No absolute host path leaks in any response.
             for response in (started, stopped, recording, after):
                 serialized = json.dumps(response)
-                self.assertNotIn(str(home), serialized)
+                host.assert_no_path_disclosure(self, home, serialized)
                 self.assertNotIn("/Users/", serialized)
 
     def test_record_started_and_stopped_events_are_journaled(self) -> None:
@@ -177,20 +192,26 @@ class RecordReplayScaffoldTest(unittest.TestCase):
             home = Path(temp_dir) / "streammate-home"
             _, sock = self._connect(home)
 
-            for bad in ["/etc/passwd.mkv", "../escape.mkv", "sub/../../escape.mkv", "rtmp://live.example.invalid/app", "https://x/y.mkv"]:
+            absolute = r"C:\Windows\Temp\streammate-evil.mkv" if sys.platform == "win32" else "/etc/passwd.mkv"
+            for bad in [absolute, "../escape.mkv", "sub/../../escape.mkv",
+                        "rtmp://live.example.invalid/app", "https://x/y.mkv"]:
                 rejected = host.rpc(sock, 330, "record.start", {"recordId": "confine", "destination": bad})
                 self.assertEqual(rejected["error"]["code"], -32602, bad)
                 self.assertIn("relative path under the state directory", rejected["error"]["message"], bad)
-                self.assertNotIn(str(home), json.dumps(rejected))
+                host.assert_no_path_disclosure(self, home, json.dumps(rejected))
 
-            replay_rejected = host.rpc(sock, 331, "replay.start", {"replayId": "confine", "destination": "/tmp/evil.mkv"})
+            replay_absolute = r"C:\Windows\Temp\streammate-replay-evil.mkv" if sys.platform == "win32" else "/tmp/evil.mkv"
+            replay_rejected = host.rpc(
+                sock, 331, "replay.start",
+                {"replayId": "confine", "destination": replay_absolute},
+            )
             self.assertEqual(replay_rejected["error"]["code"], -32602)
             self.assertIn("relative path under the state directory", replay_rejected["error"]["message"])
 
             # None of the refused destinations created any file anywhere.
             self.assertFalse((home / "studio" / "recordings").exists() and any((home / "studio" / "recordings").iterdir()))
-            self.assertFalse(Path("/etc/passwd.mkv").exists())
-            self.assertFalse(Path("/tmp/evil.mkv").exists())
+            self.assertFalse(Path(absolute).exists())
+            self.assertFalse(Path(replay_absolute).exists())
 
     def test_request_cannot_override_env_streammate_home(self) -> None:
         # A caller-supplied streammateHome must not redirect the write: home comes
@@ -218,7 +239,10 @@ class RecordReplayScaffoldTest(unittest.TestCase):
             outside = Path(temp_dir) / "outside"
             (home).mkdir(parents=True)
             outside.mkdir(parents=True)
-            os.symlink(outside, home / "studio")  # studio -> outside (escape)
+            try:
+                os.symlink(outside, home / "studio")  # studio -> outside (escape)
+            except OSError as exc:
+                self.skipTest(f"symlink creation unavailable for confinement proof: {exc}")
             _, sock = self._connect(home)
 
             refused = host.rpc(sock, 370, "record.start", {"recordId": "esc"})
@@ -239,7 +263,10 @@ class RecordReplayScaffoldTest(unittest.TestCase):
             host.rpc(sock, 380, "replay.start", {"replayId": "clip"})
             # Plant a replays -> outside symlink AFTER start; save must still refuse.
             (home / "studio").mkdir(parents=True, exist_ok=True)
-            os.symlink(outside, home / "studio" / "replays")
+            try:
+                os.symlink(outside, home / "studio" / "replays")
+            except OSError as exc:
+                self.skipTest(f"symlink creation unavailable for containment proof: {exc}")
 
             refused = host.rpc(sock, 381, "replay.save", {"replayId": "clip"})
             self.assertEqual(refused["error"]["code"], -32602)

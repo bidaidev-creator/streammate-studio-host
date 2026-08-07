@@ -36,12 +36,10 @@ from test_plugin_discovery import (
     build_bundle,
     recv_raw_text,
     rpc_raw,
-    thin_macho64,
     tree_digest,
 )
-from test_user_plugin_loading import HOST_CPU, host_arch_macho
+from test_user_plugin_loading import host_arch_binary
 
-IS_MACOS = sys.platform == "darwin"
 WATCHDOG_EXIT = 65
 SENTINEL_SCHEMA = "plugin-load-sentinel.v1"
 
@@ -71,12 +69,13 @@ class PluginCrashContainmentScaffoldTest(unittest.TestCase):
 
     def setUp(self) -> None:
         tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
+        # Windows: loaded-DLL locks can lag the terminated host (see helper).
+        self.addCleanup(host.cleanup_tempdir_with_retry, tmp)
         self.base = Path(tmp.name)
         self.root = self.base / "root"
         self.root.mkdir()
-        build_bundle(self.root, "alpha", host_arch_macho())
-        build_bundle(self.root, "beta", host_arch_macho())
+        build_bundle(self.root, "alpha", host_arch_binary())
+        build_bundle(self.root, "beta", host_arch_binary())
         self.manifest = self.base / "manifest.json"
         write_manifest(
             self.manifest,
@@ -406,7 +405,7 @@ class PluginCrashContainmentLibobsTest(unittest.TestCase):
     """Real seeded crash/hang containment against the packaged HAS_LIBOBS app.
 
     Env contract (set by the CI step, mirroring the loading e2e):
-      STREAMMATE_TEST_SOURCE_PLUGIN — the built test-source .plugin bundle
+      STREAMMATE_TEST_SOURCE_PLUGIN — built test-source bundle or Windows DLL
       STREAMMATE_TEST_CRASH_PLUGIN  — obs_module_load calls abort()
       STREAMMATE_TEST_HANG_PLUGIN   — obs_module_load never returns
     HOST_BIN is the packaged studio-host executable in this lane.
@@ -417,7 +416,8 @@ class PluginCrashContainmentLibobsTest(unittest.TestCase):
         import shutil
 
         tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
+        # Windows: loaded-DLL locks can lag the terminated host (see helper).
+        self.addCleanup(host.cleanup_tempdir_with_retry, tmp)
         self.base = Path(tmp.name)
         self.root = self.base / "user-plugins"
         self.root.mkdir()
@@ -426,9 +426,13 @@ class PluginCrashContainmentLibobsTest(unittest.TestCase):
             ("STREAMMATE_TEST_CRASH_PLUGIN", "streammate-test-crash"),
             ("STREAMMATE_TEST_HANG_PLUGIN", "streammate-test-hang"),
         ):
-            bundle = os.environ.get(env_key, "")
-            self.assertTrue(bundle and Path(bundle).is_dir(), f"{env_key} must name a bundle dir")
-            shutil.copytree(bundle, self.root / f"{name}.plugin", symlinks=False)
+            plugin = os.environ.get(env_key, "")
+            if sys.platform == "win32":
+                self.assertTrue(plugin and Path(plugin).is_file(), f"{env_key} must name a DLL")
+                shutil.copy2(plugin, self.root / f"{name}.dll")
+            else:
+                self.assertTrue(plugin and Path(plugin).is_dir(), f"{env_key} must name a bundle dir")
+                shutil.copytree(plugin, self.root / f"{name}.plugin", symlinks=False)
         self.manifest = self.base / "manifest.json"
         self.sentinel = self.base / "sentinel.json"
 

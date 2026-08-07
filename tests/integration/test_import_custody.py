@@ -48,7 +48,9 @@ def tree_digest(root: Path) -> str:
     for path in sorted(root.rglob("*")):
         if path.is_symlink() or not path.is_file():
             continue
-        digest.update(str(path.relative_to(root)).encode())
+        # The host digests generic (forward-slash) relative paths; mirror that
+        # wire form so the comparison holds on Windows too.
+        digest.update(path.relative_to(root).as_posix().encode())
         digest.update(path.read_bytes())
     return digest.hexdigest()
 
@@ -134,8 +136,9 @@ class ImportCustodyTest(unittest.TestCase):
             "STREAMMATE_HOME": str(self.home),
         }
         self.process, port, _ = lifecycle.start_host(env=env)
-        self.addCleanup(self.process.kill)
+        self.addCleanup(lifecycle.stop_process, self.process)
         self.sock = lifecycle.websocket_connect(port)
+        self.addCleanup(self.sock.close)
 
     _rpc_id = 6200
 

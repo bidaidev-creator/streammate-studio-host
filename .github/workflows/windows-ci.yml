@@ -1,0 +1,332 @@
+name: windows-ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows-scaffold:
+    name: Windows scaffold
+    runs-on: windows-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install pinned CMake and Ninja
+        shell: pwsh
+        run: |
+          python -m venv "$env:RUNNER_TEMP\cmake-venv"
+          & "$env:RUNNER_TEMP\cmake-venv\Scripts\python.exe" -m pip install 'cmake==3.28.4' ninja
+          "$env:RUNNER_TEMP\cmake-venv\Scripts" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Enable the VS 2022 x64 compiler environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Verify upstream pin and fork guard
+        shell: bash
+        run: bash scripts/fork-guard.sh
+
+      - name: Configure scaffold smoke without libobs
+        run: cmake -S . -B build/scaffold -G Ninja -DSTREAMMATE_REQUIRE_LIBOBS=OFF
+
+      - name: Build scaffold host and smoke
+        run: cmake --build build/scaffold --target studio-host studio-host-smoke native-overlay-renderer-test user-plugin-portability-test
+
+      - name: Run scaffold smoke
+        run: .\build\scaffold\studio-host-smoke.exe
+
+      - name: Run scaffold test ladder
+        run: ctest --test-dir build/scaffold --output-on-failure
+
+      - name: Enforce the upstream pin-set derivation guard against the pinned tree
+        shell: bash
+        run: STREAMMATE_REQUIRE_OBS_TREE=1 python tests/integration/test_upstream_pin_sets.py
+
+  windows-libobs:
+    name: Windows pinned libobs smoke
+    # windows-2022, NOT windows-latest: the windows-latest (2025) image ships
+    # only Visual Studio 18 (2026), and upstream OBS 32.1.2 hard-requires a
+    # Visual Studio generator on Windows (cmake/windows/architecture.cmake
+    # fatals on any other generator and nests a Win32 child configure for the
+    # 32-bit capture hooks) — while our pinned CMake 3.28.4 has no VS 18
+    # generator. VS 2022 on windows-2022 is the toolchain OBS 32.1.2 supports.
+    runs-on: windows-2022
+    timeout-minutes: 100
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install pinned CMake and Ninja
+        shell: pwsh
+        run: |
+          python -m venv "$env:RUNNER_TEMP\cmake-venv"
+          & "$env:RUNNER_TEMP\cmake-venv\Scripts\python.exe" -m pip install 'cmake==3.28.4' ninja
+          "$env:RUNNER_TEMP\cmake-venv\Scripts" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
+      - name: Enable the VS 2022 x64 compiler environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Verify upstream pin and fork guard
+        shell: bash
+        run: bash scripts/fork-guard.sh
+
+      - name: Fetch OBS version tag metadata for upstream CMake
+        shell: bash
+        run: git -C external/obs-studio fetch --tags --force --depth 1 origin tag 32.1.2
+
+      # Diagnostic: the first two runs died with CMake "could not find any
+      # instance of Visual Studio" under both bash and pwsh. Surface exactly
+      # what vswhere and cmake see before the configure attempts anything.
+      - name: Survey Visual Studio installation and cmake resolution
+        shell: pwsh
+        run: |
+          Get-Command cmake | Format-List Source, Version
+          cmake --version
+          $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"
+          Write-Host "vswhere path: $vswhere (exists: $(Test-Path $vswhere))"
+          if (Test-Path $vswhere) {
+            & $vswhere -products '*' -format json -utf8 | Write-Host
+          }
+          Write-Host "VSINSTALLDIR=$env:VSINSTALLDIR"
+          Write-Host "VisualStudioVersion=$env:VisualStudioVersion"
+
+      # pwsh, not bash: CMake's Visual Studio generator locates VS through
+      # vswhere via the ProgramFiles(x86) environment variable, which MSYS
+      # bash does not export — under bash the configure dies with "could not
+      # find any instance of Visual Studio".
+      - name: Configure upstream OBS without Qt frontend or CEF
+        shell: pwsh
+        run: |
+          cmake -S external/obs-studio -B build/obs -G "Visual Studio 17 2022" -A x64 `
+            -DVIRTUALCAM_GUID=A3FCE0F5-3493-419F-958A-ABA1250EC20B `
+            -DENABLE_UI=OFF `
+            -DENABLE_SERVICE_UPDATES=OFF `
+            -DENABLE_SCRIPTING=OFF `
+            -DENABLE_WEBRTC=OFF `
+            -DENABLE_VST=OFF `
+            -DENABLE_AJA=OFF `
+            -DENABLE_DECKLINK=OFF `
+            -DENABLE_BROWSER=OFF
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Build libobs and required upstream modules
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          cmake --build build/obs --config RelWithDebInfo --target libobs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build build/obs --config RelWithDebInfo --target libobs-d3d11
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build build/obs --config RelWithDebInfo --target libobs-opengl
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build build/obs --config RelWithDebInfo --target obs-outputs
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build build/obs --config RelWithDebInfo --target obs-x264
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build build/obs --config RelWithDebInfo --target rtmp-services
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build build/obs --config RelWithDebInfo --target win-capture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build build/obs --config RelWithDebInfo --target win-wasapi
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build build/obs --config RelWithDebInfo --target obs-ffmpeg
+          exit 0
+
+      - name: Locate built libobs and stage required modules
+        id: libobs
+        shell: bash
+        run: |
+          obs_import="$(find build/obs -type f -iname 'obs.lib' -print -quit)"
+          obs_dll="$(find build/obs -type f -iname 'obs.dll' -print -quit)"
+          graphics_module="$(find build/obs -type f -iname 'libobs-d3d11.dll' -print -quit)"
+          obs_config="$(find build/obs -type f -name 'obsconfig.h' -print -quit)"
+          deps_root="$(find external/obs-studio/.deps -maxdepth 1 -type d -name 'obs-deps-*-x64' -print -quit)"
+          if [[ -z "$obs_import" || -z "$obs_dll" || -z "$graphics_module" || -z "$obs_config" ]]; then
+            echo "required libobs build artifact missing" >&2
+            find build/obs -maxdepth 8 \( -iname 'obs.lib' -o -iname 'obs.dll' -o -iname 'libobs-*.dll' -o -name 'obsconfig.h' \) -print >&2
+            exit 1
+          fi
+          if [[ -z "$deps_root" || ! -d "$deps_root/include" || ! -d "$deps_root/bin" ]]; then
+            echo "downloaded Windows obs-deps include/bin layout not found" >&2
+            find external/obs-studio/.deps -maxdepth 3 -type d -print >&2
+            exit 1
+          fi
+
+          module_stage="$PWD/build/obs/streammate-plugin-stage"
+          mkdir -p "$module_stage/data"
+          plugin_bin_dir="build/obs/rundir/RelWithDebInfo/obs-plugins/64bit"
+          plugin_data_dir="build/obs/rundir/RelWithDebInfo/data/obs-plugins"
+          libobs_data_dir="build/obs/rundir/RelWithDebInfo/data/libobs"
+          if [[ ! -d "$plugin_bin_dir" || ! -d "$plugin_data_dir" || ! -f "$libobs_data_dir/default.effect" ]]; then
+            echo "upstream Windows plugin runtime layout not found" >&2
+            find build/obs/rundir -maxdepth 6 -print >&2
+            exit 1
+          fi
+          for module in obs-outputs obs-x264 rtmp-services win-capture win-wasapi; do
+            module_dll="$(find "$plugin_bin_dir" -maxdepth 1 -type f -iname "$module.dll" -print -quit)"
+            module_data="$plugin_data_dir/$module"
+            if [[ -z "$module_dll" || ! -d "$module_data" ]]; then
+              echo "required staged OBS plugin artifact missing: $module" >&2
+              find build/obs/rundir/RelWithDebInfo -maxdepth 6 \( -iname '*.dll' -o -type d -path '*/data/obs-plugins/*' \) -print >&2
+              exit 1
+            fi
+            cp "$module_dll" "$module_stage/$module.dll"
+            cp -R "$module_data" "$module_stage/data/$module"
+          done
+
+          # obs.dll depends on w32-pthreads.dll, which the VS build leaves in a
+          # SIBLING directory (deps/w32-pthreads/RelWithDebInfo) — loading
+          # obs.dll without it fails (bash surfaces the DLL-load failure as
+          # exit 127). Stage the complete libobs runtime DLL closure into one
+          # directory: it feeds both the smoke PATH and the packaged dist.
+          w32_pthreads_dll="$(find build/obs -type f -iname 'w32-pthreads.dll' -print -quit)"
+          if [[ -z "$w32_pthreads_dll" ]]; then
+            echo "w32-pthreads.dll not found in the OBS build tree" >&2
+            find build/obs -maxdepth 6 -iname '*pthread*' -print >&2
+            exit 1
+          fi
+          runtime_dll_stage="$PWD/build/obs/streammate-runtime-dll-stage"
+          mkdir -p "$runtime_dll_stage"
+          cp "$obs_dll" "$w32_pthreads_dll" "$runtime_dll_stage/"
+
+          # The user-plugin no-exports fixture: a real DLL that is NOT an OBS
+          # module. It must not be obs.dll — Windows keys loaded modules by
+          # path, so a copy would put a SECOND libobs (duplicate statics) into
+          # a host that already has one resident. macOS uses libobs-opengl for
+          # exactly this reason; mirror it.
+          opengl_dll="$(find build/obs -type f -iname 'libobs-opengl.dll' -print -quit)"
+          if [[ -z "$opengl_dll" ]]; then
+            echo "libobs-opengl.dll not found for the no-exports fixture" >&2
+            find build/obs -maxdepth 6 -iname 'libobs-*.dll' -print >&2
+            exit 1
+          fi
+          echo "noexports_dll=$PWD/$opengl_dll" >> "$GITHUB_OUTPUT"
+
+          echo "library=$PWD/$obs_import" >> "$GITHUB_OUTPUT"
+          echo "obs_dll_dir=$runtime_dll_stage" >> "$GITHUB_OUTPUT"
+          echo "graphics_module=$PWD/$graphics_module" >> "$GITHUB_OUTPUT"
+          echo "generated_include=$PWD/$(dirname "$obs_config")" >> "$GITHUB_OUTPUT"
+          echo "deps_include=$PWD/$deps_root/include" >> "$GITHUB_OUTPUT"
+          echo "deps_library=$PWD/$deps_root/lib" >> "$GITHUB_OUTPUT"
+          echo "deps_bin=$PWD/$deps_root/bin" >> "$GITHUB_OUTPUT"
+          echo "modules_dir=$module_stage" >> "$GITHUB_OUTPUT"
+          echo "libobs_data_dir=$PWD/$libobs_data_dir" >> "$GITHUB_OUTPUT"
+
+      - name: Configure obs_startup smoke against built libobs
+        shell: bash
+        run: |
+          cmake -S . -B build/host -G Ninja \
+            -DSTREAMMATE_REQUIRE_LIBOBS=ON \
+            -DSTREAMMATE_OBS_INCLUDE_DIR="$PWD/external/obs-studio/libobs" \
+            -DSTREAMMATE_OBS_DEPS_INCLUDE_DIR="${{ steps.libobs.outputs.deps_include }}" \
+            -DSTREAMMATE_OBS_DEPS_LIBRARY_DIR="${{ steps.libobs.outputs.deps_library }}" \
+            -DSTREAMMATE_OBS_GENERATED_INCLUDE_DIR="${{ steps.libobs.outputs.generated_include }}" \
+            -DSTREAMMATE_OBS_LIBRARY="${{ steps.libobs.outputs.library }}"
+
+      - name: Build host and native-overlay HAS_LIBOBS targets
+        shell: bash
+        run: cmake --build build/host --target studio-host-smoke studio-host streammate-native-overlay native-overlay-module-smoke
+
+      - name: Run obs_startup smoke headlessly
+        shell: bash
+        run: |
+          export PATH="${{ steps.libobs.outputs.obs_dll_dir }}:${{ steps.libobs.outputs.deps_bin }}:$PATH"
+          ./build/host/studio-host-smoke.exe
+
+      - name: Build user-plugin test modules
+        shell: bash
+        run: cmake --build build/host --target streammate-test-source streammate-test-filter streammate-test-noop streammate-test-crash streammate-test-hang user-plugin-module-smoke
+
+      - name: Package bare-root Windows distribution
+        shell: bash
+        run: |
+          packaging/windows/package-dist.sh \
+            --host-bin build/host/studio-host.exe \
+            --smoke-bin build/host/studio-host-smoke.exe \
+            --obs-dll-dir "${{ steps.libobs.outputs.obs_dll_dir }}" \
+            --deps-bin-dir "${{ steps.libobs.outputs.deps_bin }}" \
+            --graphics-module "${{ steps.libobs.outputs.graphics_module }}" \
+            --obs-modules-dir "${{ steps.libobs.outputs.modules_dir }}" \
+            --streammate-plugin build/host/streammate-native-overlay.dll \
+            --libobs-data-dir "${{ steps.libobs.outputs.libobs_data_dir }}" \
+            --output-dir dist
+
+      - name: Verify packaged smoke and checksum manifest without PATH augmentation
+        shell: bash
+        run: |
+          dist/StreamMateStudioHost/studio-host-smoke.exe --version
+          (cd dist/StreamMateStudioHost && sha256sum -c ../sha256-manifest.txt)
+
+      - name: Run HAS_LIBOBS production-control verb smoke against packaged dist
+        shell: bash
+        run: |
+          STREAMMATE_EXPECT_LIBOBS=1 \
+          STREAMMATE_TEST_SOURCE_PLUGIN="$PWD/build/host/streammate-test-source.dll" \
+          STREAMMATE_TEST_FILTER_PLUGIN="$PWD/build/host/streammate-test-filter.dll" \
+          python tests/integration/test_production_control_verbs.py \
+            dist/StreamMateStudioHost/studio-host.exe
+
+      - name: Run real user-plugin loading end-to-end against packaged dist
+        shell: bash
+        run: |
+          echo "Windows coverage gaps in this lane, declared:"
+          echo "  1. dependency-missing fixture SKIPPED - no test DLL with a deliberately unresolved import is built yet."
+          echo "  2. wrong-architecture load-failure arm UNPROVEN - the static PE probe refuses mismatched binaries before dlopen, so the loader arm is unreachable from this fixture set."
+          STREAMMATE_EXPECT_LIBOBS=1 \
+          STREAMMATE_TEST_SOURCE_PLUGIN="$PWD/build/host/streammate-test-source.dll" \
+          STREAMMATE_TEST_FILTER_PLUGIN="$PWD/build/host/streammate-test-filter.dll" \
+          STREAMMATE_TEST_NOOP_PLUGIN="$PWD/build/host/streammate-test-noop.dll" \
+          STREAMMATE_NOEXPORTS_DYLIB="${{ steps.libobs.outputs.noexports_dll }}" \
+          python tests/integration/test_user_plugin_loading.py \
+            dist/StreamMateStudioHost/studio-host.exe
+
+      - name: Run seeded crash and hang containment against packaged dist
+        shell: bash
+        run: |
+          STREAMMATE_EXPECT_LIBOBS=1 \
+          STREAMMATE_TEST_SOURCE_PLUGIN="$PWD/build/host/streammate-test-source.dll" \
+          STREAMMATE_TEST_CRASH_PLUGIN="$PWD/build/host/streammate-test-crash.dll" \
+          STREAMMATE_TEST_HANG_PLUGIN="$PWD/build/host/streammate-test-hang.dll" \
+          python tests/integration/test_plugin_crash_containment.py \
+            dist/StreamMateStudioHost/studio-host.exe
+
+      - name: Verify Windows repack determinism
+        shell: bash
+        run: |
+          packaging/windows/package-dist.sh \
+            --host-bin build/host/studio-host.exe \
+            --smoke-bin build/host/studio-host-smoke.exe \
+            --obs-dll-dir "${{ steps.libobs.outputs.obs_dll_dir }}" \
+            --deps-bin-dir "${{ steps.libobs.outputs.deps_bin }}" \
+            --graphics-module "${{ steps.libobs.outputs.graphics_module }}" \
+            --obs-modules-dir "${{ steps.libobs.outputs.modules_dir }}" \
+            --streammate-plugin build/host/streammate-native-overlay.dll \
+            --libobs-data-dir "${{ steps.libobs.outputs.libobs_data_dir }}" \
+            --output-dir dist-repack
+          diff dist/sha256-manifest.txt dist-repack/sha256-manifest.txt
+          cmp dist/StreamMateStudioHost-windows-x64.tar.gz \
+            dist-repack/StreamMateStudioHost-windows-x64.tar.gz
+
+      - name: Upload Windows distribution artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: streammate-studio-host-windows-x64
+          path: |
+            dist/StreamMateStudioHost-windows-x64.tar.gz
+            dist/sha256-manifest.txt

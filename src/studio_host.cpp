@@ -1,5 +1,20 @@
 
+#if defined(_WIN32)
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <windows.h>
+#else
 #include <arpa/inet.h>
+#include <fcntl.h>
+#include <netinet/in.h>
+#include <sys/select.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+#include <unistd.h>
+#endif
+
 #include <algorithm>
 #include <array>
 #include <atomic>
@@ -10,7 +25,6 @@
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
-#include <fcntl.h>
 #include <filesystem>
 #include <cerrno>
 #include <exception>
@@ -18,23 +32,19 @@
 #include <functional>
 #include <iomanip>
 #include <iostream>
+#include <limits>
 #include <limits.h>
 #include <map>
-#include <netinet/in.h>
 #include <optional>
 #include <regex>
 #include <set>
 #include <sstream>
 #include <stdexcept>
 #include <string>
-#include <sys/select.h>
-#include <sys/socket.h>
-#include <sys/stat.h>
-#include <sys/types.h>
+#include <system_error>
 #include <thread>
 #include <mutex>
 #include <condition_variable>
-#include <unistd.h>
 #include <vector>
 
 #include "native_overlay_renderer.h"
@@ -48,7 +58,9 @@
 #endif
 
 #if STREAMMATE_HAS_LIBOBS
+#if !defined(_WIN32)
 #include <dlfcn.h>
+#endif
 #include <obs.h>
 #include <callback/calldata.h>
 #include <callback/proc.h>
@@ -60,6 +72,78 @@
 #endif
 
 namespace {
+#if STREAMMATE_HAS_LIBOBS && defined(_WIN32)
+constexpr int RTLD_LAZY = 0;
+constexpr int RTLD_LOCAL = 0;
+thread_local const char *g_dynamic_load_error = nullptr;
+
+const char *sanitized_windows_load_error(DWORD error) {
+  switch (error) {
+  case ERROR_MOD_NOT_FOUND:
+  case ERROR_DLL_NOT_FOUND:
+    return "dependent-library-missing";
+  // ERROR_BAD_EXE_FORMAT only says "not a valid image for this loader" — it
+  // covers corrupt images as well as machine-type mismatches, so it cannot
+  // claim wrong-architecture by itself; the caller disambiguates against the
+  // PE machine field. ERROR_EXE_MACHINE_TYPE_MISMATCH (CreateProcess-family
+  // image activation) is an explicit machine-type verdict.
+  case ERROR_BAD_EXE_FORMAT:
+    return "bad-image";
+  case ERROR_EXE_MACHINE_TYPE_MISMATCH:
+    return "wrong-architecture";
+  default:
+    return "dlopen-failed";
+  }
+}
+
+// Minimal dlfcn compatibility surface for the HAS_LIBOBS code below. Error
+// strings are classifications only: FormatMessage is deliberately not used
+// because its inserted module name can contain an absolute path.
+void *dlopen(const char *utf8_path, int) {
+  g_dynamic_load_error = nullptr;
+  if (utf8_path == nullptr) {
+    g_dynamic_load_error = "dlopen-failed";
+    return nullptr;
+  }
+  const int length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8_path, -1, nullptr, 0);
+  if (length <= 0) {
+    g_dynamic_load_error = "dlopen-failed";
+    return nullptr;
+  }
+  std::vector<wchar_t> wide_path(static_cast<std::size_t>(length));
+  if (MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, utf8_path, -1,
+                          wide_path.data(), length) <= 0) {
+    g_dynamic_load_error = "dlopen-failed";
+    return nullptr;
+  }
+  HMODULE module = LoadLibraryW(wide_path.data());
+  if (module == nullptr) {
+    g_dynamic_load_error = sanitized_windows_load_error(GetLastError());
+  }
+  return reinterpret_cast<void *>(module);
+}
+
+void *dlsym(void *handle, const char *symbol) {
+  g_dynamic_load_error = nullptr;
+  FARPROC address = GetProcAddress(reinterpret_cast<HMODULE>(handle), symbol);
+  if (address == nullptr) g_dynamic_load_error = "symbol-not-found";
+  return reinterpret_cast<void *>(address);
+}
+
+int dlclose(void *handle) {
+  g_dynamic_load_error = nullptr;
+  if (FreeLibrary(reinterpret_cast<HMODULE>(handle))) return 0;
+  g_dynamic_load_error = "dlclose-failed";
+  return -1;
+}
+
+const char *dlerror() {
+  const char *error = g_dynamic_load_error;
+  g_dynamic_load_error = nullptr;
+  return error;
+}
+#endif
+
 constexpr const char *kVersion = STREAMMATE_STUDIO_HOST_VERSION;
 constexpr int kUsageExit = 64;
 constexpr int kRuntimeExit = 70;
@@ -72,7 +156,7 @@ constexpr std::uintmax_t kMaxSceneCollectionBytes = 8 * 1024 * 1024;
 constexpr const char *kWebSocketGuid = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 // NIF-H1: tells plugins.discover/plugins.report consumers whether this host
 // can really load modules (the discovery inventory itself is identical in
-// both lanes -- pure filesystem + Mach-O byte parsing, no libobs).
+// both lanes -- pure filesystem + native binary parsing, no libobs).
 #if STREAMMATE_HAS_LIBOBS
 constexpr const char *kPluginHostMode = "libobs";
 #else
@@ -81,6 +165,156 @@ constexpr const char *kPluginHostMode = "scaffold";
 volatile std::sig_atomic_t g_stop = 0;
 
 void handle_signal(int) { g_stop = 1; }
+
+#if defined(_WIN32)
+using socket_t = SOCKET;
+using socket_io_result_t = int;
+using socket_length_t = int;
+constexpr socket_t kInvalidSocket = INVALID_SOCKET;
+
+class SocketRuntime {
+public:
+  SocketRuntime() {
+    WSADATA data{};
+    const int result = WSAStartup(MAKEWORD(2, 2), &data);
+    if (result != 0 || LOBYTE(data.wVersion) != 2 || HIBYTE(data.wVersion) != 2) {
+      if (result == 0) WSACleanup();
+      throw std::runtime_error("Winsock 2.2 startup failed");
+    }
+  }
+  ~SocketRuntime() { WSACleanup(); }
+  SocketRuntime(const SocketRuntime &) = delete;
+  SocketRuntime &operator=(const SocketRuntime &) = delete;
+};
+
+bool socket_valid(socket_t fd) { return fd != kInvalidSocket; }
+void close_socket(socket_t fd) { closesocket(fd); }
+int socket_last_error() { return WSAGetLastError(); }
+bool socket_would_block(int error) { return error == WSAEWOULDBLOCK; }
+int select_nfds(socket_t) { return 0; } // Winsock ignores nfds.
+
+bool set_socket_nonblocking(socket_t fd) {
+  u_long enabled = 1;
+  return ioctlsocket(fd, FIONBIO, &enabled) == 0;
+}
+
+// NOT SO_REUSEADDR: on Windows that option lets an unrelated process bind the
+// SAME loopback address, and the kernel then delivers connections to an
+// indeterminate socket — a squatter could receive Station's token-bearing
+// handshake, and our bind would succeed where POSIX refuses loudly.
+// SO_EXCLUSIVEADDRUSE is the documented Windows equivalent of the POSIX
+// intent here (fail closed when the address is already taken).
+bool set_socket_reuse_address(socket_t fd) {
+  const int enabled = 1;
+  return setsockopt(fd, SOL_SOCKET, SO_EXCLUSIVEADDRUSE,
+                    reinterpret_cast<const char *>(&enabled), sizeof(enabled)) == 0;
+}
+#else
+using socket_t = int;
+using socket_io_result_t = ssize_t;
+using socket_length_t = socklen_t;
+constexpr socket_t kInvalidSocket = -1;
+
+class SocketRuntime {};
+
+bool socket_valid(socket_t fd) { return fd >= 0; }
+void close_socket(socket_t fd) { close(fd); }
+int socket_last_error() { return errno; }
+bool socket_would_block(int error) { return error == EAGAIN || error == EWOULDBLOCK; }
+int select_nfds(socket_t fd) { return fd + 1; }
+
+bool set_socket_nonblocking(socket_t fd) {
+  const int flags = fcntl(fd, F_GETFL, 0);
+  return flags >= 0 && fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
+}
+
+bool set_socket_reuse_address(socket_t fd) {
+  const int enabled = 1;
+  return setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &enabled, sizeof(enabled)) == 0;
+}
+#endif
+
+socket_io_result_t socket_send(socket_t fd, const void *data, std::size_t length, int flags) {
+#if defined(_WIN32)
+  const std::size_t bounded = std::min(length, static_cast<std::size_t>(std::numeric_limits<int>::max()));
+  return send(fd, static_cast<const char *>(data), static_cast<int>(bounded), flags);
+#else
+  return send(fd, data, length, flags);
+#endif
+}
+
+socket_io_result_t socket_receive(socket_t fd, void *data, std::size_t length, int flags) {
+#if defined(_WIN32)
+  const std::size_t bounded = std::min(length, static_cast<std::size_t>(std::numeric_limits<int>::max()));
+  return recv(fd, static_cast<char *>(data), static_cast<int>(bounded), flags);
+#else
+  return recv(fd, data, length, flags);
+#endif
+}
+
+std::filesystem::path path_from_utf8(const std::string &value) {
+#if defined(_WIN32)
+  return std::filesystem::path(std::u8string(value.begin(), value.end()));
+#else
+  return std::filesystem::path(value);
+#endif
+}
+
+// NTFS is case-insensitive, so a user module may legitimately be named
+// `MyPlugin.DLL`. MSVC's path::operator== compares the native string case
+// SENSITIVELY, which would silently drop such a file from the inventory —
+// and "silently dropped" is exactly what the discovery contract forbids.
+// These two helpers fold case on Windows only; POSIX matching stays exact.
+bool equals_ignoring_windows_case(const std::string &left, const std::string &right) {
+#if defined(_WIN32)
+  if (left.size() != right.size()) return false;
+  for (std::size_t i = 0; i < left.size(); ++i) {
+    if (std::tolower(static_cast<unsigned char>(left[i])) !=
+        std::tolower(static_cast<unsigned char>(right[i]))) {
+      return false;
+    }
+  }
+  return true;
+#else
+  return left == right;
+#endif
+}
+
+bool has_windows_module_extension(const std::filesystem::path &path) {
+  return equals_ignoring_windows_case(path.extension().string(), ".dll");
+}
+
+std::string path_to_utf8(const std::filesystem::path &value) {
+#if defined(_WIN32)
+  const std::u8string encoded = value.u8string();
+  return std::string(encoded.begin(), encoded.end());
+#else
+  return value.string();
+#endif
+}
+
+bool replace_file(const std::filesystem::path &source, const std::filesystem::path &destination,
+                  std::error_code &ec) {
+#if defined(_WIN32)
+  if (MoveFileExW(source.c_str(), destination.c_str(),
+                  MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+    ec.clear();
+    return true;
+  }
+  ec = std::error_code(static_cast<int>(GetLastError()), std::system_category());
+  return false;
+#else
+  std::filesystem::rename(source, destination, ec);
+  return !ec;
+#endif
+}
+
+void replace_file(const std::filesystem::path &source, const std::filesystem::path &destination) {
+  std::error_code ec;
+  if (!replace_file(source, destination, ec)) {
+    throw std::filesystem::filesystem_error("atomic file replacement failed", source, destination, ec);
+  }
+}
 
 // ---------------------------------------------------------------------------
 // NIF-H1: --user-plugins-manifest launch input (schema user-plugins-manifest.v1)
@@ -329,7 +563,7 @@ private:
 };
 
 inline bool is_absolute_manifest_path(const std::string &path) {
-  return !path.empty() && path[0] == '/';
+  return !path.empty() && path_from_utf8(path).is_absolute();
 }
 
 inline bool is_module_ref(const std::string &value) {
@@ -496,11 +730,12 @@ constexpr std::uintmax_t kMaxManifestBytes = 1024 * 1024;
 inline Manifest load_or_throw(const std::string &path) {
   const std::string prefix = "invalid --user-plugins-manifest: ";
   if (!is_absolute_manifest_path(path)) throw std::runtime_error(prefix + "not-absolute-path");
+  const std::filesystem::path manifest_path = path_from_utf8(path);
   std::error_code ec;
-  const std::uintmax_t size = std::filesystem::file_size(path, ec);
+  const std::uintmax_t size = std::filesystem::file_size(manifest_path, ec);
   if (ec) throw std::runtime_error(prefix + "unreadable-file");
   if (size > kMaxManifestBytes) throw std::runtime_error(prefix + "manifest-too-large");
-  std::ifstream in(path, std::ios::binary);
+  std::ifstream in(manifest_path, std::ios::binary);
   if (!in) throw std::runtime_error(prefix + "unreadable-file");
   std::ostringstream buffer;
   buffer << in.rdbuf();
@@ -676,7 +911,9 @@ inline std::string serialize(const State &state) {
 // persisted" and refuse the guarded action (codex F2 — never load a module
 // whose crash could not be pinned on it afterwards).
 inline bool write(const std::string &path, const State &state) {
-  const std::string tmp = path + ".tmp";
+  const std::filesystem::path target = path_from_utf8(path);
+  std::filesystem::path tmp = target;
+  tmp += ".tmp";
   {
     std::ofstream out(tmp, std::ios::binary | std::ios::trunc);
     if (!out) return false;
@@ -685,8 +922,7 @@ inline bool write(const std::string &path, const State &state) {
     if (!out.good()) return false;
   }
   std::error_code ec;
-  std::filesystem::rename(tmp, path, ec);
-  return !ec;
+  return replace_file(tmp, target, ec);
 }
 
 // Strict parse. Missing file => fresh idle state. Malformed content refuses
@@ -695,14 +931,15 @@ inline bool write(const std::string &path, const State &state) {
 inline State load_or_throw(const std::string &path) {
   const std::string prefix = "invalid --plugin-load-sentinel: ";
   State state;
+  const std::filesystem::path sentinel_path = path_from_utf8(path);
   std::error_code ec;
-  const bool present = std::filesystem::exists(path, ec);
+  const bool present = std::filesystem::exists(sentinel_path, ec);
   if (ec) throw std::runtime_error(prefix + "unreadable-file");
   if (!present) return state;
-  const std::uintmax_t size = std::filesystem::file_size(path, ec);
+  const std::uintmax_t size = std::filesystem::file_size(sentinel_path, ec);
   if (ec) throw std::runtime_error(prefix + "unreadable-file");
   if (size > kMaxSentinelBytes) throw std::runtime_error(prefix + "sentinel-too-large");
-  std::ifstream in(path, std::ios::binary);
+  std::ifstream in(sentinel_path, std::ios::binary);
   if (!in) throw std::runtime_error(prefix + "unreadable-file");
   std::ostringstream buffer;
   buffer << in.rdbuf();
@@ -1029,6 +1266,7 @@ public:
   bool start(const std::optional<user_plugins::Manifest> &user_plugins_manifest,
              const PluginContainment &containment = {}) {
 #if STREAMMATE_HAS_LIBOBS
+    add_bundle_data_path();
     if (!obs_startup("en-US", nullptr, nullptr)) {
       return false;
     }
@@ -1092,6 +1330,13 @@ private:
       return std::nullopt;
     }
     return std::filesystem::weakly_canonical(buffer.data());
+#elif defined(_WIN32)
+    std::vector<wchar_t> buffer(32768, L'\0');
+    const DWORD length = GetModuleFileNameW(nullptr, buffer.data(), static_cast<DWORD>(buffer.size()));
+    if (length == 0 || length >= buffer.size()) {
+      return std::nullopt;
+    }
+    return std::filesystem::weakly_canonical(std::filesystem::path(buffer.data(), buffer.data() + length));
 #else
     return std::nullopt;
 #endif
@@ -1104,8 +1349,16 @@ private:
     if (!executable) {
       return {};
     }
+#if defined(__APPLE__)
     std::filesystem::path contents = executable->parent_path().parent_path();
     std::filesystem::path plugins = contents / "PlugIns" / "obs-plugins";
+#elif defined(_WIN32)
+    // The distributable is a bare-root payload: both executables and their
+    // runtime DLLs sit at <root>, with bundled modules below obs-plugins/64bit.
+    std::filesystem::path plugins = executable->parent_path() / "obs-plugins" / "64bit";
+#else
+    return {};
+#endif
     if (!std::filesystem::is_directory(plugins)) {
       return {};
     }
@@ -1117,14 +1370,52 @@ private:
     if (plugins.empty()) {
       return;
     }
-    std::string binary_pattern = (plugins / "%module%.plugin" / "Contents" / "MacOS").string();
-    std::string data_pattern = (plugins / "%module%.plugin" / "Contents" / "Resources").string();
+#if defined(__APPLE__)
+    std::filesystem::path binary = plugins / "%module%.plugin" / "Contents" / "MacOS";
+    std::filesystem::path data = plugins / "%module%.plugin" / "Contents" / "Resources";
+#elif defined(_WIN32)
+    // A directory pattern makes libobs enumerate <module>.dll files here.
+    std::filesystem::path binary = plugins;
+    std::filesystem::path data = plugins.parent_path().parent_path() / "data" / "obs-plugins" / "%module%";
+#else
+    return;
+#endif
+    std::string binary_pattern = path_to_utf8(binary);
+    std::string data_pattern = path_to_utf8(data);
     obs_add_module_path(binary_pattern.c_str(), data_pattern.c_str());
+  }
+
+  static void add_bundle_data_path() {
+#if defined(_WIN32)
+    auto executable = executable_path();
+    if (!executable) {
+      return;
+    }
+    // Upstream's Windows fallback searches ../../data/libobs relative to the
+    // process working directory. Station may launch the bare-root executable
+    // from any directory, so add the packaged core-effect directory explicitly
+    // before obs_startup/reset_video asks for default.effect and its peers.
+    std::filesystem::path data = executable->parent_path() / "data" / "libobs";
+    if (std::filesystem::is_directory(data)) {
+      // libobs' check_path concatenates <added path> + <file> with NO
+      // separator, so a data path MUST end with a slash or every lookup
+      // becomes "...libobsdefault.effect".
+      std::string data_path = path_to_utf8(data) + "/";
+      obs_add_data_path(data_path.c_str());
+    }
+#endif
   }
 
   static bool reset_offscreen_video() {
     obs_video_info video = {};
+#if defined(__APPLE__)
     video.graphics_module = "@executable_path/../Frameworks/libobs-opengl.dylib";
+#elif defined(_WIN32)
+    // libobs-d3d11.dll is beside the executable in the bare-root payload.
+    video.graphics_module = "libobs-d3d11.dll";
+#else
+    video.graphics_module = "libobs-opengl.so";
+#endif
     video.fps_num = 30;
     video.fps_den = 1;
     video.base_width = 1280;
@@ -1162,7 +1453,7 @@ public:
       return;
     }
     try {
-      std::filesystem::path target(path_);
+      std::filesystem::path target = path_from_utf8(path_);
       if (!target.parent_path().empty()) {
         std::filesystem::create_directories(target.parent_path());
       }
@@ -1173,7 +1464,7 @@ public:
         out << "{\"status\":\"ready\",\"hostId\":\"studio-host-1\",\"port\":" << port
             << ",\"heartbeatMs\":" << kHeartbeatMs << "}\n";
       }
-      std::filesystem::rename(temp, target);
+      replace_file(temp, target);
     } catch (...) {
       throw std::runtime_error("state file write failed");
     }
@@ -1184,7 +1475,7 @@ public:
       return;
     }
     try {
-      std::filesystem::path target(path_);
+      std::filesystem::path target = path_from_utf8(path_);
       if (!target.parent_path().empty()) {
         std::filesystem::create_directories(target.parent_path());
       }
@@ -1194,7 +1485,7 @@ public:
         std::ofstream out(temp);
         out << "{\"status\":\"stopped\",\"hostId\":\"studio-host-1\"}\n";
       }
-      std::filesystem::rename(temp, target);
+      replace_file(temp, target);
     } catch (...) {
       throw std::runtime_error("state file write failed");
     }
@@ -1315,9 +1606,9 @@ std::map<std::string, std::string> parse_headers(const std::string &request) {
   return headers;
 }
 
-bool send_all(int fd, const uint8_t *data, size_t len) {
+bool send_all(socket_t fd, const uint8_t *data, size_t len) {
   while (len > 0) {
-    ssize_t written = send(fd, data, len, 0);
+    const socket_io_result_t written = socket_send(fd, data, len, 0);
     if (written <= 0) return false;
     data += written;
     len -= static_cast<size_t>(written);
@@ -1325,7 +1616,18 @@ bool send_all(int fd, const uint8_t *data, size_t len) {
   return true;
 }
 
-bool send_text_frame(int fd, const std::string &payload) {
+bool receive_exact(socket_t fd, void *data, size_t len) {
+  auto *cursor = static_cast<uint8_t *>(data);
+  while (len > 0) {
+    const socket_io_result_t received = socket_receive(fd, cursor, len, 0);
+    if (received <= 0) return false;
+    cursor += received;
+    len -= static_cast<size_t>(received);
+  }
+  return true;
+}
+
+bool send_text_frame(socket_t fd, const std::string &payload) {
   std::vector<uint8_t> frame;
   frame.push_back(0x81);
   if (payload.size() < 126) {
@@ -1347,24 +1649,23 @@ bool send_text_frame(int fd, const std::string &payload) {
   return send_all(fd, frame.data(), frame.size());
 }
 
-std::optional<std::string> read_text_frame(int fd) {
+std::optional<std::string> read_text_frame(socket_t fd) {
   uint8_t header[2];
-  ssize_t n = recv(fd, header, 2, MSG_WAITALL);
-  if (n <= 0) return std::nullopt;
+  if (!receive_exact(fd, header, sizeof(header))) return std::nullopt;
   uint8_t opcode = header[0] & 0x0f;
   bool masked = (header[1] & 0x80) != 0;
   uint64_t len = header[1] & 0x7f;
   if (len == 126) {
     uint8_t ext[2];
-    if (recv(fd, ext, 2, MSG_WAITALL) != 2) return std::nullopt;
+    if (!receive_exact(fd, ext, sizeof(ext))) return std::nullopt;
     len = (static_cast<uint64_t>(ext[0]) << 8) | ext[1];
   } else if (len == 127) {
     return std::nullopt;
   }
   uint8_t mask[4]{};
-  if (masked && recv(fd, mask, 4, MSG_WAITALL) != 4) return std::nullopt;
+  if (masked && !receive_exact(fd, mask, sizeof(mask))) return std::nullopt;
   std::vector<uint8_t> payload(len);
-  if (len > 0 && recv(fd, payload.data(), len, MSG_WAITALL) != static_cast<ssize_t>(len)) return std::nullopt;
+  if (len > 0 && !receive_exact(fd, payload.data(), static_cast<size_t>(len))) return std::nullopt;
   if (opcode == 0x8) return std::nullopt;
   if (opcode != 0x1) return std::string{};
   if (masked) {
@@ -3565,8 +3866,8 @@ std::string json_array_join(const std::vector<std::string> &items) {
 
 // ---------------------------------------------------------------------------
 // NIF-H1: user plugin static inventory (discovery ONLY -- no dlopen, no
-// obs_open_module; loading is chunk NIF-H2). Pure filesystem reads + Mach-O
-// header byte parsing, so it behaves identically in both lanes; enumeration
+// obs_open_module; loading is chunk NIF-H2). Pure filesystem reads + native
+// binary header parsing, so it behaves identically in both lanes; enumeration
 // leaves the manifest roots byte-for-byte identical.
 // ---------------------------------------------------------------------------
 
@@ -3745,22 +4046,64 @@ std::optional<std::vector<std::string>> parse_macho_archs(const std::vector<unsi
   return archs;
 }
 
+// Windows PE image: a complete 64-byte DOS header supplies e_lfanew, followed
+// by the PE signature and the complete 20-byte COFF header. Architecture is
+// read only after all three structures are inside the bounded header window.
+std::optional<std::vector<std::string>> parse_pe_archs(const std::vector<unsigned char> &bytes) {
+  constexpr std::size_t kDosHeaderSize = 64;
+  constexpr std::size_t kPeSignatureSize = 4;
+  constexpr std::size_t kCoffHeaderSize = 20;
+  constexpr uint16_t kMachineAmd64 = 0x8664;
+  constexpr uint16_t kMachineArm64 = 0xaa64;
+  if (bytes.size() < kDosHeaderSize || bytes[0] != 'M' || bytes[1] != 'Z') return std::nullopt;
+
+  const uint32_t pe_offset = read_u32_at(bytes.data() + 0x3c, false);
+  if (pe_offset < kDosHeaderSize || pe_offset > bytes.size() ||
+      bytes.size() - pe_offset < kPeSignatureSize + kCoffHeaderSize) {
+    return std::nullopt;
+  }
+  const unsigned char *pe = bytes.data() + pe_offset;
+  if (pe[0] != 'P' || pe[1] != 'E' || pe[2] != 0 || pe[3] != 0) return std::nullopt;
+  const uint16_t machine = static_cast<uint16_t>(pe[4]) |
+                           (static_cast<uint16_t>(pe[5]) << 8);
+  if (machine == kMachineAmd64) return std::vector<std::string>{"x86_64"};
+  if (machine == kMachineArm64) return std::vector<std::string>{"arm64"};
+  return std::vector<std::string>{"unknown"};
+}
+
+std::optional<std::vector<std::string>> parse_user_plugin_archs(
+    const std::vector<unsigned char> &bytes) {
+#if defined(_WIN32)
+  return parse_pe_archs(bytes);
+#else
+  return parse_macho_archs(bytes);
+#endif
+}
+
+constexpr const char *unreadable_plugin_header_reason() {
+#if defined(_WIN32)
+  return "unreadable-pe-header";
+#else
+  return "unreadable-macho-header";
+#endif
+}
+
 // Walk/probe bounds -- every root scan and binary read is explicitly capped.
 constexpr int kMaxScanDepth = 8;                                     // dirs below the root
 constexpr std::size_t kMaxVisitedEntriesPerRoot = 4096;              // dir entries inspected
 constexpr std::size_t kMaxCandidatesPerRoot = 256;                   // records per root
 constexpr std::uintmax_t kMaxHashedBinaryBytes = 512ull * 1024 * 1024; // sha256 size ceiling
-constexpr std::size_t kMachoHeaderWindowBytes = 64 * 1024;           // arch probe window
+constexpr std::size_t kBinaryHeaderWindowBytes = 64 * 1024;         // arch probe window
 constexpr std::size_t kHashChunkBytes = 1024 * 1024;                 // streaming read unit
 
 struct UserPluginBinaryProbe {
   bool readable = false;
   bool too_large = false;              // over the sha256 ceiling
   std::string sha256;                  // empty => null on the wire
-  std::vector<unsigned char> header;   // first kMachoHeaderWindowBytes only
+  std::vector<unsigned char> header;   // first kBinaryHeaderWindowBytes only
 };
 
-// Reads a candidate binary with bounded memory: the Mach-O parse sees only a
+// Reads a candidate binary with bounded memory: the Mach-O/PE parse sees only a
 // 64 KiB header window, and hashing streams 1 MiB chunks through the SHA-256
 // context. Files over the ceiling are NOT hashed (header window still read).
 UserPluginBinaryProbe probe_user_plugin_binary(const std::filesystem::path &path) {
@@ -3773,7 +4116,7 @@ UserPluginBinaryProbe probe_user_plugin_binary(const std::filesystem::path &path
 
   if (size > kMaxHashedBinaryBytes) {
     probe.too_large = true;
-    probe.header.resize(kMachoHeaderWindowBytes);
+    probe.header.resize(kBinaryHeaderWindowBytes);
     in.read(reinterpret_cast<char *>(probe.header.data()),
             static_cast<std::streamsize>(probe.header.size()));
     probe.header.resize(static_cast<std::size_t>(in.gcount()));
@@ -3788,9 +4131,9 @@ UserPluginBinaryProbe probe_user_plugin_binary(const std::filesystem::path &path
     const std::streamsize got = in.gcount();
     if (got <= 0) break;
     hasher.update(chunk.data(), static_cast<std::size_t>(got));
-    if (probe.header.size() < kMachoHeaderWindowBytes) {
+    if (probe.header.size() < kBinaryHeaderWindowBytes) {
       const std::size_t take =
-          std::min(static_cast<std::size_t>(got), kMachoHeaderWindowBytes - probe.header.size());
+          std::min(static_cast<std::size_t>(got), kBinaryHeaderWindowBytes - probe.header.size());
       probe.header.insert(probe.header.end(), chunk.data(), chunk.data() + take);
     }
   }
@@ -3844,7 +4187,8 @@ std::vector<std::filesystem::path> list_directory_sorted(const std::filesystem::
 // truncation is deterministic). Directory symlinks are never followed; file
 // symlinks still surface as matches so confinement can refuse them loudly.
 void walk_legacy_bin_dir(const std::filesystem::path &dir, int depth, const std::string &so_name,
-                         const std::string &dylib_name, std::vector<std::filesystem::path> &matches,
+                         const std::string &dylib_name, const std::string &dll_name,
+                         std::vector<std::filesystem::path> &matches,
                          std::size_t &visited, bool &truncated) {
   if (depth > kMaxScanDepth) {
     truncated = true;
@@ -3860,9 +4204,12 @@ void walk_legacy_bin_dir(const std::filesystem::path &dir, int depth, const std:
     if (ec) continue;
     if (std::filesystem::is_regular_file(status) || std::filesystem::is_symlink(status)) {
       const std::string file_name = entry.filename().string();
-      if (file_name == so_name || file_name == dylib_name) matches.push_back(entry);
+      if (file_name == so_name || file_name == dylib_name ||
+          (!dll_name.empty() && equals_ignoring_windows_case(file_name, dll_name)))
+        matches.push_back(entry);
     } else if (std::filesystem::is_directory(status)) {
-      walk_legacy_bin_dir(entry, depth + 1, so_name, dylib_name, matches, visited, truncated);
+      walk_legacy_bin_dir(entry, depth + 1, so_name, dylib_name, dll_name, matches, visited,
+                          truncated);
       if (truncated) return;
     }
   }
@@ -3906,12 +4253,14 @@ struct UserPluginInventory {
   std::vector<UserPluginRecord> modules;
 };
 
-// Enumerates one manifest root across BOTH macOS layouts, in sorted entry
+// Enumerates one manifest root across the native layouts, in sorted entry
 // order (directory iteration order is unspecified, and the inventory must be
 // deterministic):
 //   (a) <root>/<name>.plugin CFBundle -> Contents/MacOS/<name>
 //   (b) legacy <root>/<name>/bin/**/<name>.{so,dylib} (first match in sorted
 //       path order; walk bounded by depth/entry caps)
+// On Windows, a direct <root>/<name>.dll and the legacy bin/**/<name>.dll form
+// replace the CFBundle/shared-object shapes.
 // Names that are not protocol-safe ids cannot form a valid "module:<id>" ref
 // and are skipped. A missing/unreadable root yields zero candidates. Every
 // candidate carries a confinement verdict; unconfined binaries are never
@@ -3931,10 +4280,32 @@ UserPluginRootScan scan_user_plugin_root(const std::filesystem::path &root) {
       break;
     }
     std::error_code entry_ec;
-    if (!std::filesystem::is_directory(path, entry_ec) || entry_ec) continue;
     const std::string entry_name = path.filename().string();
 
     std::optional<UserPluginCandidate> candidate;
+#if defined(_WIN32)
+    if (has_windows_module_extension(path) && std::filesystem::is_regular_file(path, entry_ec) && !entry_ec) {
+      const std::string name = path.stem().string();
+      if (!is_safe_protocol_id(name)) continue;
+      candidate = UserPluginCandidate{name, path, entry_name, false, false};
+    } else if (!std::filesystem::is_directory(path, entry_ec) || entry_ec) {
+      continue;
+    } else {
+      const std::string &name = entry_name;
+      if (!is_safe_protocol_id(name)) continue;
+      std::filesystem::path bin_dir = path / "bin";
+      if (!std::filesystem::is_directory(bin_dir, entry_ec) || entry_ec) continue;
+      std::vector<std::filesystem::path> matches;
+      walk_legacy_bin_dir(bin_dir, 3, name + ".so", name + ".dylib", name + ".dll", matches,
+                          visited, scan.truncated);
+      if (scan.truncated) break;
+      if (!matches.empty()) {
+        const std::filesystem::path &binary = matches.front();
+        candidate = UserPluginCandidate{name, binary, binary.filename().string(), false, false};
+      }
+    }
+#else
+    if (!std::filesystem::is_directory(path, entry_ec) || entry_ec) continue;
     if (entry_name.size() > kBundleSuffixLen && entry_name.ends_with(kBundleSuffix)) {
       const std::string name = entry_name.substr(0, entry_name.size() - kBundleSuffixLen);
       if (!is_safe_protocol_id(name)) continue;
@@ -3951,7 +4322,7 @@ UserPluginRootScan scan_user_plugin_root(const std::filesystem::path &root) {
       std::filesystem::path bin_dir = path / "bin";
       if (!std::filesystem::is_directory(bin_dir, entry_ec) || entry_ec) continue;
       std::vector<std::filesystem::path> matches;
-      walk_legacy_bin_dir(bin_dir, 3, name + ".so", name + ".dylib", matches, visited,
+      walk_legacy_bin_dir(bin_dir, 3, name + ".so", name + ".dylib", "", matches, visited,
                           scan.truncated); // bin sits 2 levels below the root; entries start at 3
       if (scan.truncated) break;
       if (!matches.empty()) {
@@ -3960,6 +4331,7 @@ UserPluginRootScan scan_user_plugin_root(const std::filesystem::path &root) {
         candidate = UserPluginCandidate{name, binary, binary.filename().string(), false, false};
       }
     }
+#endif
     if (!candidate) continue;
     if (scan.candidates.size() >= kMaxCandidatesPerRoot) {
       scan.truncated = true;
@@ -3988,7 +4360,7 @@ UserPluginInventory build_user_plugin_inventory(const user_plugins::Manifest &ma
     const std::string root_ref = "root:" + std::to_string(index);
     UserPluginRootScan scan;
     try {
-      scan = scan_user_plugin_root(manifest.roots[index].binary_dir);
+      scan = scan_user_plugin_root(path_from_utf8(manifest.roots[index].binary_dir));
     } catch (const std::filesystem::filesystem_error &) {
       scan = {}; // a root racing with deletion degrades to empty
     }
@@ -4021,7 +4393,7 @@ UserPluginInventory build_user_plugin_inventory(const user_plugins::Manifest &ma
       record.label = candidate.name;
       record.file_name = candidate.relative;
       // Reason precedence (one category per record): symlink-refused >
-      // unreadable-binary > binary-too-large > unreadable-macho-header.
+      // unreadable-binary > binary-too-large > unreadable-platform-header.
       if (!candidate.confined) {
         // Never opened: no bytes disclosed, no hash, no arch.
         record.reason_detail = "symlink-refused";
@@ -4031,11 +4403,11 @@ UserPluginInventory build_user_plugin_inventory(const user_plugins::Manifest &ma
       } else {
         record.sha256 = probe.sha256; // empty (=> null) when over the size ceiling
         if (probe.too_large) record.reason_detail = "binary-too-large";
-        if (auto archs = parse_macho_archs(probe.header)) {
+        if (auto archs = parse_user_plugin_archs(probe.header)) {
           record.archs = *archs;
           record.observed_arch = true; // read from the header bytes, honestly
         } else if (record.reason_detail.empty()) {
-          record.reason_detail = "unreadable-macho-header";
+          record.reason_detail = unreadable_plugin_header_reason();
         }
       }
       // Exclusion wins over duplicate detection; only non-excluded records
@@ -4053,7 +4425,7 @@ UserPluginInventory build_user_plugin_inventory(const user_plugins::Manifest &ma
         if (candidate.bundle) {
           source.data_dir = candidate.binary.parent_path().parent_path() / "Resources";
         } else if (!manifest.roots[index].data_dir.empty()) {
-          source.data_dir = std::filesystem::path(manifest.roots[index].data_dir) / candidate.name;
+          source.data_dir = path_from_utf8(manifest.roots[index].data_dir) / candidate.name;
         }
         sources_out->push_back(std::move(source));
       }
@@ -4121,7 +4493,7 @@ std::string user_plugins_discover_json(const std::optional<user_plugins::Manifes
 // The plan runs in BOTH lanes over static filesystem facts only:
 //   - a record refused at discovery (any reasonDetail) is never a candidate;
 //   - a wrong-arch record gets state "architecture_mismatch" (observed from
-//     the Mach-O header) and is never attempted, selected or not;
+//     the native binary header) and is never attempted, selected or not;
 //   - manifest `selected` gates candidacy (`not-selected` reason; selected
 //     null/absent means every discovered candidate in the given roots);
 //   - excluded / duplicate_in_roots lifecycles never load.
@@ -4133,9 +4505,9 @@ std::string user_plugins_discover_json(const std::optional<user_plugins::Manifes
 // ---------------------------------------------------------------------------
 
 constexpr const char *kHostCpuArch =
-#if defined(__aarch64__) || defined(__arm64__)
+#if defined(__aarch64__) || defined(__arm64__) || defined(_M_ARM64)
     "arm64";
-#elif defined(__x86_64__)
+#elif defined(__x86_64__) || defined(_M_X64)
     "x86_64";
 #else
     "";
@@ -4206,19 +4578,33 @@ std::array<std::set<std::string>, 6> snapshot_registered_types() {
   return out;
 }
 
-// Bundled-module stems ("mac-capture" from mac-capture.plugin etc.): the
+// Bundled-module stems ("mac-capture" from mac-capture.plugin or
+// "win-capture" from win-capture.dll): the
 // UNION of (a) modules libobs actually opened (obs_enum_modules) and (b) the
-// app bundle's Contents/PlugIns/obs-plugins directory listing — a bundled
+// packaged module directory listing — a bundled
 // module that failed to open/init is absent from (a) but must still shadow a
 // same-named user module (bundled wins even when broken). A user module
 // colliding with either is refused (duplicate_of_bundled) before any dlopen.
+// The key both sides of the collision test are folded through: identity on
+// POSIX, lowercase on Windows (NTFS is case-insensitive, so `WIN-CAPTURE` and
+// `win-capture` name the same file and must collide).
+std::string bundled_collision_key(const std::string &stem) {
+#if defined(_WIN32)
+  std::string key = stem;
+  for (char &c : key) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  return key;
+#else
+  return stem;
+#endif
+}
+
 std::set<std::string> bundled_module_stems(const std::filesystem::path &bundle_plugins_dir) {
   std::set<std::string> stems;
   obs_enum_modules(
       [](void *param, obs_module_t *module) {
         const char *file = obs_get_module_file_name(module);
         if (file == nullptr) return;
-        std::string stem = std::filesystem::path(file).stem().string();
+        std::string stem = bundled_collision_key(std::filesystem::path(file).stem().string());
         if (!stem.empty()) static_cast<std::set<std::string> *>(param)->insert(std::move(stem));
       },
       &stems);
@@ -4227,8 +4613,12 @@ std::set<std::string> bundled_module_stems(const std::filesystem::path &bundle_p
     std::filesystem::directory_iterator it(bundle_plugins_dir, ec);
     for (std::filesystem::directory_iterator end; !ec && it != end; it.increment(ec)) {
       const std::filesystem::path entry = it->path();
+#if defined(_WIN32)
+      if (has_windows_module_extension(entry)) {
+#else
       if (entry.extension() == ".plugin") {
-        std::string stem = entry.stem().string();
+#endif
+        std::string stem = bundled_collision_key(entry.stem().string());
         if (!stem.empty()) stems.insert(std::move(stem));
       }
     }
@@ -4237,12 +4627,12 @@ std::set<std::string> bundled_module_stems(const std::filesystem::path &bundle_p
 }
 
 // Sanitized dlerror classification: NEVER the raw dlerror text (it embeds
-// absolute paths). "Library not loaded" appears ONLY when a dependent dylib
-// failed to resolve — a bare "image not found" also fires for a missing
-// CANDIDATE file, so it must not be treated as a dependency signal;
-// "architecture" => arch rejection at load. In the pinned libobs,
-// MODULE_FILE_NOT_FOUND is a deprecated alias of MODULE_FAILED_TO_OPEN (every
-// os_dlopen failure returns it), so ALL open failures route through here.
+// absolute paths). On macOS, "Library not loaded" appears only when a
+// dependent dylib failed to resolve, and "architecture" is an arch rejection.
+// The Windows shim returns only equivalent sanitized category strings. In the
+// pinned libobs, MODULE_FILE_NOT_FOUND is a deprecated alias of
+// MODULE_FAILED_TO_OPEN (every os_dlopen failure returns it), so ALL open
+// failures route through here.
 void classify_failed_dlopen(const std::filesystem::path &binary, UserPluginRecord &record) {
   std::error_code exists_ec;
   if (!std::filesystem::exists(binary, exists_ec) || exists_ec) {
@@ -4253,7 +4643,8 @@ void classify_failed_dlopen(const std::filesystem::path &binary, UserPluginRecor
   // Probe dlopen runs constructors if it unexpectedly succeeds; that only
   // happens after obs_open_module already failed on the same path, so the
   // side-effect window is accepted (the module was user-selected for load).
-  void *handle = dlopen(binary.c_str(), RTLD_LAZY | RTLD_LOCAL);
+  const std::string binary_utf8 = path_to_utf8(binary);
+  void *handle = dlopen(binary_utf8.c_str(), RTLD_LAZY | RTLD_LOCAL);
   if (handle != nullptr) {
     dlclose(handle);
     record.state = "module_load_failed";
@@ -4262,6 +4653,44 @@ void classify_failed_dlopen(const std::filesystem::path &binary, UserPluginRecor
   }
   const char *raw = dlerror();
   const std::string text = raw != nullptr ? raw : "";
+#if defined(_WIN32)
+  if (text == "dependent-library-missing") {
+    // ERROR_MOD_NOT_FOUND names the candidate or one of its dependencies.
+    // The candidate still existing after LoadLibraryW makes the dependency
+    // classification an observed fact rather than a guess.
+    std::error_code after_ec;
+    if (!std::filesystem::exists(binary, after_ec) || after_ec) {
+      record.state = "module_load_failed";
+      record.reason_detail = "file-not-found";
+      return;
+    }
+    record.state = "dependency_missing";
+    record.reason_detail = "library-not-loaded";
+    record.observed_dependencies = true;
+  } else if (text == "wrong-architecture") {
+    record.state = "architecture_mismatch";
+    record.reason_detail = "wrong-architecture";
+  } else if (text == "bad-image") {
+    // ERROR_BAD_EXE_FORMAT does not distinguish a corrupt image from a
+    // mismatched machine type; only a parsed PE machine field that excludes
+    // the host arch makes architecture_mismatch an observed fact.
+    const UserPluginBinaryProbe probe = probe_user_plugin_binary(binary);
+    std::optional<std::vector<std::string>> archs;
+    if (probe.readable) archs = parse_user_plugin_archs(probe.header);
+    if (archs && kHostCpuArch[0] != '\0' &&
+        std::find(archs->begin(), archs->end(), std::string(kHostCpuArch)) ==
+            archs->end()) {
+      record.state = "architecture_mismatch";
+      record.reason_detail = "wrong-architecture";
+    } else {
+      record.state = "module_load_failed";
+      record.reason_detail = "dlopen-failed";
+    }
+  } else {
+    record.state = "module_load_failed";
+    record.reason_detail = "dlopen-failed";
+  }
+#else
   if (text.find("Library not loaded") != std::string::npos) {
     record.state = "dependency_missing";
     record.reason_detail = "library-not-loaded";
@@ -4273,6 +4702,7 @@ void classify_failed_dlopen(const std::filesystem::path &binary, UserPluginRecor
     record.state = "module_load_failed";
     record.reason_detail = "dlopen-failed";
   }
+#endif
 }
 
 // NIF-H3: converts a hanging obs_open_module/obs_init_module into a bounded,
@@ -4362,10 +4792,13 @@ void load_user_plugin_candidates(UserPluginLoadPlan &plan,
     UserPluginRecord &record = plan.inventory.modules[index];
     const UserPluginModuleSource &source = plan.sources[index];
 
-    // Stem comparison is deliberately case-sensitive: APFS defaults are
-    // case-insensitive, but libobs module ids are exact-match, and a
-    // case-variant name that survives here still fails obs_open_module.
-    if (bundled.count(record.label) != 0) {
+    // Stem comparison is case-sensitive on POSIX (libobs module ids are
+    // exact-match) but MUST fold case on Windows: NTFS is always
+    // case-insensitive, so `WIN-CAPTURE.dll` is an ordinary working name for
+    // a bundled module — and obs_open_module dedupes by exact bin_path, so a
+    // case-variant would be dlopened, exactly what this pre-dlopen guard
+    // exists to prevent.
+    if (bundled.count(bundled_collision_key(record.label)) != 0) {
       record.lifecycle = "duplicate_of_bundled"; // bundled upstream wins, never dlopened
       continue;
     }
@@ -4387,7 +4820,9 @@ void load_user_plugin_candidates(UserPluginLoadPlan &plan,
       }
     }
 
-    const char *data_path = source.data_dir.empty() ? nullptr : source.data_dir.c_str();
+    const std::string binary_path = path_to_utf8(source.binary);
+    const std::string data_path_storage = path_to_utf8(source.data_dir);
+    const char *data_path = source.data_dir.empty() ? nullptr : data_path_storage.c_str();
     // NIF-H3: record the attempt BEFORE dlopen/init — a crash mid-load leaves
     // this loading record behind and the next boot attributes it. If the
     // record cannot be persisted, the attempt is REFUSED (codex F2): loading
@@ -4406,7 +4841,7 @@ void load_user_plugin_candidates(UserPluginLoadPlan &plan,
       watchdog->arm(record.module_ref);
     }
     obs_module_t *module = nullptr;
-    const int rc = obs_open_module(&module, source.binary.c_str(), data_path);
+    const int rc = obs_open_module(&module, binary_path.c_str(), data_path);
     if (rc == MODULE_SUCCESS) {
       record.observed_dependencies = true; // dlopen resolved every dependent library
       const bool init_ok = obs_init_module(module);
@@ -4662,7 +5097,7 @@ public:
     if (home.empty()) home = getenv_string("STREAMMATE_HOME");
     if (home.empty()) return error(-32602, "STREAMMATE_HOME is required");
 
-    std::filesystem::path destination = std::filesystem::path(home) / "studio" / "obs-imports" / collection_id;
+    std::filesystem::path destination = path_from_utf8(home) / "studio" / "obs-imports" / collection_id;
     std::filesystem::path temp = destination;
     temp += ".tmp";
     std::string json;
@@ -4931,7 +5366,7 @@ private:
     std::string config = extract_json_string(request, "configDir");
     if (config.empty()) config = getenv_string("STREAMMATE_OBS_CONFIG_DIR");
     if (config.empty()) return std::nullopt;
-    std::filesystem::path path(config);
+    std::filesystem::path path = path_from_utf8(config);
     if (!std::filesystem::is_directory(path)) return std::nullopt;
     return path;
   }
@@ -5084,7 +5519,7 @@ private:
       resource.workspace_path = value;
       return resource;
     }
-    const std::string basename = std::filesystem::path(value).filename().string();
+    const std::string basename = path_from_utf8(value).filename().string();
     std::vector<std::string> candidates;
     std::filesystem::recursive_directory_iterator end;
     for (std::filesystem::recursive_directory_iterator it(config, ec); it != end; ++it) {
@@ -5633,19 +6068,18 @@ public:
 #if STREAMMATE_HAS_LIBOBS
     stop_live_output();
 #endif
-    int fd = socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) return rpc_error_result(-32603, "fake ingest socket create failed");
+    socket_t fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (!socket_valid(fd)) return rpc_error_result(-32603, "fake ingest socket create failed");
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(static_cast<uint16_t>(endpoint_preview_.port));
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     if (connect(fd, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0) {
-      close(fd);
+      close_socket(fd);
       clear_stream_key();
       return rpc_error_result(-32603, "fake ingest connect failed");
     }
-    int flags = fcntl(fd, F_GETFL, 0);
-    if (flags >= 0) fcntl(fd, F_SETFL, flags | O_NONBLOCK);
+    set_socket_nonblocking(fd);
     ingest_fd_ = fd;
     stream_key_ = stream_key;
     running_ = true;
@@ -5689,7 +6123,7 @@ public:
     return "{\"ok\":true,\"sampleShape\":\"spec18-item8\",\"intervalMs\":" + std::to_string(stats_interval_ms_) + "}";
   }
 
-  void tick(int control_fd) {
+  void tick(socket_t control_fd) {
     if (!running_) return;
     auto now = std::chrono::steady_clock::now();
 #if STREAMMATE_HAS_LIBOBS
@@ -5807,26 +6241,27 @@ private:
   }
 
   bool send_ingest_chunk() {
-    if (ingest_fd_ < 0) return false;
+    if (!socket_valid(ingest_fd_)) return false;
     const char chunk[] = "STREAMMATE_FAKE_RTMP_CHUNK\n";
-    ssize_t sent = send(ingest_fd_, chunk, sizeof(chunk) - 1, 0);
-    return sent == static_cast<ssize_t>(sizeof(chunk) - 1) || (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK));
+    const socket_io_result_t sent = socket_send(ingest_fd_, chunk, sizeof(chunk) - 1, 0);
+    return sent == static_cast<socket_io_result_t>(sizeof(chunk) - 1) ||
+           (sent < 0 && socket_would_block(socket_last_error()));
   }
 
   bool ingest_disconnected() const {
-    if (ingest_fd_ < 0) return true;
+    if (!socket_valid(ingest_fd_)) return true;
     fd_set readfds;
     FD_ZERO(&readfds);
     FD_SET(ingest_fd_, &readfds);
     timeval timeout{0, 0};
-    int ready = select(ingest_fd_ + 1, &readfds, nullptr, nullptr, &timeout);
+    int ready = select(select_nfds(ingest_fd_), &readfds, nullptr, nullptr, &timeout);
     if (ready <= 0 || !FD_ISSET(ingest_fd_, &readfds)) return false;
     char byte = 0;
-    ssize_t n = recv(ingest_fd_, &byte, 1, MSG_PEEK);
-    return n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK);
+    const socket_io_result_t n = socket_receive(ingest_fd_, &byte, 1, MSG_PEEK);
+    return n == 0 || (n < 0 && !socket_would_block(socket_last_error()));
   }
 
-  void fail_output(int control_fd, const std::string &reason) {
+  void fail_output(socket_t control_fd, const std::string &reason) {
     running_ = false;
     close_ingest();
 #if STREAMMATE_HAS_LIBOBS
@@ -5839,9 +6274,9 @@ private:
   }
 
   void close_ingest() {
-    if (ingest_fd_ >= 0) {
-      close(ingest_fd_);
-      ingest_fd_ = -1;
+    if (socket_valid(ingest_fd_)) {
+      close_socket(ingest_fd_);
+      ingest_fd_ = kInvalidSocket;
     }
   }
 
@@ -6076,7 +6511,7 @@ private:
   bool stopped_pending_ = false;
   bool error_pending_ = false;
   int stats_interval_ms_ = 1000;
-  int ingest_fd_ = -1;
+  socket_t ingest_fd_ = kInvalidSocket;
   std::string output_id_;
   std::string endpoint_;
   EndpointPreview endpoint_preview_;
@@ -6469,7 +6904,7 @@ private:
   std::optional<std::filesystem::path> resolve_home() const {
     std::string home = getenv_string("STREAMMATE_HOME");
     if (home.empty()) return std::nullopt;
-    return std::filesystem::path(home);
+    return path_from_utf8(home);
   }
 
   // Rejects absolute / URL-shaped / parent-escaping destinations up front and
@@ -6481,7 +6916,7 @@ private:
     std::string destination = extract_json_string(request, "destination");
     if (destination.empty()) return std::filesystem::path(subdir) / default_name;
     if (destination.find("://") != std::string::npos) return std::nullopt;
-    std::filesystem::path candidate(destination);
+    std::filesystem::path candidate = path_from_utf8(destination);
     if (candidate.is_absolute()) return std::nullopt;
     for (const auto &part : candidate) {
       if (part == "..") return std::nullopt;
@@ -6585,26 +7020,25 @@ public:
   }
 
   int run() {
-    int server = socket(AF_INET, SOCK_STREAM, 0);
-    if (server < 0) throw std::runtime_error("socket create failed");
-    int yes = 1;
-    setsockopt(server, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+    socket_t server = socket(AF_INET, SOCK_STREAM, 0);
+    if (!socket_valid(server)) throw std::runtime_error("socket create failed");
+    set_socket_reuse_address(server);
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
     addr.sin_port = htons(static_cast<uint16_t>(options_.port));
     addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     if (bind(server, reinterpret_cast<sockaddr *>(&addr), sizeof(addr)) != 0) {
-      close(server);
+      close_socket(server);
       throw std::runtime_error("loopback bind failed");
     }
     if (listen(server, 8) != 0) {
-      close(server);
+      close_socket(server);
       throw std::runtime_error("listen failed");
     }
 
     sockaddr_in bound{};
-    socklen_t bound_len = sizeof(bound);
+    socket_length_t bound_len = sizeof(bound);
     getsockname(server, reinterpret_cast<sockaddr *>(&bound), &bound_len);
     port_ = ntohs(bound.sin_port);
     state_.write_ready(port_);
@@ -6616,27 +7050,27 @@ public:
       FD_ZERO(&readfds);
       FD_SET(server, &readfds);
       timeval timeout{0, 200000};
-      int ready = select(server + 1, &readfds, nullptr, nullptr, &timeout);
+      int ready = select(select_nfds(server), &readfds, nullptr, nullptr, &timeout);
       if (ready > 0 && FD_ISSET(server, &readfds)) {
         sockaddr_in client{};
-        socklen_t client_len = sizeof(client);
-        int fd = accept(server, reinterpret_cast<sockaddr *>(&client), &client_len);
-        if (fd >= 0) {
+        socket_length_t client_len = sizeof(client);
+        socket_t fd = accept(server, reinterpret_cast<sockaddr *>(&client), &client_len);
+        if (socket_valid(fd)) {
           handle_client(fd);
-          close(fd);
+          close_socket(fd);
         }
       }
     }
-    close(server);
+    close_socket(server);
     state_.write_stopped();
     emit_log("info", "host.exited", "studio-host stopped");
     return EXIT_SUCCESS;
   }
 
 private:
-  void handle_client(int fd) {
+  void handle_client(socket_t fd) {
     char buffer[8192];
-    ssize_t n = recv(fd, buffer, sizeof(buffer) - 1, 0);
+    const socket_io_result_t n = socket_receive(fd, buffer, sizeof(buffer) - 1, 0);
     if (n <= 0) return;
     buffer[n] = '\0';
     std::string request(buffer);
@@ -6662,7 +7096,7 @@ private:
       FD_ZERO(&readfds);
       FD_SET(fd, &readfds);
       timeval timeout{0, 200000};
-      int ready = select(fd + 1, &readfds, nullptr, nullptr, &timeout);
+      int ready = select(select_nfds(fd), &readfds, nullptr, nullptr, &timeout);
       if (ready > 0 && FD_ISSET(fd, &readfds)) {
         auto payload = read_text_frame(fd);
         if (!payload) return;
@@ -6682,7 +7116,7 @@ private:
   // against them, so the declared capability set can never drift from what the
   // host actually implements -- and a verb it cannot perform can never be
   // declared.
-  void handle_message(int fd, const std::string &payload) {
+  void handle_message(socket_t fd, const std::string &payload) {
     std::string id = extract_json_id(payload);
     std::string method = extract_json_string(payload, "method");
     for (const auto &entry : command_table_) {
@@ -6741,36 +7175,36 @@ private:
     };
     // >>> STUDIO_HOST_COMMAND_TABLE (single source of truth for both dispatch
     // and host.hello's supportedCommands; do not hand-list these anywhere else)
-    add("host.hello", [this](int fd, const std::string &id, const std::string &) {
+    add("host.hello", [this](socket_t fd, const std::string &id, const std::string &) {
       send_text_frame(fd, rpc_result(id, hello_result()));
     });
-    add("host.health", [this](int fd, const std::string &id, const std::string &) {
+    add("host.health", [this](socket_t fd, const std::string &id, const std::string &) {
       send_text_frame(fd, rpc_result(id, "{\"status\":\"ready\",\"engineStarted\":" + std::string(engine_.started() ? "true" : "false") +
                                       ",\"heartbeatMs\":" + std::to_string(kHeartbeatMs) +
                                       ",\"nativeOverlaySourceCount\":" + std::to_string(native_overlays_.count()) + "}"));
     });
-    add("host.exerciseTccPrompts", [this](int fd, const std::string &id, const std::string &payload) {
+    add("host.exerciseTccPrompts", [this](socket_t fd, const std::string &id, const std::string &payload) {
       send_renderer_result(fd, id, importer_.exercise_tcc_prompts(payload));
     });
-    add("scene.load", [this](int fd, const std::string &id, const std::string &payload) {
+    add("scene.load", [this](socket_t fd, const std::string &id, const std::string &payload) {
       send_renderer_result(fd, id, renderer_.load_scene(payload));
     });
-    add("scene.setProgram", [this](int fd, const std::string &id, const std::string &payload) {
+    add("scene.setProgram", [this](socket_t fd, const std::string &id, const std::string &payload) {
       send_renderer_result(fd, id, renderer_.set_program(payload));
     });
-    add("scene.list", [this](int fd, const std::string &id, const std::string &payload) {
+    add("scene.list", [this](socket_t fd, const std::string &id, const std::string &payload) {
       send_renderer_result(fd, id, renderer_.list_scenes(payload));
     });
-    add("scene.itemTransform", [this](int fd, const std::string &id, const std::string &payload) {
+    add("scene.itemTransform", [this](socket_t fd, const std::string &id, const std::string &payload) {
       send_renderer_result(fd, id, renderer_.item_transform(payload));
     });
-    add("sceneItem.setVisible", [this](int fd, const std::string &id, const std::string &payload) {
+    add("sceneItem.setVisible", [this](socket_t fd, const std::string &id, const std::string &payload) {
       send_renderer_result(fd, id, renderer_.set_item_visible(payload));
     });
-    add("sceneItem.setOrder", [this](int fd, const std::string &id, const std::string &payload) {
+    add("sceneItem.setOrder", [this](socket_t fd, const std::string &id, const std::string &payload) {
       send_renderer_result(fd, id, renderer_.set_item_order(payload));
     });
-    add("source.remove", [this](int fd, const std::string &id, const std::string &payload) {
+    add("source.remove", [this](socket_t fd, const std::string &id, const std::string &payload) {
       // Explicit opt-in Phase B native overlay sources are routed to their own
       // manager; every other id stays on the scaffold browser-source path.
       std::string source_id = extract_json_string(payload, "sourceId");
@@ -6780,7 +7214,7 @@ private:
         send_renderer_result(fd, id, renderer_.remove_source(payload));
       }
     });
-    add("source.create", [this](int fd, const std::string &id, const std::string &payload) {
+    add("source.create", [this](socket_t fd, const std::string &id, const std::string &payload) {
       // kind "native-overlay" is the explicit opt-in surface (Spec 34 Capability
       // 2); the default browser create path is untouched (ADR-0003 stands).
       if (extract_json_string(payload, "kind") == "native-overlay") {
@@ -6789,7 +7223,7 @@ private:
         send_renderer_result(fd, id, renderer_.create_source(payload));
       }
     });
-    add("source.update", [this](int fd, const std::string &id, const std::string &payload) {
+    add("source.update", [this](socket_t fd, const std::string &id, const std::string &payload) {
       std::string source_id = extract_json_string(payload, "sourceId");
       if (native_overlays_.has(source_id)) {
         send_renderer_result(fd, id, native_overlays_.apply(payload));
@@ -6797,95 +7231,95 @@ private:
         send_renderer_result(fd, id, renderer_.update_source(payload));
       }
     });
-    add("source.mute", [this](int fd, const std::string &id, const std::string &payload) {
+    add("source.mute", [this](socket_t fd, const std::string &id, const std::string &payload) {
       send_renderer_result(fd, id, renderer_.mute_source(payload));
     });
-    add("filter.list", [this](int fd, const std::string &id, const std::string &payload) {
+    add("filter.list", [this](socket_t fd, const std::string &id, const std::string &payload) {
       send_renderer_result(fd, id, renderer_.list_filters(payload));
     });
-    add("filter.setEnabled", [this](int fd, const std::string &id, const std::string &payload) {
+    add("filter.setEnabled", [this](socket_t fd, const std::string &id, const std::string &payload) {
       send_renderer_result(fd, id, renderer_.set_filter_enabled(payload));
     });
-    add("filter.setSettings", [this](int fd, const std::string &id, const std::string &payload) {
+    add("filter.setSettings", [this](socket_t fd, const std::string &id, const std::string &payload) {
       send_renderer_result(fd, id, renderer_.set_filter_settings(payload));
     });
-    add("audio.setVolume", [this](int fd, const std::string &id, const std::string &payload) {
+    add("audio.setVolume", [this](socket_t fd, const std::string &id, const std::string &payload) {
       send_renderer_result(fd, id, renderer_.set_audio_volume(payload));
     });
-    add("media.control", [this](int fd, const std::string &id, const std::string &payload) {
+    add("media.control", [this](socket_t fd, const std::string &id, const std::string &payload) {
       send_renderer_result(fd, id, renderer_.media_control(payload));
     });
-    add("source.refreshBrowser", [this](int fd, const std::string &id, const std::string &payload) {
+    add("source.refreshBrowser", [this](socket_t fd, const std::string &id, const std::string &payload) {
       send_renderer_result(fd, id, renderer_.refresh_browser(payload));
     });
-    add("scene.captureFrame", [this](int fd, const std::string &id, const std::string &payload) {
+    add("scene.captureFrame", [this](socket_t fd, const std::string &id, const std::string &payload) {
       send_renderer_result(fd, id, renderer_.capture_frame(payload));
     });
-    add("program.captureFrame", [this](int fd, const std::string &id, const std::string &payload) {
+    add("program.captureFrame", [this](socket_t fd, const std::string &id, const std::string &payload) {
       send_renderer_result(fd, id, renderer_.capture_program_frame(payload));
     });
-    add("program.captureAudio", [this](int fd, const std::string &id, const std::string &payload) {
+    add("program.captureAudio", [this](socket_t fd, const std::string &id, const std::string &payload) {
       send_renderer_result(fd, id, renderer_.capture_program_audio(payload));
     });
-    add("source.captureFrame", [this](int fd, const std::string &id, const std::string &payload) {
+    add("source.captureFrame", [this](socket_t fd, const std::string &id, const std::string &payload) {
       send_renderer_result(fd, id, renderer_.capture_source_frame(payload));
     });
-    add("import.scan", [this](int fd, const std::string &id, const std::string &payload) {
+    add("import.scan", [this](socket_t fd, const std::string &id, const std::string &payload) {
       send_renderer_result(fd, id, importer_.scan(payload));
     });
-    add("import.load", [this](int fd, const std::string &id, const std::string &payload) {
+    add("import.load", [this](socket_t fd, const std::string &id, const std::string &payload) {
       send_renderer_result(fd, id, importer_.load(payload));
     });
-    add("import.report", [this](int fd, const std::string &id, const std::string &payload) {
+    add("import.report", [this](socket_t fd, const std::string &id, const std::string &payload) {
       send_renderer_result(fd, id, importer_.report(payload));
     });
     // NIF-H1: static user plugin inventory from --user-plugins-manifest roots
     // (read-only; NO module loading -- dlopen/obs_open_module land in NIF-H2).
-    add("plugins.discover", [this](int fd, const std::string &id, const std::string &) {
+    add("plugins.discover", [this](socket_t fd, const std::string &id, const std::string &) {
       send_text_frame(fd, rpc_result(id, user_plugins_discover_json(options_.user_plugins)));
     });
     // NIF-H2: the boot-frozen per-module load report (plan facts in scaffold,
     // real per-module load outcomes + registered-type deltas under libobs).
-    add("plugins.report", [this](int fd, const std::string &id, const std::string &) {
+    add("plugins.report", [this](socket_t fd, const std::string &id, const std::string &) {
       send_text_frame(fd, rpc_result(id, engine_.user_plugins_report_json()));
     });
-    add("output.configure", [this](int fd, const std::string &id, const std::string &payload) {
+    add("output.configure", [this](socket_t fd, const std::string &id, const std::string &payload) {
       send_output_result(fd, id, output_.configure(payload));
     });
-    add("output.start", [this](int fd, const std::string &id, const std::string &payload) {
+    add("output.start", [this](socket_t fd, const std::string &id, const std::string &payload) {
       send_output_result(fd, id, output_.start(payload));
     });
-    add("output.stop", [this](int fd, const std::string &id, const std::string &payload) {
+    add("output.stop", [this](socket_t fd, const std::string &id, const std::string &payload) {
       send_output_result(fd, id, output_.stop(payload));
     });
-    add("output.status", [this](int fd, const std::string &id, const std::string &payload) {
+    add("output.status", [this](socket_t fd, const std::string &id, const std::string &payload) {
       send_output_result(fd, id, output_.status(payload));
     });
-    add("stats.subscribe", [this](int fd, const std::string &id, const std::string &payload) {
+    add("stats.subscribe", [this](socket_t fd, const std::string &id, const std::string &payload) {
       send_output_result(fd, id, output_.subscribe(payload));
     });
-    add("record.start", [this](int fd, const std::string &id, const std::string &payload) {
+    add("record.start", [this](socket_t fd, const std::string &id, const std::string &payload) {
       send_record_result(fd, id, record_replay_.start_record(payload));
     });
-    add("record.stop", [this](int fd, const std::string &id, const std::string &payload) {
+    add("record.stop", [this](socket_t fd, const std::string &id, const std::string &payload) {
       send_record_result(fd, id, record_replay_.stop_record(payload));
     });
-    add("record.status", [this](int fd, const std::string &id, const std::string &payload) {
+    add("record.status", [this](socket_t fd, const std::string &id, const std::string &payload) {
       send_record_result(fd, id, record_replay_.record_status(payload));
     });
-    add("replay.start", [this](int fd, const std::string &id, const std::string &payload) {
+    add("replay.start", [this](socket_t fd, const std::string &id, const std::string &payload) {
       send_record_result(fd, id, record_replay_.start_replay(payload));
     });
-    add("replay.save", [this](int fd, const std::string &id, const std::string &payload) {
+    add("replay.save", [this](socket_t fd, const std::string &id, const std::string &payload) {
       send_record_result(fd, id, record_replay_.save_replay(payload));
     });
-    add("replay.stop", [this](int fd, const std::string &id, const std::string &payload) {
+    add("replay.stop", [this](socket_t fd, const std::string &id, const std::string &payload) {
       send_record_result(fd, id, record_replay_.stop_replay(payload));
     });
-    add("replay.status", [this](int fd, const std::string &id, const std::string &payload) {
+    add("replay.status", [this](socket_t fd, const std::string &id, const std::string &payload) {
       send_record_result(fd, id, record_replay_.replay_status(payload));
     });
-    add("host.shutdown", [this](int fd, const std::string &id, const std::string &) {
+    add("host.shutdown", [this](socket_t fd, const std::string &id, const std::string &) {
       send_text_frame(fd, rpc_result(id, "{\"ok\":true}"));
       g_stop = 1;
     });
@@ -6899,7 +7333,7 @@ private:
     supported_commands_json_ = build_supported_commands_json();
   }
 
-  void send_renderer_result(int fd, const std::string &id, const std::string &result) {
+  void send_renderer_result(socket_t fd, const std::string &id, const std::string &result) {
     if (is_renderer_error(result)) {
       send_text_frame(fd, renderer_error_to_rpc(id, result));
     } else {
@@ -6907,7 +7341,7 @@ private:
     }
   }
 
-  void send_output_result(int fd, const std::string &id, const std::string &result) {
+  void send_output_result(socket_t fd, const std::string &id, const std::string &result) {
     if (is_output_error(result)) {
       send_text_frame(fd, output_error_to_rpc(id, result));
     } else {
@@ -6918,7 +7352,7 @@ private:
   // record.*/replay.* results share the __error__ convention; on success any
   // journaled event (record.started/stopped, replay.saved) is emitted after the
   // RPC reply so the adapter can order it against the reply.
-  void send_record_result(int fd, const std::string &id, const std::string &result) {
+  void send_record_result(socket_t fd, const std::string &id, const std::string &result) {
     if (is_renderer_error(result)) {
       send_text_frame(fd, renderer_error_to_rpc(id, result));
       return;
@@ -6927,7 +7361,7 @@ private:
     if (auto event = record_replay_.take_event()) send_text_frame(fd, *event);
   }
 
-  using CommandHandler = std::function<void(int fd, const std::string &id, const std::string &payload)>;
+  using CommandHandler = std::function<void(socket_t fd, const std::string &id, const std::string &payload)>;
   struct CommandEntry {
     const char *method;
     CommandHandler handler;
@@ -6949,12 +7383,19 @@ private:
 } // namespace
 
 int main(int argc, char **argv) {
+#if defined(_WIN32)
+  // Graceful Windows lifecycle coverage uses host.shutdown; SIGINT remains a
+  // useful console fallback, while SIGTERM/SIGPIPE do not have POSIX semantics.
+  std::signal(SIGINT, handle_signal);
+#else
   std::signal(SIGTERM, handle_signal);
   std::signal(SIGINT, handle_signal);
   std::signal(SIGPIPE, SIG_IGN);
+#endif
 
   try {
     Options options = parse_args(argc, argv);
+    SocketRuntime socket_runtime;
     PluginContainment containment;
     if (!options.plugin_sentinel_path.empty()) {
       containment.enabled = true;

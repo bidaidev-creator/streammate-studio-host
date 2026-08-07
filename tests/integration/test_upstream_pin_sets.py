@@ -137,22 +137,9 @@ def obs_tree_source_files() -> list[tuple[str, str]]:
     return files
 
 
-def obs_tree_id_index() -> str:
+def obs_tree_id_index(files: list[tuple[str, str]]) -> str:
     """One concatenated haystack of every quoted string in plausible id sites."""
-    chunks: list[str] = []
-    for sub in ("plugins", "libobs", "UI"):
-        root = OBS_TREE / sub
-        if not root.is_dir():
-            continue
-        proc = subprocess.run(
-            ["grep", "-r", "--include=*.c", "--include=*.cpp", "--include=*.h",
-             "--include=*.hpp", "--include=*.m", "--include=*.mm", "-h", '"', str(root)],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        chunks.append(proc.stdout)
-    return "\n".join(chunks)
+    return "\n".join(text for _path, text in files if '"' in text)
 
 
 class UpstreamPinSetDerivationTest(unittest.TestCase):
@@ -168,8 +155,9 @@ class UpstreamPinSetDerivationTest(unittest.TestCase):
                 "external/obs-studio not populated locally; CI enforces this suite with "
                 "STREAMMATE_REQUIRE_OBS_TREE=1"
             )
-        cls.haystack = obs_tree_id_index()
-        cls.registered, cls.versioned = build_registration_index(obs_tree_source_files())
+        source_files = obs_tree_source_files()
+        cls.haystack = obs_tree_id_index(source_files)
+        cls.registered, cls.versioned = build_registration_index(source_files)
 
     def test_pin_matches_submodule(self) -> None:
         pin = dict(

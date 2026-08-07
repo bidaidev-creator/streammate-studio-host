@@ -31,7 +31,7 @@ inline bool is_portable_type_id(const std::string &value) {
 // A module NAME must survive every mono field it feeds:
 //   moduleRef "module:<name>"  -> ^module:[A-Za-z0-9][A-Za-z0-9._-]{0,127}$
 //   label     "<name>"         -> sanitized string <= 120
-//   fileName  "<name>.plugin"  -> sanitized string <= 160
+//   fileName  "<name>.<native suffix>" -> sanitized string <= 160
 // Binding constraints: alnum-led, portable charset, length <= 120.
 inline bool is_portable_module_name(const std::string &value) {
   if (value.empty() || value.size() > 120) return false;
