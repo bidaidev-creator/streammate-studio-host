@@ -1267,7 +1267,15 @@ public:
              const PluginContainment &containment = {}) {
 #if STREAMMATE_HAS_LIBOBS
     add_bundle_data_path();
-    if (!obs_startup("en-US", nullptr, nullptr)) {
+    // Module config state (obs-browser's CEF profile, win-capture's compat
+    // cache) is host-owned and ephemeral, never the caller's CWD — a null
+    // module_config_path makes libobs resolve every module config dir
+    // relative to whatever directory the host happened to be launched from.
+    const std::optional<std::string> module_config_root = prepare_module_config_root();
+    if (!module_config_root) {
+      return false;
+    }
+    if (!obs_startup("en-US", module_config_root->c_str(), nullptr)) {
       return false;
     }
     add_bundle_module_path();
@@ -1309,6 +1317,10 @@ public:
     }
 #if STREAMMATE_HAS_LIBOBS
     obs_shutdown();
+    if (!module_config_root_.empty()) {
+      std::error_code ec;
+      std::filesystem::remove_all(module_config_root_, ec);
+    }
 #endif
     started_ = false;
   }
@@ -1317,6 +1329,51 @@ public:
 
 private:
 #if STREAMMATE_HAS_LIBOBS
+  // Fresh per-process module-config root handed to obs_startup. On Windows a
+  // regular FILE is stationed at <root>/win-capture: the pinned win-capture
+  // (obs-studio 32.1.2) defines ENABLE_COMPAT_UPDATES but no source ever
+  // references it, so the module creates its obsproject.com compat updater
+  // unconditionally at load — live egress the two-gate egress policy never
+  // armed. The submodule is pin-frozen, so the host denies the updater
+  // instead: update_info_create() returns before any network activity when
+  // it cannot create its cache directory, and a file at the module's config
+  // path makes that mkdir fail deterministically. win-capture then reads
+  // only the shipped compatibility.json — the frozen-inventory posture.
+  std::optional<std::string> prepare_module_config_root() {
+#if defined(_WIN32)
+    const unsigned long pid = GetCurrentProcessId();
+#else
+    const unsigned long pid = static_cast<unsigned long>(getpid());
+#endif
+    std::error_code ec;
+    std::filesystem::path root = std::filesystem::temp_directory_path(ec);
+    if (ec) {
+      return std::nullopt;
+    }
+    root /= "streammate-studio-host";
+    root /= "obs-module-config-" + std::to_string(pid);
+    std::filesystem::remove_all(root, ec);
+    ec.clear();
+    std::filesystem::create_directories(root, ec);
+    if (ec) {
+      return std::nullopt;
+    }
+#if defined(_WIN32)
+    std::ofstream sentinel(root / "win-capture");
+    if (!sentinel) {
+      return std::nullopt;
+    }
+    sentinel.close();
+    if (!std::filesystem::is_regular_file(root / "win-capture", ec)) {
+      return std::nullopt;
+    }
+#endif
+    module_config_root_ = root;
+    return root.generic_string();
+  }
+
+  std::filesystem::path module_config_root_;
+
   static std::optional<std::filesystem::path> executable_path() {
 #if defined(__APPLE__)
     uint32_t size = PATH_MAX;
