@@ -65,6 +65,25 @@ class WindowsPackagingTest(unittest.TestCase):
         libobs_data = inputs / "libobs-data"
         self.write_fixture(libobs_data / "default.effect")
         self.write_fixture(libobs_data / "format_conversion.effect")
+        browser_plugin = self.write_fixture(inputs / "browser" / "obs-browser.dll")
+        browser_page = self.write_fixture(inputs / "browser" / "obs-browser-page.exe")
+        frontend_api = self.write_fixture(inputs / "frontend" / "obs-frontend-api.dll")
+        cef_release = inputs / "cef" / "Release"
+        for name in (
+            "libcef.dll", "chrome_elf.dll", "libEGL.dll", "libGLESv2.dll",
+            "v8_context_snapshot.bin",
+        ):
+            self.write_fixture(cef_release / name)
+        cef_resources = inputs / "cef" / "Resources"
+        for name in (
+            "chrome_100_percent.pak", "chrome_200_percent.pak", "icudtl.dat",
+            "resources.pak",
+        ):
+            self.write_fixture(cef_resources / name)
+        self.write_fixture(cef_resources / "locales" / "en-US.pak")
+        self.write_fixture(cef_resources / "not-staged.txt")
+        browser_data = inputs / "browser-data"
+        self.write_fixture(browser_data / "locale" / "en-US.ini")
         return {
             "host": host,
             "smoke": smoke,
@@ -74,10 +93,16 @@ class WindowsPackagingTest(unittest.TestCase):
             "modules": modules,
             "streammate": streammate,
             "libobs_data": libobs_data,
+            "browser_plugin": browser_plugin,
+            "browser_page": browser_page,
+            "frontend_api": frontend_api,
+            "cef_release": cef_release,
+            "cef_resources": cef_resources,
+            "browser_data": browser_data,
         }
 
     def package(self, inputs: dict[str, Path], output: Path,
-                extra: list[str] | None = None) -> subprocess.CompletedProcess[str]:
+                extra: list[str] | None = None, include_cef: bool = True) -> subprocess.CompletedProcess[str]:
         args = [
             bash_command(), PACKAGE_SCRIPT.as_posix(),
             "--host-bin", inputs["host"].as_posix(),
@@ -88,8 +113,17 @@ class WindowsPackagingTest(unittest.TestCase):
             "--obs-modules-dir", inputs["modules"].as_posix(),
             "--streammate-plugin", inputs["streammate"].as_posix(),
             "--libobs-data-dir", inputs["libobs_data"].as_posix(),
-            "--output-dir", output.as_posix(),
         ]
+        if include_cef:
+            args.extend([
+                "--obs-browser-plugin", inputs["browser_plugin"].as_posix(),
+                "--obs-browser-page", inputs["browser_page"].as_posix(),
+                "--cef-release-dir", inputs["cef_release"].as_posix(),
+                "--cef-resources-dir", inputs["cef_resources"].as_posix(),
+                "--obs-frontend-api", inputs["frontend_api"].as_posix(),
+                "--obs-browser-data-dir", inputs["browser_data"].as_posix(),
+            ])
+        args.extend(["--output-dir", output.as_posix()])
         if extra:
             args.extend(extra)
         return subprocess.run(
@@ -108,6 +142,7 @@ class WindowsPackagingTest(unittest.TestCase):
             for name in (
                 "studio-host.exe", "studio-host-smoke.exe", "obs.dll",
                 "w32-pthreads.dll", "libcrypto-3-x64.dll", "libobs-d3d11.dll",
+                "obs-frontend-api.dll",
             ):
                 self.assertTrue((stage / name).is_file(), name)
             self.assertFalse((stage / "not-a-runtime.txt").exists())
@@ -115,12 +150,24 @@ class WindowsPackagingTest(unittest.TestCase):
             plugins = stage / "obs-plugins" / "64bit"
             for module in (*REQUIRED_MODULES, "obs-ffmpeg", "streammate-native-overlay"):
                 self.assertTrue((plugins / f"{module}.dll").is_file(), module)
+            for name in (
+                "obs-browser.dll", "obs-browser-page.exe", "libcef.dll",
+                "chrome_elf.dll", "libEGL.dll", "libGLESv2.dll",
+                "v8_context_snapshot.bin", "chrome_100_percent.pak",
+                "chrome_200_percent.pak", "icudtl.dat", "resources.pak",
+            ):
+                self.assertTrue((plugins / name).is_file(), name)
+            self.assertTrue((plugins / "locales" / "en-US.pak").is_file())
+            self.assertFalse((plugins / "not-staged.txt").exists())
             for module in (*REQUIRED_MODULES, "obs-ffmpeg"):
                 self.assertTrue(
                     (stage / "data" / "obs-plugins" / module / "locale" / "en-US.ini").is_file(),
                     module,
                 )
             self.assertTrue((stage / "data" / "libobs" / "default.effect").is_file())
+            self.assertTrue(
+                (stage / "data" / "obs-plugins" / "obs-browser" / "locale" / "en-US.ini").is_file()
+            )
 
     def test_manifest_is_sorted_sha256sum_compatible_and_relative_to_archive_root(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -163,6 +210,11 @@ class WindowsPackagingTest(unittest.TestCase):
             self.assertIn("studio-host.exe", names)
             self.assertIn("obs.dll", names)
             self.assertIn("obs-plugins/64bit/streammate-native-overlay.dll", names)
+            self.assertIn("obs-plugins/64bit/obs-browser.dll", names)
+            self.assertIn("obs-plugins/64bit/libcef.dll", names)
+            self.assertIn("obs-plugins/64bit/locales/en-US.pak", names)
+            self.assertIn("data/obs-plugins/obs-browser/locale/en-US.ini", names)
+            self.assertIn("obs-frontend-api.dll", names)
             self.assertFalse(any(name.startswith("StreamMateStudioHost/") for name in names))
 
             self.assertEqual(
@@ -191,12 +243,55 @@ class WindowsPackagingTest(unittest.TestCase):
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("required obs module data win-wasapi", result.stdout.lower())
 
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            inputs = self.build_input_tree(root)
+            inputs["cef_resources"].joinpath("icudtl.dat").unlink()
+            result = self.package(inputs, root / "missing-cef-resource")
+            self.assertNotEqual(result.returncode, 0)
+            self.assertIn("cef resources payload icudtl.dat", result.stdout.lower())
+
+    def test_partial_cef_argument_groups_fail_closed(self) -> None:
+        cef_arguments = {
+            "--obs-browser-plugin": "browser_plugin",
+            "--obs-browser-page": "browser_page",
+            "--cef-release-dir": "cef_release",
+            "--cef-resources-dir": "cef_resources",
+            "--obs-frontend-api": "frontend_api",
+            "--obs-browser-data-dir": "browser_data",
+        }
+        for argument, input_key in cef_arguments.items():
+            with self.subTest(argument=argument), tempfile.TemporaryDirectory() as temp_dir:
+                root = Path(temp_dir)
+                inputs = self.build_input_tree(root)
+                result = self.package(
+                    inputs,
+                    root / "partial-cef",
+                    extra=[argument, inputs[input_key].as_posix()],
+                    include_cef=False,
+                )
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("is required", result.stdout.lower())
+
+    def test_cef_argument_group_is_optional_as_a_whole(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            inputs = self.build_input_tree(root)
+            output = root / "without-cef"
+            result = self.package(inputs, output, include_cef=False)
+            self.assertEqual(result.returncode, 0, result.stdout)
+            stage = output / "StreamMateStudioHost"
+            self.assertFalse((stage / "obs-frontend-api.dll").exists())
+            self.assertFalse((stage / "obs-plugins" / "64bit" / "obs-browser.dll").exists())
+
     def test_script_pins_all_arguments_and_deterministic_tools(self) -> None:
         script = PACKAGE_SCRIPT.read_text(encoding="utf-8")
         for argument in (
             "--host-bin", "--smoke-bin", "--obs-dll-dir", "--deps-bin-dir",
             "--graphics-module", "--obs-modules-dir", "--streammate-plugin",
-            "--libobs-data-dir", "--output-dir",
+            "--libobs-data-dir", "--obs-browser-plugin", "--obs-browser-page",
+            "--cef-release-dir", "--cef-resources-dir", "--obs-frontend-api",
+            "--obs-browser-data-dir", "--output-dir",
         ):
             self.assertIn(argument, script)
         self.assertIn("sha256sum", script)
