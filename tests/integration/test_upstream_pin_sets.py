@@ -22,9 +22,11 @@ the enforcement lane.
 
 from __future__ import annotations
 
+import json
 import os
 import re
 import subprocess
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -32,6 +34,9 @@ REPO = Path(__file__).resolve().parents[2]
 HOST_CPP = REPO / "src" / "studio_host.cpp"
 OBS_TREE = REPO / "external" / "obs-studio"
 OBS_PIN = REPO / "OBS_PIN"
+DEPS_PIN = REPO / "DEPS_PIN"
+VERIFY_DEPS_PIN = REPO / "scripts" / "verify-deps-pin.sh"
+OBS_PRESETS = OBS_TREE / "CMakePresets.json"
 
 # Set-accessor functions in studio_host.cpp whose ids must all exist in the
 # pinned obs-studio tree.
@@ -120,6 +125,61 @@ def extract_set(function_name: str) -> list[str]:
 
 def obs_tree_present() -> bool:
     return (OBS_TREE / "libobs").is_dir() and (OBS_TREE / "plugins").is_dir()
+
+
+def read_pin(path: Path) -> dict[str, str]:
+    lines = path.read_text(encoding="utf-8").splitlines()
+    if any(line.count("=") != 1 for line in lines):
+        raise AssertionError(f"malformed pin line in {path}")
+    return dict(line.split("=", 1) for line in lines)
+
+
+class DependencyPinTest(unittest.TestCase):
+    def test_deps_pin_has_exactly_three_well_formed_keys(self) -> None:
+        pin = read_pin(DEPS_PIN)
+        self.assertEqual(list(pin), ["prebuilt", "qt6", "cef"])
+        self.assertRegex(pin["prebuilt"], r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
+        self.assertRegex(pin["qt6"], r"^[0-9]{4}-[0-9]{2}-[0-9]{2}$")
+        self.assertRegex(pin["cef"], r"^[0-9]+$")
+
+    def test_deps_pin_matches_pinned_obs_presets_when_present(self) -> None:
+        if not OBS_PRESETS.is_file():
+            if os.environ.get("STREAMMATE_REQUIRE_OBS_TREE") == "1":
+                self.fail(
+                    "STREAMMATE_REQUIRE_OBS_TREE=1 but external/obs-studio/CMakePresets.json "
+                    "is absent; dependency pin drift cannot be verified"
+                )
+            self.skipTest(
+                "external/obs-studio/CMakePresets.json absent; dependency pin drift not verified locally"
+            )
+        presets = json.loads(OBS_PRESETS.read_text(encoding="utf-8"))
+        dependency_preset = next(
+            preset for preset in presets["configurePresets"] if preset["name"] == "dependencies"
+        )
+        dependencies = dependency_preset["vendor"]["obsproject.com/obs-studio"]["dependencies"]
+        actual = {name: dependencies[name]["version"] for name in ("prebuilt", "qt6", "cef")}
+        self.assertEqual(actual, read_pin(DEPS_PIN))
+
+    def test_verify_script_loudly_skips_an_absent_submodule(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            fixture = Path(temp_dir)
+            scripts = fixture / "scripts"
+            scripts.mkdir()
+            (fixture / "external" / "obs-studio").mkdir(parents=True)
+            (fixture / "DEPS_PIN").write_text(DEPS_PIN.read_text(encoding="utf-8"), encoding="utf-8")
+            script = scripts / "verify-deps-pin.sh"
+            script.write_text(VERIFY_DEPS_PIN.read_text(encoding="utf-8"), encoding="utf-8")
+            result = subprocess.run(
+                ["bash", str(script)],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            output = result.stdout + result.stderr
+            self.assertIn("SKIP:", output)
+            self.assertIn("not populated", output)
+            self.assertIn("not verified", output)
 
 
 def obs_tree_source_files() -> list[tuple[str, str]]:

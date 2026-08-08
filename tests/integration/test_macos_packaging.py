@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import json
 import os
 import plistlib
 import re
@@ -15,12 +16,18 @@ PACKAGE_SCRIPT = REPO_ROOT / "packaging" / "macos" / "package-app.sh"
 INFO_PLIST = REPO_ROOT / "packaging" / "macos" / "Info.plist"
 README = REPO_ROOT / "README.md"
 CI_NOTES = REPO_ROOT / "docs" / "ci-notes.md"
+NOTICES = REPO_ROOT / "docs" / "THIRD-PARTY-NOTICES.md"
+SOURCE_REVISION = "0123456789abcdef0123456789abcdef01234567"
 
 OUTER_IDENTIFIER = "com.streammate.studio-host"
 VENDORED_PREFIX = "com.streammate.studio-host.vendored."
 NESTED_PLUGINS = ["mac-avcapture", "mac-capture", "obs-outputs", "obs-x264"]
 
 CODESIGN_AVAILABLE = sys.platform == "darwin" and shutil.which("codesign") is not None
+
+
+def read_pin(path: Path) -> dict[str, str]:
+    return dict(line.split("=", 1) for line in path.read_text(encoding="utf-8").splitlines())
 
 
 class MacosPackagingTest(unittest.TestCase):
@@ -103,6 +110,7 @@ class MacosPackagingTest(unittest.TestCase):
             "--obs-modules-dir", str(inputs["modules_dir"]),
             "--obs-deps-lib-dir", str(inputs["deps_dir"]),
             "--obs-graphics-module", str(inputs["graphics_module"]),
+            "--source-revision", SOURCE_REVISION,
             "--output-dir", str(output_dir),
             "--skip-install-name-tool",
         ]
@@ -181,6 +189,8 @@ class MacosPackagingTest(unittest.TestCase):
             manifest_text = manifest.read_text(encoding="utf-8")
             self.assertIn("./StreamMateStudioHost.app/Contents/Frameworks/libobs.framework/Versions/A/libobs", manifest_text)
             self.assertIn("./StreamMateStudioHost.app/Contents/Frameworks/libobs-opengl.dylib", manifest_text)
+            self.assertIn("./THIRD-PARTY-NOTICES.md", manifest_text)
+            self.assertIn("./PAYLOAD-PROVENANCE.json", manifest_text)
             self.assertNotIn(str(temp_root), manifest_text)
             verify = subprocess.run(
                 ["shasum", "-a", "256", "-c", "sha256-manifest.txt"],
@@ -191,6 +201,46 @@ class MacosPackagingTest(unittest.TestCase):
                 check=False,
             )
             self.assertEqual(verify.returncode, 0, verify.stdout)
+
+            payload_root = temp_root / "dist"
+            self.assertEqual(
+                (payload_root / "THIRD-PARTY-NOTICES.md").read_bytes(),
+                NOTICES.read_bytes(),
+            )
+            provenance_path = payload_root / "PAYLOAD-PROVENANCE.json"
+            provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+            obs_pin = read_pin(REPO_ROOT / "OBS_PIN")
+            deps_pin = read_pin(REPO_ROOT / "DEPS_PIN")
+            self.assertEqual(
+                list(provenance),
+                ["provenanceVersion", "component", "repository", "revision", "obsStudio", "obsDeps", "notices"],
+            )
+            self.assertEqual(list(provenance["obsStudio"]), ["tag", "commit", "upstream"])
+            self.assertEqual(list(provenance["obsDeps"]), ["prebuilt", "qt6", "cef"])
+            self.assertEqual(provenance, {
+                "provenanceVersion": 1,
+                "component": "streammate-studio-host",
+                "repository": "https://github.com/bidaidev-creator/streammate-studio-host",
+                "revision": SOURCE_REVISION,
+                "obsStudio": obs_pin,
+                "obsDeps": deps_pin,
+                "notices": "THIRD-PARTY-NOTICES.md",
+            })
+            self.assertTrue(provenance_path.read_bytes().endswith(b"\n"))
+
+    def test_source_revision_is_required_and_must_be_40_hex(self) -> None:
+        for args in ([], ["--source-revision", "not-a-commit"]):
+            with self.subTest(args=args):
+                result = subprocess.run(
+                    [str(PACKAGE_SCRIPT), *args],
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    check=False,
+                )
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("--source-revision", result.stdout)
+                self.assertIn("40-hex", result.stdout)
 
     def make_streammate_plugin(self, root: Path, name: str = "streammate-native-overlay") -> Path:
         # A minimal CFBundle .plugin layout matching what the CMake MODULE

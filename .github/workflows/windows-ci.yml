@@ -35,7 +35,9 @@ jobs:
 
       - name: Verify upstream pin and fork guard
         shell: bash
-        run: bash scripts/fork-guard.sh
+        run: |
+          bash scripts/fork-guard.sh
+          bash scripts/verify-deps-pin.sh
 
       - name: Configure scaffold smoke without libobs
         run: cmake -S . -B build/scaffold -G Ninja -DSTREAMMATE_REQUIRE_LIBOBS=OFF
@@ -84,7 +86,9 @@ jobs:
 
       - name: Verify upstream pin and fork guard
         shell: bash
-        run: bash scripts/fork-guard.sh
+        run: |
+          bash scripts/fork-guard.sh
+          bash scripts/verify-deps-pin.sh
 
       - name: Fetch OBS version tag metadata for upstream CMake
         shell: bash
@@ -327,6 +331,7 @@ jobs:
             --obs-frontend-api "${{ steps.libobs.outputs.frontend_api }}" \
             --obs-browser-data-dir "${{ steps.libobs.outputs.browser_data_dir }}" \
             --qt-bin-dir "${{ steps.libobs.outputs.qt_bin_dir }}" \
+            --source-revision "$GITHUB_SHA" \
             --output-dir dist
 
       - name: Verify packaged smoke and checksum manifest without PATH augmentation
@@ -394,6 +399,7 @@ jobs:
             --obs-frontend-api "${{ steps.libobs.outputs.frontend_api }}" \
             --obs-browser-data-dir "${{ steps.libobs.outputs.browser_data_dir }}" \
             --qt-bin-dir "${{ steps.libobs.outputs.qt_bin_dir }}" \
+            --source-revision "$GITHUB_SHA" \
             --output-dir dist-repack
           diff dist/sha256-manifest.txt dist-repack/sha256-manifest.txt
           cmp dist/StreamMateStudioHost-windows-x64.tar.gz \

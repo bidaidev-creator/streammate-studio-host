@@ -33,6 +33,7 @@ jobs:
         run: |
           chmod +x scripts/*.sh packaging/macos/package-app.sh
           ./scripts/fork-guard.sh
+          ./scripts/verify-deps-pin.sh
 
       - name: Configure scaffold smoke without libobs
         run: cmake -S . -B build/scaffold -G Ninja -DSTREAMMATE_REQUIRE_LIBOBS=OFF
@@ -245,6 +246,7 @@ jobs:
             --cef-helpers-dir "${{ steps.libobs.outputs.cef_helpers_dir }}" \
             --qt-lib-dir "${{ steps.libobs.outputs.qt_lib_dir }}" \
             --qt-platform-plugin "${{ steps.libobs.outputs.qt_platform_plugin }}" \
+            --source-revision "$GITHUB_SHA" \
             --output-dir dist
 
       - name: Verify relocatable app artifact from scratch copy
@@ -355,6 +357,7 @@ jobs:
             --cef-helpers-dir "${{ steps.libobs.outputs.cef_helpers_dir }}" \
             --qt-lib-dir "${{ steps.libobs.outputs.qt_lib_dir }}" \
             --qt-platform-plugin "${{ steps.libobs.outputs.qt_platform_plugin }}" \
+            --source-revision "$GITHUB_SHA" \
             --output-dir dist-repack
           # Ad-hoc signatures are content-derived, so a second packaging of the
           # same build tree must produce byte-identical manifests.
@@ -376,7 +379,7 @@ jobs:
       # Current links. The tarball is the form that survives download intact —
       # and is also the shape an npm-package extraction would consume.
       - name: Tar app bundle for symlink-preserving download
-        run: tar -C dist -czf dist/StreamMateStudioHost.app.tar.gz StreamMateStudioHost.app sha256-manifest.txt
+        run: tar -C dist -czf dist/StreamMateStudioHost.app.tar.gz StreamMateStudioHost.app sha256-manifest.txt THIRD-PARTY-NOTICES.md PAYLOAD-PROVENANCE.json
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

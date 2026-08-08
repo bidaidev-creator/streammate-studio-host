@@ -7,6 +7,15 @@ WORKFLOW = REPO_ROOT / ".github" / "workflows" / "macos-ci.yml"
 
 
 class MacosCiWorkflowTest(unittest.TestCase):
+    def test_dependency_pin_guard_and_payload_revision_are_wired(self) -> None:
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        self.assertIn("./scripts/verify-deps-pin.sh", workflow)
+        self.assertEqual(workflow.count('--source-revision "$GITHUB_SHA"'), 2)
+        self.assertIn(
+            "StreamMateStudioHost.app sha256-manifest.txt THIRD-PARTY-NOTICES.md PAYLOAD-PROVENANCE.json",
+            workflow,
+        )
+
     def test_obs_configure_keeps_xcode_16_deprecation_warnings_non_fatal(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
         start = workflow.index("      - name: Configure upstream OBS without Qt frontend")
