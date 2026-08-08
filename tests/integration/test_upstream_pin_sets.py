@@ -26,9 +26,30 @@ import json
 import os
 import re
 import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
+
+
+def bash_command() -> str:
+    """A REAL bash for running the verify script.
+
+    On Windows a bare "bash" from a non-Actions-step process resolves through
+    the system PATH to the System32 WSL stub (which dies with "no installed
+    distributions" when WSL has no distro); Git-Bash's bin directory is not on
+    the system PATH. Prefer the Git for Windows bash explicitly.
+    """
+    if sys.platform != "win32":
+        return "bash"
+    for env_var in ("ProgramFiles", "ProgramFiles(x86)"):
+        base = os.environ.get(env_var)
+        if not base:
+            continue
+        candidate = Path(base) / "Git" / "bin" / "bash.exe"
+        if candidate.is_file():
+            return str(candidate)
+    return "bash"
 
 REPO = Path(__file__).resolve().parents[2]
 HOST_CPP = REPO / "src" / "studio_host.cpp"
@@ -170,7 +191,7 @@ class DependencyPinTest(unittest.TestCase):
             script = scripts / "verify-deps-pin.sh"
             script.write_text(VERIFY_DEPS_PIN.read_text(encoding="utf-8"), encoding="utf-8")
             result = subprocess.run(
-                ["bash", str(script)],
+                [bash_command(), str(script)],
                 capture_output=True,
                 text=True,
                 check=False,
