@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import hashlib
+import json
 import os
 import re
 import subprocess
@@ -11,6 +12,12 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PACKAGE_SCRIPT = REPO_ROOT / "packaging" / "windows" / "package-dist.sh"
+NOTICES = REPO_ROOT / "docs" / "THIRD-PARTY-NOTICES.md"
+SOURCE_REVISION = "0123456789abcdef0123456789abcdef01234567"
+
+
+def read_pin(path: Path) -> dict[str, str]:
+    return dict(line.split("=", 1) for line in path.read_text(encoding="utf-8").splitlines())
 
 
 def bash_command() -> str:
@@ -118,6 +125,7 @@ class WindowsPackagingTest(unittest.TestCase):
             "--obs-modules-dir", inputs["modules"].as_posix(),
             "--streammate-plugin", inputs["streammate"].as_posix(),
             "--libobs-data-dir", inputs["libobs_data"].as_posix(),
+            "--source-revision", SOURCE_REVISION,
         ]
         if include_cef:
             args.extend([
@@ -177,6 +185,31 @@ class WindowsPackagingTest(unittest.TestCase):
             self.assertTrue(
                 (stage / "data" / "obs-plugins" / "obs-browser" / "locale" / "en-US.ini").is_file()
             )
+            self.assertEqual(
+                (stage / "THIRD-PARTY-NOTICES.md").read_bytes(),
+                NOTICES.read_bytes(),
+            )
+            provenance_path = stage / "PAYLOAD-PROVENANCE.json"
+            self.assertTrue(provenance_path.is_file())
+            provenance = json.loads(provenance_path.read_text(encoding="utf-8"))
+            obs_pin = read_pin(REPO_ROOT / "OBS_PIN")
+            deps_pin = read_pin(REPO_ROOT / "DEPS_PIN")
+            self.assertEqual(
+                list(provenance),
+                ["provenanceVersion", "component", "repository", "revision", "obsStudio", "obsDeps", "notices"],
+            )
+            self.assertEqual(list(provenance["obsStudio"]), ["tag", "commit", "upstream"])
+            self.assertEqual(list(provenance["obsDeps"]), ["prebuilt", "qt6", "cef"])
+            self.assertEqual(provenance, {
+                "provenanceVersion": 1,
+                "component": "streammate-studio-host",
+                "repository": "https://github.com/bidaidev-creator/streammate-studio-host",
+                "revision": SOURCE_REVISION,
+                "obsStudio": obs_pin,
+                "obsDeps": deps_pin,
+                "notices": "THIRD-PARTY-NOTICES.md",
+            })
+            self.assertTrue(provenance_path.read_bytes().endswith(b"\n"))
 
     def test_manifest_is_sorted_sha256sum_compatible_and_relative_to_archive_root(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -199,6 +232,9 @@ class WindowsPackagingTest(unittest.TestCase):
                 for form in {str(root), str(root).replace(chr(92), '/')}:
                     self.assertNotIn(form, line)
                 self.assertNotIn("StreamMateStudioHost/", relative)
+            manifested_paths = {line.split("  ", 1)[1] for line in lines}
+            self.assertIn("./THIRD-PARTY-NOTICES.md", manifested_paths)
+            self.assertIn("./PAYLOAD-PROVENANCE.json", manifested_paths)
 
     def test_tarball_has_bare_files_at_archive_root_and_is_repack_deterministic(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -225,6 +261,8 @@ class WindowsPackagingTest(unittest.TestCase):
             self.assertIn("obs-plugins/64bit/Qt6Widgets.dll", names)
             self.assertIn("data/obs-plugins/obs-browser/locale/en-US.ini", names)
             self.assertIn("obs-frontend-api.dll", names)
+            self.assertIn("THIRD-PARTY-NOTICES.md", names)
+            self.assertIn("PAYLOAD-PROVENANCE.json", names)
             self.assertFalse(any(name.startswith("StreamMateStudioHost/") for name in names))
 
             self.assertEqual(
@@ -260,6 +298,20 @@ class WindowsPackagingTest(unittest.TestCase):
             result = self.package(inputs, root / "missing-cef-resource")
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("cef resources payload icudtl.dat", result.stdout.lower())
+
+    def test_source_revision_is_required_and_must_be_40_hex(self) -> None:
+        for args in ([], ["--source-revision", "not-a-commit"]):
+            with self.subTest(args=args):
+                result = subprocess.run(
+                    [bash_command(), PACKAGE_SCRIPT.as_posix(), *args],
+                    text=True,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    check=False,
+                )
+                self.assertNotEqual(result.returncode, 0, result.stdout)
+                self.assertIn("--source-revision", result.stdout)
+                self.assertIn("40-hex", result.stdout)
 
     def test_partial_cef_argument_groups_fail_closed(self) -> None:
         cef_arguments = {
@@ -340,6 +392,7 @@ class WindowsPackagingTest(unittest.TestCase):
                  "--obs-modules-dir", inputs["modules"].as_posix(),
                  "--streammate-plugin", inputs["streammate"].as_posix(),
                  "--libobs-data-dir", inputs["libobs_data"].as_posix(),
+                 "--source-revision", SOURCE_REVISION,
                  "--output-dir", (root / "broken-grep").as_posix()],
                 text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
                 check=False, env=env,
@@ -354,7 +407,7 @@ class WindowsPackagingTest(unittest.TestCase):
             "--graphics-module", "--obs-modules-dir", "--streammate-plugin",
             "--libobs-data-dir", "--obs-browser-plugin", "--obs-browser-page",
             "--cef-release-dir", "--cef-resources-dir", "--obs-frontend-api",
-            "--obs-browser-data-dir", "--qt-bin-dir", "--output-dir",
+            "--obs-browser-data-dir", "--qt-bin-dir", "--source-revision", "--output-dir",
         ):
             self.assertIn(argument, script)
         self.assertIn("sha256sum", script)

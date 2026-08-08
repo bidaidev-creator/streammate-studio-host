@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$(cd "$script_dir/../.." && pwd)"
+
 host_bin=""
 smoke_bin=""
 info_plist=""
@@ -16,6 +19,7 @@ cef_helpers_dir=""
 qt_lib_dir=""
 qt_platform_plugin=""
 output_dir="dist"
+source_revision=""
 skip_codesign=0
 skip_install_name_tool=0
 
@@ -27,6 +31,7 @@ usage: package-app.sh --host-bin PATH --smoke-bin PATH --info-plist PATH \
   [--streammate-plugin PATH] \
   [--obs-browser-plugin PATH --obs-frontend-api PATH --cef-framework PATH \
    --cef-helpers-dir PATH --qt-lib-dir PATH --qt-platform-plugin PATH] \
+  --source-revision SHA \
   [--output-dir PATH] [--skip-codesign] [--skip-install-name-tool]
 USAGE
 }
@@ -47,6 +52,7 @@ while [[ $# -gt 0 ]]; do
     --cef-helpers-dir) cef_helpers_dir="${2:-}"; shift 2 ;;
     --qt-lib-dir) qt_lib_dir="${2:-}"; shift 2 ;;
     --qt-platform-plugin) qt_platform_plugin="${2:-}"; shift 2 ;;
+    --source-revision) source_revision="${2:-}"; shift 2 ;;
     --output-dir) output_dir="${2:-}"; shift 2 ;;
     --skip-codesign) skip_codesign=1; shift ;;
     --skip-install-name-tool) skip_install_name_tool=1; shift ;;
@@ -72,6 +78,60 @@ require_dir() {
     exit 1
   fi
 }
+
+read_pin_value() {
+  local file="$1"
+  local key="$2"
+  local matches
+  matches="$(sed -n "s/^${key}=\([^[:space:]][^[:space:]]*\)$/\1/p" "$file")"
+  if [[ -z "$matches" || "$matches" == *$'\n'* ]]; then
+    echo "pin file must contain exactly one well-formed $key entry: $file" >&2
+    exit 1
+  fi
+  printf '%s' "$matches"
+}
+
+if [[ ! "$source_revision" =~ ^[0-9a-fA-F]{40}$ ]]; then
+  echo "--source-revision is required and must be a 40-hex commit SHA" >&2
+  exit 1
+fi
+
+obs_pin="$repo_root/OBS_PIN"
+deps_pin="$repo_root/DEPS_PIN"
+notices_source="$repo_root/docs/THIRD-PARTY-NOTICES.md"
+require_file "OBS pin" "$obs_pin"
+require_file "dependency pin" "$deps_pin"
+require_file "third-party notices" "$notices_source"
+
+while IFS= read -r line || [[ -n "$line" ]]; do
+  case "$line" in
+    tag=*|commit=*|upstream=*) ;;
+    *) echo "OBS_PIN contains an unknown or malformed entry: $line" >&2; exit 1 ;;
+  esac
+done < "$obs_pin"
+while IFS= read -r line || [[ -n "$line" ]]; do
+  case "$line" in
+    prebuilt=*|qt6=*|cef=*) ;;
+    *) echo "DEPS_PIN contains an unknown or malformed entry: $line" >&2; exit 1 ;;
+  esac
+done < "$deps_pin"
+
+obs_tag="$(read_pin_value "$obs_pin" tag)"
+obs_commit="$(read_pin_value "$obs_pin" commit)"
+obs_upstream="$(read_pin_value "$obs_pin" upstream)"
+deps_prebuilt="$(read_pin_value "$deps_pin" prebuilt)"
+deps_qt6="$(read_pin_value "$deps_pin" qt6)"
+deps_cef="$(read_pin_value "$deps_pin" cef)"
+
+if [[ ! "$obs_tag" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ||
+      ! "$obs_commit" =~ ^[0-9a-fA-F]{40}$ ||
+      ! "$obs_upstream" =~ ^https://[A-Za-z0-9./:_-]+$ ||
+      ! "$deps_prebuilt" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ||
+      ! "$deps_qt6" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ||
+      ! "$deps_cef" =~ ^[0-9]+$ ]]; then
+  echo "OBS_PIN or DEPS_PIN contains malformed values" >&2
+  exit 1
+fi
 
 require_file "studio-host binary" "$host_bin"
 require_file "studio-host-smoke binary" "$smoke_bin"
@@ -272,7 +332,11 @@ if [[ $skip_codesign -eq 0 ]]; then
   /usr/bin/codesign --force --sign - --identifier com.streammate.studio-host "$app"
 fi
 
-script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cp "$notices_source" "$output_dir/THIRD-PARTY-NOTICES.md"
+printf '{\n  "provenanceVersion": 1,\n  "component": "streammate-studio-host",\n  "repository": "https://github.com/bidaidev-creator/streammate-studio-host",\n  "revision": "%s",\n  "obsStudio": { "tag": "%s", "commit": "%s", "upstream": "%s" },\n  "obsDeps": { "prebuilt": "%s", "qt6": "%s", "cef": "%s" },\n  "notices": "THIRD-PARTY-NOTICES.md"\n}\n' \
+  "$source_revision" "$obs_tag" "$obs_commit" "$obs_upstream" \
+  "$deps_prebuilt" "$deps_qt6" "$deps_cef" \
+  > "$output_dir/PAYLOAD-PROVENANCE.json"
 "$script_dir/../../scripts/write-sha256-manifest.sh" "$output_dir"
 
 echo "packaged $app"

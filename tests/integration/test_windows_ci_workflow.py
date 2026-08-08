@@ -33,6 +33,7 @@ class WindowsCiWorkflowTest(unittest.TestCase):
     def test_scaffold_ladder_and_pin_guards_are_enforced(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
         self.assertIn("bash scripts/fork-guard.sh", workflow)
+        self.assertEqual(workflow.count("bash scripts/verify-deps-pin.sh"), 2)
         self.assertIn("-DSTREAMMATE_REQUIRE_LIBOBS=OFF", workflow)
         self.assertIn("studio-host-smoke.exe", workflow)
         self.assertIn("ctest --test-dir build/scaffold --output-on-failure", workflow)
@@ -118,7 +119,8 @@ class WindowsCiWorkflowTest(unittest.TestCase):
             "--graphics-module", "--obs-modules-dir", "--streammate-plugin",
             "--libobs-data-dir", "--obs-browser-plugin", "--obs-browser-page",
             "--cef-release-dir", "--cef-resources-dir", "--obs-frontend-api",
-            "--obs-browser-data-dir", "--qt-bin-dir", "--output-dir dist",
+            "--obs-browser-data-dir", "--qt-bin-dir", "--source-revision \"$GITHUB_SHA\"",
+            "--output-dir dist",
         ):
             self.assertIn(argument, workflow)
         self.assertIn("libobs_data_dir/default.effect", workflow)
@@ -147,6 +149,7 @@ class WindowsCiWorkflowTest(unittest.TestCase):
         self.assertIn("--output-dir dist-repack", workflow)
         self.assertIn("diff dist/sha256-manifest.txt dist-repack/sha256-manifest.txt", workflow)
         self.assertIn("cmp dist/StreamMateStudioHost-windows-x64.tar.gz", workflow)
+        self.assertEqual(workflow.count('--source-revision "$GITHUB_SHA"'), 2)
         self.assertIn("uses: actions/upload-artifact@v4", workflow)
         self.assertIn("name: streammate-studio-host-windows-x64", workflow)
         self.assertIn("dist/StreamMateStudioHost-windows-x64.tar.gz", workflow)
