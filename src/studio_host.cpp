@@ -1686,6 +1686,10 @@ bool receive_exact(socket_t fd, void *data, size_t len) {
   return true;
 }
 
+// PROTOTYPE streammate-pivot #11: every writer to a control socket takes this; the preview
+// worker / encoder threads interleave binary frames with RPC replies and heartbeats.
+std::mutex g_ws_send_mutex;
+
 bool send_text_frame(socket_t fd, const std::string &payload) {
   std::vector<uint8_t> frame;
   frame.push_back(0x81);
@@ -1705,6 +1709,7 @@ bool send_text_frame(socket_t fd, const std::string &payload) {
     }
   }
   frame.insert(frame.end(), payload.begin(), payload.end());
+  std::lock_guard<std::mutex> lock(g_ws_send_mutex);  // PROTOTYPE: interleaves with preview binary frames
   return send_all(fd, frame.data(), frame.size());
 }
 
@@ -1948,6 +1953,8 @@ std::optional<std::string> extract_json_object_body(const std::string &json, con
   }
   return std::nullopt;
 }
+
+#include "proto_preview.h"  // PROTOTYPE streammate-pivot #11 (needs the helpers above)
 
 std::optional<std::string> parse_json_string_token(const std::string &json, size_t &pos);
 void skip_json_whitespace(const std::string &json, size_t &pos);
@@ -3269,6 +3276,18 @@ private:
     return true;
   }
 
+public:
+  // PROTOTYPE streammate-pivot #11: snapshot targets.
+  obs_source_t *proto_obs_source(const std::string &id) const {
+    auto it = obs_sources_.find(id);
+    return it == obs_sources_.end() ? nullptr : it->second;
+  }
+  obs_source_t *proto_obs_scene_source(const std::string &id) const {
+    auto it = obs_scenes_.find(id);
+    return it == obs_scenes_.end() ? nullptr : obs_scene_get_source(it->second);
+  }
+
+private:
   std::map<std::string, obs_scene_t *> obs_scenes_;
   std::map<std::string, obs_source_t *> obs_sources_;
   std::map<std::string, obs_sceneitem_t *> obs_scene_items_;
@@ -7137,7 +7156,19 @@ private:
     auto key_it = headers.find("sec-websocket-key");
     auto auth_it = headers.find("authorization");
     std::string expected = "Bearer " + options_.token;
-    if (key_it == headers.end() || auth_it == headers.end() || auth_it->second != expected) {
+    // PROTOTYPE: browsers cannot set Authorization on a WebSocket upgrade; accept ?token= too.
+    std::string query_token;
+    {
+      std::string first_line = request.substr(0, request.find("\r\n"));
+      size_t q = first_line.find("token=");
+      if (q != std::string::npos) {
+        size_t end = first_line.find_first_of(" &", q);
+        query_token = first_line.substr(q + 6, end == std::string::npos ? std::string::npos : end - q - 6);
+      }
+    }
+    const bool header_ok = auth_it != headers.end() && auth_it->second == expected;
+    const bool query_ok = !query_token.empty() && query_token == options_.token;
+    if (key_it == headers.end() || !(header_ok || query_ok)) {
       std::string response = "HTTP/1.1 401 Unauthorized\r\nConnection: close\r\nContent-Length: 0\r\n\r\n";
       send_all(fd, reinterpret_cast<const uint8_t *>(response.data()), response.size());
       emit_log("warn", "auth.rejected", "websocket authorization rejected");
@@ -7317,6 +7348,34 @@ private:
     add("program.captureFrame", [this](socket_t fd, const std::string &id, const std::string &payload) {
       send_renderer_result(fd, id, renderer_.capture_program_frame(payload));
     });
+#if STREAMMATE_HAS_LIBOBS
+    // PROTOTYPE streammate-pivot #11 — preview feed verbs. Throwaway.
+    add("preview.start", [this](socket_t fd, const std::string &id, const std::string &payload) {
+      send_renderer_result(fd, id, proto_preview::Feed::instance().start(fd, payload));
+    });
+    add("preview.stop", [this](socket_t fd, const std::string &id, const std::string &) {
+      send_renderer_result(fd, id, proto_preview::Feed::instance().stop());
+    });
+    add("preview.stats", [this](socket_t fd, const std::string &id, const std::string &) {
+      send_renderer_result(fd, id, proto_preview::Feed::instance().stats());
+    });
+    add("preview.snapshot", [this](socket_t fd, const std::string &id, const std::string &payload) {
+      std::string source_id = extract_json_string(payload, "sourceId");
+      std::string scene_id = extract_json_string(payload, "sceneId");
+      obs_source_t *target = nullptr;
+      const char *kind = "program";
+      if (!source_id.empty()) {
+        target = renderer_.proto_obs_source(source_id);
+        kind = "source";
+        if (!target) return send_renderer_result(fd, id, proto_preview::err(-32602, "source not found"));
+      } else if (!scene_id.empty()) {
+        target = renderer_.proto_obs_scene_source(scene_id);
+        kind = "scene";
+        if (!target) return send_renderer_result(fd, id, proto_preview::err(-32602, "scene not found"));
+      }
+      send_renderer_result(fd, id, proto_preview::Feed::instance().snapshot(payload, target, kind));
+    });
+#endif
     add("program.captureAudio", [this](socket_t fd, const std::string &id, const std::string &payload) {
       send_renderer_result(fd, id, renderer_.capture_program_audio(payload));
     });
