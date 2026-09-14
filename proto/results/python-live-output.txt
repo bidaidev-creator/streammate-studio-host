@@ -1,0 +1,35 @@
+idle, no output, no preview: host cpu 6.4%
+configure {"ok": true, "outputId": "rtmp-main", "configured": true, "encoder": {"requested": "videotoolbox_h264", "actual": "videotoolbox_h264", "fallback": false}, "audio": {"requested": "aac", "actual": "aac-scaffold"}, "endpoint": {"scheme": "rtmp", "host": "127.0.0.1", "port": 19350, "path": "<redacted>"}
+start {"ok": true, "outputId": "rtmp-main", "configured": true, "running": true, "endpoint": {"scheme": "rtmp", "host": "127.0.0.1", "port": 19350, "path": "<redacted>"}, "encoder": {"requested": "videotoolbox_h264", "actual": "com.apple.videotoolbox.videoencoder.ave.avc", "fallback": true}, "audio": {"re
+status {"outputId": "rtmp-main", "configured": true, "running": true, "endpoint": {"scheme": "rtmp", "host": "127.0.0.1", "port": 19350, "path": "<redacted>"}, "encoder": {"requested": "videotoolbox_h264", "actual": "com.apple.videotoolbox.videoencoder.ave.avc", "fallback": true}, "audio": {"requested": "aac", "actual": "CoreAudio_AAC"}, "streamKeyStatus": "memory-only-redacted", "panicMute": {"hostAudio
+live output, no preview: host cpu 11.0%
+live + preview jpeg 1280x720: fps=29.7 hostCpu=19.0% avgEncodeUs=2629 avgObsDelayUs=40401 droppedBusy=2 lat p50=3 p95=5
+live + preview jpeg 640x360: fps=30.2 hostCpu=18.2% avgEncodeUs=683 avgObsDelayUs=40201 droppedBusy=0 lat p50=1 p95=2
+live + preview h264 1280x720: fps=29.2 hostCpu=13.5% avgEncodeUs=0 avgObsDelayUs=0 droppedBusy=0 lat p50=0 p95=1
+live + preview h264 640x360: fps=30.0 hostCpu=20.5% avgEncodeUs=0 avgObsDelayUs=0 droppedBusy=0 lat p50=0 p95=1
+status after {"outputId": "rtmp-main", "configured": true, "running": true, "endpoint": {"scheme": "rtmp", "host": "127.0.0.1", "port": 19350, "path": "<redacted>"}, "encoder": {"requested": "videotoolbox_h264", "actual": "com.apple.videotoolbox.videoencoder.ave.avc", "fallback": true}, "audio": {"requested": "aac", "actual": "CoreAudio_AAC"}, "streamKeyStatus": "memory-only-redacted", "panicMute": {"hostAudio
+ffmpeg stderr: [h264 @ 0x757048a80] Increasing reorder buffer to 2
+[in#0/flv @ 0x757018000] Error during demuxing: Input/output error
+
+host log tail: 350/live...
+info: [rtmp stream: 'streammate-live-rtmp'] Connection to rtmp://127.0.0.1:19350/live (127.0.0.1) successful
+debug: Maximum interleaver batch size for 'streammate-live-rtmp' calculated to be 5 packets
+debug: output 'proto-preview-output' (streammate_proto_preview_output) created
+debug: Maximum interleaver batch size for 'proto-preview-output' calculated to be 2 packets
+info: Output 'proto-preview-output': stopping
+info: Output 'proto-preview-output': Total frames output: 175
+info: Output 'proto-preview-output': Total drawn frames: 175 (181 attempted)
+info: Output 'proto-preview-output': Number of lagged frames due to rendering lag/stalls: 6 (3.3%)
+debug: output 'proto-preview-output' destroyed
+debug: output 'proto-preview-output' (streammate_proto_preview_output) created
+debug: Maximum interleaver batch size for 'proto-preview-output' calculated to be 2 packets
+info: Output 'proto-preview-output': stopping
+info: Output 'proto-preview-output': Total frames output: 180
+info: Output 'proto-preview-output': Total drawn frames: 181
+debug: output 'proto-preview-output' destroyed
+debug: output 'streammate-live-rtmp' destroyed
+info: [rtmp stream: 'streammate-live-rtmp'] User stopped the stream
+info: Output 'streammate-live-rtmp': stopping
+info: Output 'streammate-live-rtmp': Total frames output: 985
+info: Output 'streammate-live-rtmp': Total drawn frames: 988 (995 attempted)
+info: Output 'streammate-live-rtmp': Number of lagged frames due to rendering lag/stalls: 7 (0.7%)

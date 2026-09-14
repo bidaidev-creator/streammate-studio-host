@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><title>Preview source B</title>
+<style>html,body{margin:0;width:1280px;height:720px;overflow:hidden;background:#491327}canvas{display:block}</style>
+<canvas width="1280" height="720"></canvas>
+<script>
+'use strict';
+const canvas=document.querySelector('canvas'), ctx=canvas.getContext('2d');
+let frame=0;
+function paint(t){
+  const now=Date.now(); frame++;
+  ctx.fillStyle='#491327';ctx.fillRect(0,0,1280,720);
+  ctx.strokeStyle='#ffb52e';ctx.globalAlpha=.2;
+  for(let x=0;x<1280;x+=80){ctx.beginPath();ctx.moveTo(x,0);ctx.lineTo(x,720);ctx.stroke();}
+  for(let y=0;y<720;y+=80){ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(1280,y);ctx.stroke();}
+  ctx.globalAlpha=1;ctx.fillStyle='#ffb52e';ctx.font='bold 200px monospace';ctx.fillText('B',50,205);
+  ctx.fillStyle='white';ctx.font='bold 76px monospace';ctx.fillText('Frame '+frame,260,145);
+  ctx.font='bold 72px monospace';ctx.fillText(String(now),55,335);
+  ctx.font='32px monospace';ctx.fillText('Date.now() ms · 1280 × 720 · source B',55,390);
+  const bounce=(v,span)=>{const p=v%(2*span);return p<=span?p:2*span-p;};
+  const x=55+bounce(t*.31,1170),y=470+bounce(t*.13,195);
+  ctx.fillStyle='#ffb52e';ctx.beginPath();ctx.arc(x,y,42,0,Math.PI*2);ctx.fill();
+  ctx.fillStyle='white';ctx.fillRect((frame%120)*1280/120,710,12,10);
+  requestAnimationFrame(paint);
+}
+requestAnimationFrame(paint);
+</script></html>

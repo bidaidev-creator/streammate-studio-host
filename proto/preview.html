@@ -1,0 +1,478 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Throwaway preview measurements</title>
+<style>
+body{background:#15181d;color:#ddd;font:14px system-ui;margin:16px}main{display:flex;gap:18px;align-items:flex-start}#video{width:100%;max-width:960px;background:#000}#view{flex:1;min-width:320px}aside{width:420px}input,select,button{background:#252b34;color:#eee;border:1px solid #647080;padding:5px;margin:3px}input[type=number]{width:85px}input[type=text]{width:115px}button{cursor:pointer}button:disabled{opacity:.4;cursor:default}fieldset{margin:8px 0;border:1px solid #49515c}pre{white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px}#log{height:260px;overflow:auto;background:#080b10;padding:8px}.thumbs{display:flex;gap:10px;flex-wrap:wrap}.thumbs img{display:block;background:#000;max-width:100%}.thumbs pre{max-width:320px}#results{overflow:auto}table{border-collapse:collapse;font:12px monospace;white-space:nowrap}td,th{padding:6px;border:1px solid #49515c}@media(max-width:950px){main{display:block}aside{width:auto}}
+</style>
+<h2>Preview feed measurement · throwaway</h2>
+<p>Keep this tab visible. CPU % uses one core = 100%. Start a feed, then stop it to save a row. Setup scenes and allow CEF a few seconds to paint before measuring.</p>
+<main><section id="view"><canvas id="video" width="1280" height="720"></canvas>
+<div class="thumbs"><div>Program<img id="thumb-program" width="320" height="180"><pre id="snap-program"></pre></div><div>web-a<img id="thumb-web-a" width="160" height="90"><pre id="snap-web-a"></pre></div><div>web-b<img id="thumb-web-b" width="160" height="90"><pre id="snap-web-b"></pre></div></div>
+</section><aside>
+<fieldset><legend>Connection</legend>
+<label>Port <input id="port" type="number" min="1" max="65535" placeholder="host port"></label>
+<label>Token <input id="token" type="text" value="protok"></label>
+<label>Host PID <input id="pid" type="number" min="1" placeholder="host PID"></label><br>
+<button id="direct">Connect direct</button><button id="relay">Connect via relay</button>
+<div id="connection">Disconnected</div></fieldset>
+<button id="setup" data-host>Setup scenes</button><button id="switch" data-host>Switch scene</button>
+<fieldset><legend>Feed</legend>
+<label>Codec <select id="codec"><option>jpeg</option><option>h264</option></select></label>
+<label>Size <select id="size"><option>1280x720</option><option>960x540</option><option>640x360</option></select></label>
+<label>Divisor <select id="divisor"><option>1</option><option>2</option><option>3</option></select></label>
+<label>JPEG quality <select id="quality"><option>50</option><option selected>75</option><option>90</option></select></label>
+<label>Pixfmt <select id="pixfmt"><option>i420</option><option>bgra</option></select></label>
+<label>H.264 kbps <select id="bitrate"><option>1000</option><option selected>2500</option><option>5000</option></select></label><br>
+<button id="start" data-host>Start feed</button><button id="stop" data-host>Stop feed</button>
+</fieldset>
+<label><input id="snapshots" type="checkbox" data-host>Snapshot loop</label>
+<button id="outputStart" data-host>Start fake output</button><button id="outputStop" data-host>Stop fake output</button><div id="outputState">Fake output: off</div>
+<label><input id="matrixOutput" type="checkbox">matrix with fake output on</label><br>
+<button id="matrix" data-host>Run matrix</button><button id="cancelMatrix" disabled>Cancel matrix</button>
+<pre id="live">No measurements yet.</pre>
+</aside></main>
+<button id="copy">Copy results table</button><div id="results"></div><pre id="log"></pre>
+<script>
+'use strict';
+const $ = id => document.getElementById(id);
+const canvas = $('video'), ctx = canvas.getContext('2d');
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+const logs = [], rows = [];
+function log(message) {
+  logs.push(new Date().toISOString() + ' ' + message);
+  if (logs.length > 700) logs.shift();
+  $('log').textContent = logs.join('\n'); $('log').scrollTop = $('log').scrollHeight;
+}
+function fmt(n, digits = 1) { return typeof n === 'number' && Number.isFinite(n) ? n.toFixed(digits) : 'n/a'; }
+function mean(a) { return a.length ? a.reduce((s, x) => s + x, 0) / a.length : null; }
+function percentile(a, p) { if (!a.length) return null; const sorted = [...a].sort((a,b) => a-b); return sorted[Math.max(0, Math.ceil(sorted.length * p) - 1)]; }
+function pair(a) { return fmt(percentile(a, .5)) + '/' + fmt(percentile(a, .95)); }
+function bucket() { return { received:0, shown:0, bytes:0, recv:[], paint:[], decode:[], displayDropped:0 }; }
+let socket, nextId = 1, transport = '', ready = false, busy = false, matrixRunning = false, cancelMatrix = false;
+let connectedPid = '';
+let program = 'A', fakeOutput = false, baseline = null, run = null, windowData = bucket(), windowAt = performance.now();
+let feedTransition = false;
+let pollTimer, pollPromise, previousCpu, latestHost = null, latestPs = null, switchMark = null, lastFrame = null;
+const requests = new Map();
+function controls() {
+  document.querySelectorAll('[data-host]').forEach(el => el.disabled = !ready || busy || matrixRunning);
+  $('direct').disabled = $('relay').disabled = busy || matrixRunning || !!run;
+  $('cancelMatrix').disabled = !matrixRunning;
+  // These can remain useful during a matrix; the output state itself stays fixed.
+  $('switch').disabled = $('snapshots').disabled = !ready || busy;
+  $('port').disabled = $('token').disabled = $('pid').disabled = busy || matrixRunning || !!run;
+}
+controls();
+async function action(fn) {
+  if (busy) return;
+  busy = true; controls();
+  try { await fn(); } catch (e) { log('ERROR ' + e.message); }
+  finally { busy = false; controls(); }
+}
+function rpc(method, params) {
+  if (!socket || socket.readyState !== WebSocket.OPEN) return Promise.reject(new Error('Not connected'));
+  const id = nextId++;
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => { requests.delete(id); reject(new Error(method + ' timed out after 15 s')); }, 15000);
+    requests.set(id, { resolve, reject, timeout, method });
+    const message = { jsonrpc:'2.0', id, method };
+    if (params !== undefined) message.params = params;
+    socket.send(JSON.stringify(message));
+  });
+}
+async function logged(method, params) { const result = await rpc(method, params); log(method + ' ' + JSON.stringify(result)); return result; }
+async function readCpu() {
+  if (!/^\d+$/.test(connectedPid) || +connectedPid < 1) return { cpu:null, helpersCpu:null, threads:[], errors:['Enter host PID before connecting for ps measurements'] };
+  try { const response = await fetch('/cpu?pid=' + encodeURIComponent(connectedPid), { cache:'no-store' }); return await response.json(); }
+  catch (e) { return {cpu:null, helpersCpu:null, threads:[], errors:[e.message]}; }
+}
+async function hostSample() {
+  const before = performance.now();
+  const stats = await rpc('preview.stats');
+  return {stats, at:(before + performance.now()) / 2};
+}
+function cpuPct(a, b) {
+  if (!a || !b || !Number.isFinite(a.stats.cpuTotalMs) || !Number.isFinite(b.stats.cpuTotalMs) || b.at <= a.at || b.stats.cpuTotalMs < a.stats.cpuTotalMs) return null;
+  return (b.stats.cpuTotalMs - a.stats.cpuTotalMs) / (b.at - a.at) * 100;
+}
+async function connect(mode) {
+  clearInterval(pollTimer);
+  if (pollPromise) await pollPromise;
+  ready = false;
+  if (socket && socket.readyState !== WebSocket.CLOSED) {
+    const old = socket;
+    await new Promise(resolve => { old.addEventListener('close', resolve, {once:true}); old.close(); });
+    // The relay closes its upstream on its browser close callback.
+    await sleep(150);
+  }
+  const port = +$('port').value;
+  if (!Number.isInteger(port) || port < 1 || port > 65535) throw new Error('Enter the host port');
+  connectedPid = $('pid').value;
+  transport = mode; baseline = null; previousCpu = null; $('snapshots').checked = false;
+  const url = mode === 'direct' ? new URL(`ws://127.0.0.1:${port}/control`) : new URL('ws://127.0.0.1:8787/relay');
+  url.searchParams.set('token', $('token').value);
+  if (mode === 'relay') url.searchParams.set('port', port);
+  const ws = socket = new WebSocket(url); ws.binaryType = 'arraybuffer';
+  ws.onmessage = event => {
+    const arrivedWall = Date.now(), arrived = performance.now();
+    if (typeof event.data !== 'string') {
+      try { receiveFrame(event.data, arrivedWall, arrived); } catch(e) { log('Binary frame error: ' + e.message); if (run) run.notes.add('binary frame error'); }
+      return;
+    }
+    try {
+      const message = JSON.parse(event.data);
+      if (Object.hasOwn(message, 'id') && requests.has(message.id)) {
+        const pending = requests.get(message.id); requests.delete(message.id); clearTimeout(pending.timeout);
+        if (message.error) pending.reject(new Error(pending.method + ': ' + JSON.stringify(message.error)));
+        else pending.resolve(message.result);
+      } else log('event ' + event.data);
+    } catch(e) { log('Message error: ' + e.message); }
+  };
+  ws.onclose = () => {
+    ready = false; clearInterval(pollTimer); $('snapshots').checked = false; cancelMatrix = true;
+    for (const pending of requests.values()) { clearTimeout(pending.timeout); pending.reject(new Error('Host disconnected')); } requests.clear();
+    if (run) { discardRender(); saveRun(null, performance.now(), 'disconnected; host stats incomplete'); }
+    $('connection').textContent = 'Disconnected'; controls(); log('Disconnected');
+  };
+  await new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => { ws.close(); reject(new Error('Connection timed out')); }, 8000);
+    ws.onopen = () => { clearTimeout(timeout); resolve(); };
+    ws.onerror = () => { clearTimeout(timeout); reject(new Error('WebSocket connection error')); };
+  });
+  await logged('host.hello', {version:'1'});
+  await logged('preview.stop');
+  discardRender();
+  $('connection').textContent = mode + ' · measuring 4 s baseline…';
+  log('Baseline: preview stopped; collecting 4 s CPU delta. Scene, snapshot and output setup affect baseline.');
+  const first = await hostSample();
+  const startAt = performance.now();
+  await readCpu();
+  await sleep(Math.max(0, startAt + 2000 - performance.now()));
+  const middle = await hostSample(); const psMiddle = await readCpu();
+  log('Baseline first window hostCPU=' + fmt(cpuPct(first, middle)) + '% ps=' + fmt(psMiddle.cpu));
+  await sleep(Math.max(0, startAt + 4000 - performance.now()));
+  const last = await hostSample(); latestPs = await readCpu();
+  baseline = cpuPct(first, last); previousCpu = last; latestHost = last.stats;
+  log('Baseline hostCPU=' + fmt(baseline) + '% ps=' + fmt(latestPs.cpu) + '% helpers=' + fmt(latestPs.helpersCpu) + '%');
+  if (latestPs.errors?.length) log('/cpu: ' + latestPs.errors.join('; '));
+  ready = true; windowAt = performance.now(); windowData = bucket();
+  $('connection').textContent = mode + ' connected · baseline ' + fmt(baseline) + '%';
+  pollTimer = setInterval(() => { if (!pollPromise && !feedTransition && ready) pollPromise = poll().catch(e => log('Poll: ' + e.message)).finally(() => { pollPromise = null; }); }, 2000);
+}
+
+function record(field, value) {
+  if (!run) return;
+  if (Array.isArray(run.data[field])) { run.data[field].push(value); windowData[field].push(value); }
+  else { run.data[field] += value; windowData[field] += value; }
+}
+function dropped(item) { if (item && !item.dropped && !item.painted && item.owner === run) { item.dropped = true; record('displayDropped', 1); } }
+let generation = 0, decoder = null, waitingKey = true, decodeMetadata = new Map();
+let jpegBusy = false, jpegInFlight = null, jpegPending = null, pendingPaint = null, raf = 0;
+function discardRender() {
+  generation++;
+  cancelAnimationFrame(raf); raf = 0;
+  dropped(jpegPending); jpegPending = null; dropped(jpegInFlight); jpegInFlight = null; jpegBusy = false;
+  if (pendingPaint) { dropped(pendingPaint.meta); pendingPaint.picture.close(); pendingPaint = null; }
+  for (const list of decodeMetadata.values()) for (const meta of list) dropped(meta);
+  decodeMetadata.clear();
+  if (decoder && decoder.state !== 'closed') decoder.close(); decoder = null; waitingKey = true;
+}
+function queuePaint(picture, meta) {
+  if (meta.owner !== run || meta.generation !== generation || meta.dropped) { picture.close(); return; }
+  if (pendingPaint) {
+    if (meta.arrived < pendingPaint.meta.arrived) { dropped(meta); picture.close(); return; }
+    dropped(pendingPaint.meta); pendingPaint.picture.close();
+  }
+  pendingPaint = {picture, meta};
+  if (!raf) raf = requestAnimationFrame(() => {
+    raf = 0;
+    const next = pendingPaint; pendingPaint = null;
+    if (!next) return;
+    const {picture, meta} = next;
+    try {
+      if (meta.owner !== run || meta.generation !== generation) return;
+      if (canvas.width !== meta.width || canvas.height !== meta.height) { canvas.width = meta.width; canvas.height = meta.height; }
+      ctx.drawImage(picture, 0, 0, canvas.width, canvas.height);
+      const paintLat = Date.now() - meta.wallMs;
+      meta.painted = true; record('shown', 1); record('paint', paintLat);
+    } catch(e) { dropped(meta); log('drawImage: ' + e.message); }
+    finally { picture.close(); }
+  });
+}
+async function decodeJpeg(meta) {
+  jpegBusy = true; jpegInFlight = meta;
+  const blob = new Blob([meta.payload], {type:'image/jpeg'});
+  const started = performance.now();
+  try {
+    const bitmap = await createImageBitmap(blob);
+    if (meta.generation !== generation || meta.owner !== run) { bitmap.close(); return; }
+    record('decode', performance.now() - started); queuePaint(bitmap, meta);
+  } catch(e) { if (meta.generation === generation) { dropped(meta); log('JPEG decode: ' + e.message); } }
+  finally {
+    if (meta.generation === generation) {
+      jpegBusy = false; jpegInFlight = null;
+      if (jpegPending) { const next = jpegPending; jpegPending = null; decodeJpeg(next); }
+    }
+  }
+}
+async function prepareDecoder() {
+  if (!window.VideoDecoder) throw new Error('WebCodecs VideoDecoder unavailable. Use a browser with H.264 WebCodecs support on localhost.');
+  let config;
+  for (const codec of ['avc1.4D401F', 'avc1.42E01F']) {
+    const candidate = {codec, avc:{format:'annexb'}, optimizeForLatency:true, hardwareAcceleration:'prefer-hardware'};
+    try { if ((await VideoDecoder.isConfigSupported(candidate)).supported) { config = candidate; break; } } catch(e) { log('Decoder support: ' + e.message); }
+  }
+  if (!config) throw new Error('Neither H.264 decoder configuration is supported');
+  const currentGeneration = generation;
+  decoder = new VideoDecoder({
+    output(frame) {
+      if (currentGeneration !== generation) { frame.close(); return; }
+      const list = decodeMetadata.get(frame.timestamp), meta = list?.shift();
+      if (list && !list.length) decodeMetadata.delete(frame.timestamp);
+      if (!meta) { frame.close(); log('Decoder output has no matching timestamp'); return; }
+      record('decode', performance.now() - meta.decodeAt); queuePaint(frame, meta);
+    },
+    error(e) {
+      if (currentGeneration !== generation) return;
+      log('Decoder ERROR: ' + e.message);
+      if (run) run.notes.add('decoder error');
+      for (const list of decodeMetadata.values()) for (const meta of list) dropped(meta);
+      decodeMetadata.clear();
+    }
+  });
+  decoder.configure(config); waitingKey = true;
+  log('Decoder configured ' + JSON.stringify(config));
+}
+function receiveFrame(buffer, arrivedWall, arrived) {
+  if (!run) return;
+  if (!(buffer instanceof ArrayBuffer) || buffer.byteLength < 32) { log('Invalid binary frame: short header'); return; }
+  const view = new DataView(buffer), kind = view.getUint8(1);
+  if (view.getUint8(0) !== 0x53 || ![1,2].includes(kind)) { log('Invalid binary magic/kind'); return; }
+  if ((kind === 1 ? 'jpeg' : 'h264') !== run.config.codec) { log('Ignoring packet of unexpected codec'); return; }
+  const meta = {owner:run, generation, arrived, seq:view.getUint32(4), wallMs:Number(view.getBigUint64(8)), frameTsNs:Number(view.getBigUint64(16)), width:view.getUint16(24), height:view.getUint16(26), encodeUs:view.getUint32(28), key:!!(view.getUint8(2)&1), payload:new Uint8Array(buffer,32)};
+  record('received', 1); record('bytes', meta.payload.byteLength); record('recv', arrivedWall - meta.wallMs);
+  if (switchMark) {
+    const before = switchMark.before;
+    log('Scene switch first packet after request: gap=' + (before ? fmt(arrived - before.arrived) : 'n/a') + ' ms; seq=' + (before ? before.seq : 'n/a') + '→' + meta.seq + '; skipped=' + (before ? ((meta.seq - before.seq) >>> 0) !== 1 : 'n/a') + '; request→arrival=' + fmt(arrived - switchMark.at) + ' ms. This is packet continuity, not proof the new scene is painted.');
+    switchMark = null;
+  }
+  lastFrame = {seq:meta.seq, arrived};
+  if (kind === 1) {
+    if (jpegBusy) { dropped(jpegPending); jpegPending = meta; }
+    else decodeJpeg(meta);
+  } else {
+    if (!decoder || decoder.state !== 'configured') { dropped(meta); return; }
+    if (waitingKey && !meta.key) { dropped(meta); return; }
+    waitingKey = false;
+    const timestamp = Math.round(meta.frameTsNs / 1000);
+    const chunk = new EncodedVideoChunk({type:meta.key?'key':'delta', timestamp, data:meta.payload});
+    // Release packet bytes after decode() copies them; retain only timing metadata.
+    meta.payload = null;
+    const list = decodeMetadata.get(timestamp) || []; list.push(meta); decodeMetadata.set(timestamp, list);
+    try { meta.decodeAt = performance.now(); decoder.decode(chunk); }
+    catch(e) { list.pop(); if (!list.length) decodeMetadata.delete(timestamp); dropped(meta); log('decode(): ' + e.message); }
+  }
+}
+
+async function poll() {
+  const owner = run;
+  const [sample, ps] = await Promise.all([hostSample(), readCpu()]);
+  if (owner !== run) return;
+  latestHost = sample.stats; latestPs = ps;
+  const hostCpu = cpuPct(previousCpu, sample);
+  const busyDelta = previousCpu ? Math.max(0, sample.stats.droppedBusy - previousCpu.stats.droppedBusy) : null;
+  const pressureDelta = previousCpu ? Math.max(0, sample.stats.droppedBackpressure - previousCpu.stats.droppedBackpressure) : null;
+  previousCpu = sample;
+  if (run) {
+    if (Number.isFinite(ps.cpu)) run.ps.push(ps.cpu);
+    if (Number.isFinite(ps.helpersCpu)) run.helpers.push(ps.helpersCpu);
+  }
+  const now = performance.now(), seconds = (now - windowAt) / 1000, w = windowData;
+  windowData = bucket(); windowAt = now;
+  const line = `${run ? run.config.codec : 'idle'} ${seconds.toFixed(2)}s recv=${fmt(w.received/seconds)}fps shown=${fmt(w.shown/seconds)}fps kbps=${fmt(w.bytes*8/1000/seconds)} bytes/frame=${fmt(w.received ? w.bytes/w.received : null)} recvLat=${pair(w.recv)}ms paintLat=${pair(w.paint)}ms decode=${fmt(mean(w.decode))}ms hostCPU=${fmt(hostCpu)}% Δbase=${fmt(hostCpu === null || baseline === null ? null : hostCpu-baseline)}pp ps=${fmt(ps.cpu)}% helpers=${fmt(ps.helpersCpu)}% encode=${fmt(sample.stats.avgEncodeUs)}µs obsDelay=${fmt(sample.stats.avgObsDelayUs)}µs busyΔ=${fmt(busyDelta,0)} pressureΔ=${fmt(pressureDelta,0)} displayDropped=${w.displayDropped}`;
+  $('live').textContent = line + '\nHost cumulative droppedBusy=' + sample.stats.droppedBusy + ' droppedBackpressure=' + sample.stats.droppedBackpressure + '\nRSS KiB=' + fmt(ps.rss,0) + '\nTop threads: ' + JSON.stringify(ps.threads || []) + (ps.errors?.length ? '\n/cpu: ' + ps.errors.join('; ') : '');
+  log(line);
+}
+function selectedConfig() {
+  const [width,height] = $('size').value.split('x').map(Number), codec = $('codec').value;
+  return {codec, width, height, fpsDivisor:+$('divisor').value, ...(codec === 'jpeg' ? {quality:+$('quality').value, pixfmt:$('pixfmt').value} : {bitrateKbps:+$('bitrate').value})};
+}
+async function startFeed(config) {
+  if (run) await stopFeed();
+  feedTransition = true;
+  try {
+  if (pollPromise) await pollPromise;
+  await logged('preview.stop');
+  discardRender();
+  if (config.codec === 'h264') await prepareDecoder();
+  const cpuStart = await hostSample();
+  run = {config:{...config}, transport, baseline, started:performance.now(), cpuStart, data:bucket(), ps:[], helpers:[], fakeStart:fakeOutput, notes:new Set(), outputStates:new Set([fakeOutput ? 'on' : 'off'])};
+  if (document.hidden) run.notes.add('tab hidden');
+  if ($('snapshots').checked) run.notes.add('snapshots on');
+  previousCpu = {at:cpuStart.at, stats:{...cpuStart.stats, droppedBusy:0, droppedBackpressure:0}}; windowData = bucket(); windowAt = run.started;
+  lastFrame = null; switchMark = null;
+  clearInterval(pollTimer);
+  pollTimer = setInterval(() => { if (!pollPromise && !feedTransition && ready) pollPromise = poll().catch(e => log('Poll: ' + e.message)).finally(() => { pollPromise = null; }); }, 2000);
+  try { await logged('preview.start', config); }
+  catch(e) {
+    discardRender();
+    if (run) saveRun(null, performance.now(), 'preview.start failed');
+    try { await logged('preview.stop'); } catch {}
+    throw e;
+  }
+  } finally { feedTransition = false; }
+}
+async function stopFeed() {
+  feedTransition = true;
+  try {
+  if (pollPromise) await pollPromise;
+  const owner = run, before = performance.now();
+  let final;
+  try { final = await logged('preview.stop'); }
+  catch(e) {
+    if (run === owner && run) { discardRender(); saveRun(null, performance.now(), 'stop failed; host stats incomplete'); }
+    throw e;
+  }
+  const end = performance.now();
+  if (run === owner && run) {
+    discardRender();
+    saveRun({stats:final, at:(before+end)/2}, end);
+  }
+  previousCpu = null;
+  } finally { feedTransition = false; }
+}
+const columns = ['transport','codec','size','divisor','quality/bitrate','pixfmt','fps recv','fps shown','kbps','recvLat p50/p95 ms','paintLat p50/p95 ms','decode ms avg','hostCpu %','Δ baseline pp','ps %cpu','helpersCpu %','avgEncodeUs','avgObsDelayUs','droppedBusy','droppedBackpressure','displayDropped','fakeOutput','duration s','notes'];
+function saveRun(final, end, note) {
+  if (!run) return;
+  const r = run, d = r.data, c = r.config, seconds = (end-r.started)/1000;
+  if (note) r.notes.add(note);
+  const hostCpu = cpuPct(r.cpuStart, final), stats = final?.stats;
+  const values = [r.transport,c.codec,`${c.width}x${c.height}`,c.fpsDivisor,c.codec === 'jpeg' ? c.quality : c.bitrateKbps + ' kbps',c.pixfmt || '—',fmt(d.received/seconds),fmt(d.shown/seconds),fmt(d.bytes*8/1000/seconds),pair(d.recv),pair(d.paint),fmt(mean(d.decode)),fmt(hostCpu),fmt(hostCpu === null || r.baseline === null ? null : hostCpu-r.baseline),fmt(mean(r.ps)),fmt(mean(r.helpers)),fmt(stats?.avgEncodeUs),fmt(stats?.avgObsDelayUs),fmt(stats?.droppedBusy,0),fmt(stats?.droppedBackpressure,0),d.displayDropped,[...r.outputStates].join('/'),fmt(seconds,2),[...r.notes].join('; ')];
+  rows.push(values); run = null; lastFrame = null; switchMark = null;
+  windowData = bucket(); windowAt = end;
+  renderTable(); log('RESULT | ' + values.join(' | '));
+}
+function markdown() { return '| ' + columns.join(' | ') + ' |\n| ' + columns.map(()=>'---').join(' | ') + ' |\n' + rows.map(row=>'| ' + row.map(x=>String(x).replace(/\|/g,'\\|').replace(/\n/g,' ')).join(' | ') + ' |').join('\n'); }
+function renderTable() {
+  const table = document.createElement('table');
+  for (const [i,row] of [columns,...rows].entries()) {
+    const tr = document.createElement('tr');
+    row.forEach(value => { const cell = document.createElement(i ? 'td' : 'th'); cell.textContent = value; tr.append(cell); });
+    table.append(tr);
+  }
+  $('results').replaceChildren(table);
+}
+renderTable();
+
+async function setupScenes() {
+  if (run) run.notes.add('scene setup during run');
+  await logged('scene.load', {sceneId:'A',width:128,height:72,background:'#102030'});
+  await logged('scene.load', {sceneId:'B',width:128,height:72,background:'#301020'});
+  await logged('source.create', {sceneId:'A',sourceId:'web-a',kind:'browser',url:'http://127.0.0.1:8787/page-a.html',width:1280,height:720});
+  await logged('source.create', {sceneId:'B',sourceId:'web-b',kind:'browser',url:'http://127.0.0.1:8787/page-b.html',width:1280,height:720});
+  await logged('scene.setProgram', {sceneId:'A'}); program = 'A';
+  log('Scenes ready. Allow a few seconds for CEF to paint. Reconnect now if the baseline should include these browser sources.');
+}
+let snapshotBusy = false;
+const snapshotMeans = {};
+setInterval(async () => {
+  if (!$('snapshots').checked || !ready || snapshotBusy || busy) return;
+  snapshotBusy = true;
+  try {
+    for (const target of ['program','web-a','web-b']) {
+      if (!$('snapshots').checked || !ready) break;
+      const result = await rpc('preview.snapshot', {width:target==='program'?320:160,height:target==='program'?180:90,quality:70,...(target === 'program' ? {} : {sourceId:target})});
+      if (!result.ok || !result.jpegBase64) throw new Error('Snapshot failed: ' + JSON.stringify(result));
+      $('thumb-' + target).src = 'data:image/jpeg;base64,' + result.jpegBase64;
+      const total = snapshotMeans[target] ||= {n:0,render:0,encode:0,bytes:0};
+      total.n++; total.render += result.renderUs; total.encode += result.encodeUs; total.bytes += result.bytes;
+      $('snap-' + target).textContent = `n=${total.n} render=${fmt(total.render/total.n)}µs encode=${fmt(total.encode/total.n)}µs bytes=${fmt(total.bytes/total.n)}`;
+    }
+  } catch(e) { log('Snapshot: ' + e.message); }
+  finally { snapshotBusy = false; }
+}, 1000);
+async function startOutput() {
+  if (fakeOutput) return;
+  const config = await (await fetch('/config')).json();
+  await logged('output.configure', {outputId:'rtmp-main',endpoint:`rtmp://127.0.0.1:${config.fakeIngestPort}/live`,videoEncoder:'videotoolbox_h264',audioEncoder:'aac'});
+  await logged('output.start', {outputId:'rtmp-main',streamKey:'proto'});
+  fakeOutput = true; if (run) run.outputStates.add('on');
+  $('outputState').textContent = 'Fake output: on (start accepted; check host events for encoding status)';
+}
+async function stopOutput() {
+  await logged('output.stop', {outputId:'rtmp-main'});
+  fakeOutput = false; if (run) run.outputStates.add('off'); $('outputState').textContent = 'Fake output: off';
+}
+async function matrix() {
+  matrixRunning = true; cancelMatrix = false; controls();
+  const startedOutputHere = $('matrixOutput').checked && !fakeOutput;
+  try {
+    if (run) await stopFeed();
+    if (startedOutputHere) { try { await startOutput(); } catch(e) { log('Fake output failed; matrix continues with output off: ' + e.message); } }
+    const cases = [
+      {codec:'jpeg',width:1280,height:720,fpsDivisor:1,quality:75,pixfmt:'i420'},
+      {codec:'jpeg',width:960,height:540,fpsDivisor:1,quality:75,pixfmt:'i420'},
+      {codec:'jpeg',width:640,height:360,fpsDivisor:1,quality:75,pixfmt:'i420'},
+      {codec:'jpeg',width:1280,height:720,fpsDivisor:2,quality:75,pixfmt:'i420'},
+      {codec:'jpeg',width:1280,height:720,fpsDivisor:1,quality:75,pixfmt:'bgra'},
+      {codec:'h264',width:1280,height:720,fpsDivisor:1,bitrateKbps:2500},
+      {codec:'h264',width:960,height:540,fpsDivisor:1,bitrateKbps:1500},
+      {codec:'h264',width:640,height:360,fpsDivisor:1,bitrateKbps:1000},
+    ];
+    for (let i=0; i<cases.length && !cancelMatrix && ready; i++) {
+      log(`Matrix ${i+1}/${cases.length}: ` + JSON.stringify(cases[i]));
+      const rowCount = rows.length;
+      try {
+        await startFeed(cases[i]);
+        const deadline = performance.now() + 8000;
+        while (!cancelMatrix && ready && performance.now() < deadline) await sleep(Math.min(100, deadline-performance.now()));
+        if (run && cancelMatrix) run.notes.add('matrix cancelled');
+        if (ready) await stopFeed();
+      } catch(e) {
+        log('Matrix case failed: ' + e.message);
+        // Unsupported H.264 fails before a run exists. Keep an explicit failed row.
+        if (rows.length === rowCount) {
+          const c = cases[i];
+          const values = columns.map(() => 'n/a');
+          values.splice(0, 6, transport, c.codec, `${c.width}x${c.height}`, c.fpsDivisor, c.quality ?? c.bitrateKbps + ' kbps', c.pixfmt || '—');
+          values[21] = fakeOutput ? 'on' : 'off'; values[23] = 'FAILED: ' + e.message;
+          rows.push(values); renderTable(); log('RESULT | ' + values.join(' | '));
+        }
+      }
+    }
+  } finally {
+    if (run && ready) { try { await stopFeed(); } catch(e) { log(e.message); } }
+    if (startedOutputHere && fakeOutput && ready) { try { await stopOutput(); } catch(e) { log(e.message); } }
+    matrixRunning = false; controls(); log(cancelMatrix ? 'Matrix cancelled' : 'Matrix finished');
+  }
+}
+$('direct').onclick = () => action(() => connect('direct'));
+$('relay').onclick = () => action(() => connect('relay'));
+$('setup').onclick = () => action(setupScenes);
+$('switch').onclick = async () => {
+  const next = program === 'A' ? 'B' : 'A';
+  $('switch').disabled = true;
+  if (run) run.notes.add('scene switch');
+  const at = performance.now(); switchMark = run ? {at,before:lastFrame} : null;
+  log('scene switch at ' + Date.now() + ' perf=' + at.toFixed(3) + ' target=' + next);
+  try { await logged('scene.setProgram', {sceneId:next}); program = next; }
+  catch(e) { switchMark = null; log('Scene switch failed: ' + e.message); }
+  finally { controls(); }
+};
+$('start').onclick = () => action(() => startFeed(selectedConfig()));
+$('stop').onclick = () => action(stopFeed);
+$('outputStart').onclick = () => action(startOutput);
+$('outputStop').onclick = () => action(stopOutput);
+$('matrix').onclick = () => matrix().catch(e => log('Matrix: ' + e.message));
+$('cancelMatrix').onclick = () => { cancelMatrix = true; };
+$('snapshots').onchange = () => { if (run) run.notes.add('snapshots toggled/on'); log('Snapshot loop ' + ($('snapshots').checked ? 'on' : 'off')); };
+$('copy').onclick = async () => {
+  try { await navigator.clipboard.writeText(markdown()); log('Copied results as Markdown'); }
+  catch(e) { log('Clipboard unavailable: ' + e.message + '\n' + markdown()); }
+};
+document.addEventListener('visibilitychange', () => { if (run && document.hidden) run.notes.add('tab hidden'); log(document.hidden ? 'Tab hidden: rAF may throttle; row marked.' : 'Tab visible'); });
+window.addEventListener('beforeunload', () => socket?.close());
+log('Ready. Enter host port and PID, connect, then wait for the 4 s baseline.');
+</script>
+</html>

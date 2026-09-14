@@ -1,0 +1,34 @@
+preview verbs advertised: ['preview.start', 'preview.stop', 'preview.stats', 'preview.snapshot']
+scene.load {"jsonrpc": "2.0", "id": 2, "result": {"ok": true, "sceneId": "A", "width": 128, "height": 72, "renderer": "offscreen-scaffold"}}
+scene.setProgram {"jsonrpc": "2.0", "id": 3, "result": {"ok": true, "programSceneId": "A"}}
+baseline stats {"ok": true, "running": false, "codec": "jpeg", "width": 0, "height": 0, "fpsDivisor": 1, "quality": 75, "pixfmt": "i420", "capture": "raw", "gpuPipeline": false, "bitrateKbps": 2500, "encoderId": "", "elapsedMs": 0, "framesIn": 0, "framesEncoded": 0, "framesSent": 0, "droppedBusy": 0, "droppedBackpressure": 0, "encodeFailures": 0, "sendFailures": 0, "keyframes": 0, "bytesSent": 0, "avgCopyUs": 0, "avgEncodeUs": 0, "maxEncodeUs": 0, "avgSendUs": 0, "avgCaptureToSentUs": 0, "cpuUserMs": 195, "cpuSysMs": 78, "cpuTotalMs": 273, "avgObsDelayUs": 0, "avgRenderUs": 0, "snapshots": 0, "avgSnapshotRenderUs": 0, "avgSnapshotEncodeUs": 0}
+source.create {"ok": true, "sourceId": "web", "sceneId": "A", "kind": "browser", "muted": false, "rerouteAudio": false, "opacity": 1.0, "urlStatus": "stored-redacted"}
+snapshot program: first renderUs=6308 steady renderUs=[873, 801, 905, 888, 805, 741, 708] encodeUs~93 bytes~3562
+snapshot scene: first renderUs=691 steady renderUs=[698, 695, 778, 1298, 1341, 981, 835] encodeUs~72 bytes~3493
+snapshot source: first renderUs=760 steady renderUs=[710, 747, 806, 705, 705, 809, 646] encodeUs~196 bytes~3493
+start {"ok": true, "running": true, "codec": "jpeg", "width": 1280, "height": 720, "fpsDivisor": 1, "quality": 75, "pixfmt": "i420", "capture": "raw", "gpuPipeline": false, "bitrateKbps": 2500, "encoderId": ""}
+  frames=120 fps=30.0 avgBytes=25588 latency ms p50=3 p95=5 keyframes=120
+  stats {"avgEncodeUs": 2553, "avgRenderUs": 0, "avgObsDelayUs": 37406, "avgCaptureToSentUs": 2906, "droppedBusy": 0, "droppedBackpressure": 0, "cpuUserMs": 585, "cpuSysMs": 142, "elapsedMs": 4038} hostCpu=18.0%
+start {"ok": true, "running": true, "codec": "jpeg", "width": 640, "height": 360, "fpsDivisor": 1, "quality": 75, "pixfmt": "i420", "capture": "raw", "gpuPipeline": false, "bitrateKbps": 2500, "encoderId": ""}
+  frames=121 fps=30.2 avgBytes=9564 latency ms p50=1 p95=2 keyframes=121
+  stats {"avgEncodeUs": 780, "avgRenderUs": 0, "avgObsDelayUs": 41818, "avgCaptureToSentUs": 1013, "droppedBusy": 0, "droppedBackpressure": 0, "cpuUserMs": 548, "cpuSysMs": 147, "elapsedMs": 4030} hostCpu=17.2%
+start {"ok": true, "running": true, "codec": "jpeg", "width": 1280, "height": 720, "fpsDivisor": 1, "quality": 75, "pixfmt": "bgra", "capture": "raw", "gpuPipeline": false, "bitrateKbps": 2500, "encoderId": ""}
+  frames=121 fps=30.2 avgBytes=27543 latency ms p50=4 p95=6 keyframes=121
+  stats {"avgEncodeUs": 3163, "avgRenderUs": 0, "avgObsDelayUs": 39015, "avgCaptureToSentUs": 3844, "droppedBusy": 0, "droppedBackpressure": 0, "cpuUserMs": 766, "cpuSysMs": 147, "elapsedMs": 4032} hostCpu=22.6%
+start {"ok": true, "running": true, "codec": "jpeg", "width": 1280, "height": 720, "fpsDivisor": 1, "quality": 75, "pixfmt": "bgra", "capture": "gpu", "gpuPipeline": false, "bitrateKbps": 2500, "encoderId": ""}
+  frames=121 fps=30.2 avgBytes=27086 latency ms p50=5 p95=7 keyframes=121
+  stats {"avgEncodeUs": 2889, "avgRenderUs": 2072, "avgObsDelayUs": 0, "avgCaptureToSentUs": 5044, "droppedBusy": 0, "droppedBackpressure": 0, "cpuUserMs": 613, "cpuSysMs": 133, "elapsedMs": 4015} hostCpu=18.6%
+start {"ok": true, "running": true, "codec": "jpeg", "width": 1280, "height": 720, "fpsDivisor": 1, "quality": 75, "pixfmt": "bgra", "capture": "gpu", "gpuPipeline": true, "bitrateKbps": 2500, "encoderId": ""}
+  frames=119 fps=29.8 avgBytes=27622 latency ms p50=5 p95=8 keyframes=119
+  stats {"avgEncodeUs": 2842, "avgRenderUs": 3506, "avgObsDelayUs": 0, "avgCaptureToSentUs": 6529, "droppedBusy": 0, "droppedBackpressure": 0, "cpuUserMs": 557, "cpuSysMs": 144, "elapsedMs": 4022} hostCpu=17.4%
+start {"ok": true, "running": true, "codec": "jpeg", "width": 640, "height": 360, "fpsDivisor": 1, "quality": 75, "pixfmt": "bgra", "capture": "gpu", "gpuPipeline": false, "bitrateKbps": 2500, "encoderId": ""}
+  frames=121 fps=30.2 avgBytes=9308 latency ms p50=3 p95=4 keyframes=121
+  stats {"avgEncodeUs": 1037, "avgRenderUs": 1778, "avgObsDelayUs": 0, "avgCaptureToSentUs": 2890, "droppedBusy": 0, "droppedBackpressure": 0, "cpuUserMs": 348, "cpuSysMs": 129, "elapsedMs": 4004} hostCpu=11.9%
+start {"ok": true, "running": true, "codec": "h264", "width": 1280, "height": 720, "fpsDivisor": 1, "quality": 75, "pixfmt": "i420", "capture": "raw", "gpuPipeline": false, "bitrateKbps": 2500, "encoderId": "com.apple.videotoolbox.videoencoder.ave.avc"}
+  frames=115 fps=28.8 avgBytes=9059 latency ms p50=0 p95=1 keyframes=4
+  stats {"avgEncodeUs": 0, "avgRenderUs": 0, "avgObsDelayUs": 0, "avgCaptureToSentUs": 0, "droppedBusy": 0, "droppedBackpressure": 0, "cpuUserMs": 243, "cpuSysMs": 132, "elapsedMs": 4115} hostCpu=9.1%
+start {"ok": true, "running": true, "codec": "h264", "width": 640, "height": 360, "fpsDivisor": 1, "quality": 75, "pixfmt": "i420", "capture": "raw", "gpuPipeline": false, "bitrateKbps": 1000, "encoderId": "com.apple.videotoolbox.videoencoder.ave.avc"}
+  frames=118 fps=29.5 avgBytes=3638 latency ms p50=0 p95=1 keyframes=4
+  stats {"avgEncodeUs": 0, "avgRenderUs": 0, "avgObsDelayUs": 0, "avgCaptureToSentUs": 0, "droppedBusy": 0, "droppedBackpressure": 0, "cpuUserMs": 283, "cpuSysMs": 171, "elapsedMs": 4260} hostCpu=10.7%
+saved /tmp/sm-preview-sample.jpg and /tmp/sm-snapshot-*.jpg
+host log error lines: ["error: Source ID 'color_filter_v2' not found", "error: Failed to create source 'color-correction'!"]

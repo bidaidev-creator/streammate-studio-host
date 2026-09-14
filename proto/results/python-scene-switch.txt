@@ -1,0 +1,11 @@
+jpeg switch: {"frames": 150, "maxGapMs": 80.6, "gapsOver100ms": 0, "seqSkips": 0, "msSwitchToNextFrame": 23.4, "framesUntilKeyframeAfterSwitch": 0, "switchRpc": {"ok": true, "programSceneId": "B"}} | host droppedBusy 0 avgObsDelayUs 38001 hostCpu% 15.8
+h264 switch: {"frames": 148, "maxGapMs": 129.3, "gapsOver100ms": 1, "seqSkips": 0, "msSwitchToNextFrame": 33.9, "framesUntilKeyframeAfterSwitch": 16, "switchRpc": {"ok": true, "programSceneId": "A"}} | host droppedBusy 0 avgObsDelayUs 0 hostCpu% 8.4
+jpeg source.remove mid-feed: {"frames": 121, "maxGapMs": 84.9, "gapsOver100ms": 0, "seqSkips": 0, "msSwitchToNextFrame": 33.5, "framesUntilKeyframeAfterSwitch": 0, "switchRpc": {"ok": true, "sourceId": "web-A", "removed": true}}
+CEF helper processes (%cpu rss comm):
+0.0  35536 node
+  0.6  87488 /opt/homebrew/lib/node_modules/@openai/codex/node_modules/@openai/codex-darwin-arm64/vendor/aarch64-apple-darwin/bin/codex
+  0.0  71088 /private/tmp/sm-host-proto/StreamMateStudioHost.app/Contents/Frameworks/studio-host Helper (GPU).app/Contents/MacOS/studio-host Helper (GPU)
+  0.0  55792 /private/tmp/sm-host-proto/StreamMateStudioHost.app/Contents/Frameworks/studio-host Helper.app/Contents/MacOS/studio-host Helper
+  0.0  59024 /private/tmp/sm-host-proto/StreamMateStudioHost.app/Contents/Frameworks/studio-host Helper.app/Contents/MacOS/studio-host Helper
+  0.0  91104 /private/tmp/sm-host-proto/StreamMateStudioHost.app/Contents/Frameworks/studio-host Helper (Renderer).app/Contents/MacOS/studio-host Helper (Renderer)
+  0.0  65184 /private/tmp/sm-host-proto/StreamMateStudioHost.app/Contents/Frameworks/studio-host Helper (Renderer).app/Contents/MacOS/studio-host Helper (Renderer)

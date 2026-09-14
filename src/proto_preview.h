@@ -149,6 +149,7 @@ public:
     pixfmt_ = extract_json_string(request, "pixfmt");
     if (pixfmt_.empty()) pixfmt_ = "i420";
     if (pixfmt_ != "bgra" && pixfmt_ != "i420") return err(-32602, "pixfmt must be bgra or i420");
+    encoder_pref_ = extract_json_string(request, "encoder");  // "" = VideoToolbox first, "x264" = software x264
     capture_ = extract_json_string(request, "capture");
     if (capture_.empty()) capture_ = "raw";
     if (capture_ != "raw" && capture_ != "gpu") return err(-32602, "capture must be raw or gpu");
@@ -189,7 +190,8 @@ public:
       conversion.width = width_;
       conversion.height = height_;
       conversion.colorspace = VIDEO_CS_DEFAULT;
-      conversion.range = VIDEO_RANGE_DEFAULT;
+      // JPEG is full-range; libobs's default output is partial range, so ask the scaler for full.
+      conversion.range = VIDEO_RANGE_FULL;
       obs_add_raw_video_callback2(&conversion, divisor_, &Feed::raw_video_cb, this);
       running_ = true;
       return status_json();
@@ -620,6 +622,7 @@ private:
       }
     }
     candidates.push_back("obs_x264");
+    if (encoder_pref_ == "x264") candidates = {"obs_x264"};
     for (const std::string &candidate : candidates) {
       obs_data_t *settings = obs_data_create();
       obs_data_set_int(settings, "bitrate", bitrate_kbps_);
@@ -762,6 +765,7 @@ private:
   std::atomic<uint64_t> snapshot_count_{0}, snapshot_render_us_total_{0}, snapshot_encode_us_total_{0};
   std::atomic<uint64_t> obs_delay_us_total_{0}, render_us_total_{0};
   std::string capture_ = "raw";
+  std::string encoder_pref_;
   bool gpu_pipeline_ = false;
   uint64_t gpu_interval_us_ = 33333;
 };
