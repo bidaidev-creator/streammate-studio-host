@@ -1,0 +1,322 @@
+{
+  "verdict": "emulated-directshow-configure-proven",
+  "physicalCameraTested": false,
+  "hostCommit": "8fce0a5da31d33d4949604eff1249e3a95b2dbc1",
+  "emulator": "AkVirtualCamera 9.2.0",
+  "mainThreadId": 7980,
+  "dialogThreadId": 11232,
+  "configureOpenings": 2,
+  "brightnessDisplayedBefore": 0,
+  "brightnessDisplayedAfter": 1,
+  "readyHealthResponses": 6,
+  "crossbarWindowAppeared": false,
+  "cleanHostExit": true,
+  "customForm": {
+    "sourceId": "cam",
+    "kind": "dshow_input",
+    "width": 640,
+    "height": 480,
+    "active": false,
+    "settings": {
+      "video_device_id": "StreamMate #2237 emulated camera:AkVCamVideoDevice1",
+      "last_video_device_id": "StreamMate #2237 emulated camera:AkVCamVideoDevice1",
+      "video_format": 0,
+      "res_type": 1,
+      "frame_interval": 333333,
+      "resolution": "640x480",
+      "last_resolution": "640x480"
+    },
+    "properties": [
+      {
+        "name": "video_device_id",
+        "type": "list",
+        "description": "Device",
+        "longDescription": "",
+        "visible": true,
+        "enabled": true,
+        "listType": "list",
+        "format": "string",
+        "items": [
+          {
+            "name": "StreamMate #37 emulated camera",
+            "value": "StreamMate #2237 emulated camera:AkVCamVideoDevice1",
+            "disabled": false
+          }
+        ]
+      },
+      {
+        "name": "activate",
+        "type": "button",
+        "description": "Deactivate",
+        "longDescription": "",
+        "visible": true,
+        "enabled": true
+      },
+      {
+        "name": "video_config",
+        "type": "button",
+        "description": "Configure Video",
+        "longDescription": "",
+        "visible": true,
+        "enabled": true
+      },
+      {
+        "name": "xbar_config",
+        "type": "button",
+        "description": "Configure Crossbar",
+        "longDescription": "",
+        "visible": true,
+        "enabled": true
+      },
+      {
+        "name": "deactivate_when_not_showing",
+        "type": "bool",
+        "description": "Deactivate when not showing",
+        "longDescription": "",
+        "visible": true,
+        "enabled": true
+      },
+      {
+        "name": "res_type",
+        "type": "list",
+        "description": "Resolution/FPS Type",
+        "longDescription": "",
+        "visible": true,
+        "enabled": true,
+        "listType": "list",
+        "format": "int",
+        "items": [
+          {
+            "name": "Device Default",
+            "value": 0,
+            "disabled": false
+          },
+          {
+            "name": "Custom",
+            "value": 1,
+            "disabled": false
+          }
+        ]
+      },
+      {
+        "name": "resolution",
+        "type": "list",
+        "description": "Resolution",
+        "longDescription": "",
+        "visible": true,
+        "enabled": true,
+        "listType": "editable",
+        "format": "string",
+        "items": [
+          {
+            "name": "1280x720",
+            "value": "1280x720",
+            "disabled": false
+          },
+          {
+            "name": "640x480",
+            "value": "640x480",
+            "disabled": false
+          }
+        ]
+      },
+      {
+        "name": "frame_interval",
+        "type": "list",
+        "description": "FPS",
+        "longDescription": "",
+        "visible": true,
+        "enabled": true,
+        "listType": "list",
+        "format": "int",
+        "items": [
+          {
+            "name": "Match Output FPS",
+            "value": -1,
+            "disabled": false
+          },
+          {
+            "name": "Highest FPS",
+            "value": 0,
+            "disabled": false
+          },
+          {
+            "name": "30",
+            "value": 333333,
+            "disabled": false
+          }
+        ]
+      },
+      {
+        "name": "video_format",
+        "type": "list",
+        "description": "Video Format",
+        "longDescription": "",
+        "visible": true,
+        "enabled": true,
+        "listType": "list",
+        "format": "int",
+        "items": [
+          {
+            "name": "Any",
+            "value": 0,
+            "disabled": false
+          },
+          {
+            "name": "YUY2",
+            "value": 301,
+            "disabled": false
+          }
+        ]
+      },
+      {
+        "name": "color_space",
+        "type": "list",
+        "description": "Color Space",
+        "longDescription": "",
+        "visible": true,
+        "enabled": true,
+        "listType": "list",
+        "format": "string",
+        "items": [
+          {
+            "name": "Default",
+            "value": "default",
+            "disabled": false
+          },
+          {
+            "name": "Rec. 709",
+            "value": "709",
+            "disabled": false
+          },
+          {
+            "name": "Rec. 601",
+            "value": "601",
+            "disabled": false
+          },
+          {
+            "name": "Rec. 2100 (PQ)",
+            "value": "2100PQ",
+            "disabled": false
+          },
+          {
+            "name": "Rec. 2100 (HLG)",
+            "value": "2100HLG",
+            "disabled": false
+          }
+        ]
+      },
+      {
+        "name": "color_range",
+        "type": "list",
+        "description": "Color Range",
+        "longDescription": "",
+        "visible": true,
+        "enabled": true,
+        "listType": "list",
+        "format": "string",
+        "items": [
+          {
+            "name": "Default",
+            "value": "default",
+            "disabled": false
+          },
+          {
+            "name": "Limited",
+            "value": "partial",
+            "disabled": false
+          },
+          {
+            "name": "Full",
+            "value": "full",
+            "disabled": false
+          }
+        ]
+      },
+      {
+        "name": "buffering",
+        "type": "list",
+        "description": "Buffering",
+        "longDescription": "When enabled, buffers video/audio data to ensure the smoothest and most\naccurate playback possible, but at the cost of increased latency. When using\nbuffering with a video capture card, it's recommended to set the card and the\nprogram to the same framerate for best results.\n\nWhen disabled, ensures lowest latency playback, but at the cost of frame\nplayback accuracy. This is ideal for face cameras, or when you want to use the\nprogram's preview window to play a console.\n\nAuto-detect (default) sets it to enabled if the device has delay, and disabled\nif it has no delay.",
+        "visible": true,
+        "enabled": true,
+        "listType": "list",
+        "format": "int",
+        "items": [
+          {
+            "name": "Auto-Detect",
+            "value": 0,
+            "disabled": false
+          },
+          {
+            "name": "Enable",
+            "value": 1,
+            "disabled": false
+          },
+          {
+            "name": "Disable",
+            "value": 2,
+            "disabled": false
+          }
+        ]
+      },
+      {
+        "name": "flip_vertically",
+        "type": "bool",
+        "description": "Flip Vertically",
+        "longDescription": "",
+        "visible": true,
+        "enabled": true
+      },
+      {
+        "name": "autorotation",
+        "type": "bool",
+        "description": "Apply rotation data from camera (if any)",
+        "longDescription": "",
+        "visible": true,
+        "enabled": true
+      },
+      {
+        "name": "hw_decode",
+        "type": "bool",
+        "description": "Use hardware decoding when available",
+        "longDescription": "",
+        "visible": true,
+        "enabled": true
+      },
+      {
+        "name": "audio_output_mode",
+        "type": "list",
+        "description": "Audio Output Mode",
+        "longDescription": "",
+        "visible": true,
+        "enabled": true,
+        "listType": "list",
+        "format": "int",
+        "items": [
+          {
+            "name": "Capture audio only",
+            "value": 0,
+            "disabled": false
+          },
+          {
+            "name": "Output desktop audio (DirectSound)",
+            "value": 1,
+            "disabled": false
+          },
+          {
+            "name": "Output desktop audio (WaveOut)",
+            "value": 2,
+            "disabled": false
+          }
+        ]
+      }
+    ]
+  },
+  "limitations": [
+    "No physical USB camera tested",
+    "No successful crossbar dialog tested",
+    "AkVirtualCamera 9.4.1 enumeration crashed the host twice; root cause not established",
+    "No SmartScreen reputation or shell-launch test"
+  ]
+}
