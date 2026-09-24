@@ -127,6 +127,7 @@ jobs:
           cmake -S external/obs-studio -B build/obs -G "Visual Studio 17 2022" -A x64 `
             -DVIRTUALCAM_GUID=A3FCE0F5-3493-419F-958A-ABA1250EC20B `
             -DENABLE_UI=OFF `
+            -DENABLE_VIRTUALCAM=OFF `
             -DENABLE_SERVICE_UPDATES=OFF `
             -DENABLE_SCRIPTING=OFF `
             -DENABLE_WEBRTC=OFF `
@@ -154,6 +155,8 @@ jobs:
           cmake --build build/obs --config RelWithDebInfo --target rtmp-services
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cmake --build build/obs --config RelWithDebInfo --target win-capture
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cmake --build build/obs --config RelWithDebInfo --target win-dshow
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cmake --build build/obs --config RelWithDebInfo --target win-wasapi
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
@@ -195,7 +198,7 @@ jobs:
             find build/obs/rundir -maxdepth 6 -print >&2
             exit 1
           fi
-          for module in obs-outputs obs-x264 rtmp-services win-capture win-wasapi; do
+          for module in obs-outputs obs-x264 rtmp-services win-capture win-wasapi win-dshow; do
             module_dll="$(find "$plugin_bin_dir" -maxdepth 1 -type f -iname "$module.dll" -print -quit)"
             module_data="$plugin_data_dir/$module"
             if [[ -z "$module_dll" || ! -d "$module_data" ]]; then
@@ -379,6 +382,16 @@ jobs:
           STREAMMATE_EXPECT_LIBOBS=1 STREAMMATE_EXPECT_CEF=1 \
           python tests/integration/test_cef_composition.py \
             dist/StreamMateStudioHost/studio-host.exe
+
+      - name: Smoke prototype DirectShow properties and buttons
+        shell: bash
+        run: python tests/integration/test_proto_dshow.py dist/StreamMateStudioHost/studio-host.exe
+
+      - name: Exercise owner probe with Windows PowerShell 5.1
+        shell: powershell
+        run: |
+          & powershell.exe -NoProfile -ExecutionPolicy Bypass -File dist/StreamMateStudioHost/dshow-probe.ps1 -Script "props;press video_config;health;quit"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Verify Windows repack determinism
         shell: bash

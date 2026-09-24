@@ -34,6 +34,7 @@
 #include <iostream>
 #include <limits>
 #include <limits.h>
+#include <locale>
 #include <map>
 #include <optional>
 #include <regex>
@@ -7066,6 +7067,159 @@ private:
   std::optional<std::string> pending_event_;
 };
 
+// PROTOTYPE (streammate-pivot#37) — throwaway, never merge
+uint32_t proto_main_thread_id = 0;
+uint32_t proto_thread_id() {
+#ifdef _WIN32
+  return GetCurrentThreadId();
+#else
+  return 0;
+#endif
+}
+
+class ProtoInputs {
+public:
+  ~ProtoInputs() { clear(); }
+  void clear() {
+#if STREAMMATE_HAS_LIBOBS
+    for (auto &entry : sources_) obs_source_release(entry.second);
+    sources_.clear();
+#endif
+  }
+  std::string call(const std::string &verb, const std::string &request) {
+#if STREAMMATE_HAS_LIBOBS
+    const auto id = extract_json_string(request, "sourceId");
+    if (id.empty()) return rpc_error_result(-32602, "sourceId is required");
+    auto it = sources_.find(id);
+    if (verb == "createInput") {
+      if (it != sources_.end()) return rpc_error_result(-32602, "proto source already exists");
+      const auto kind = extract_json_string(request, "kind");
+      bool registered = false;
+      const char *type = nullptr;
+      for (size_t i = 0; obs_enum_input_types(i, &type); ++i) {
+        if (kind == type) registered = true;
+      }
+      if (!registered) return rpc_error_result(-32602, "kind is not a registered input type");
+      auto body = extract_json_object_body(request, "settings");
+      obs_data_t *settings = obs_data_create_from_json(("{" + body.value_or("") + "}").c_str());
+      if (!settings) return rpc_error_result(-32602, "invalid settings object");
+      obs_source_t *source = obs_source_create(kind.c_str(), id.c_str(), settings, nullptr);
+      obs_data_release(settings);
+      if (!source) return rpc_error_result(-32603, "proto source creation failed");
+      // DShowInput activates on create unless deactivate_when_not_showing is set.
+      // No scene attachment or showing reference is needed for its default settings.
+      it = sources_.emplace(id, source).first;
+    }
+    if (it == sources_.end()) return rpc_error_result(-32602, "proto source not found");
+    obs_source_t *source = it->second;
+    if (verb == "remove") {
+      obs_source_release(source);
+      sources_.erase(it);
+      return "{\"sourceId\":" + quote(id.c_str()) + ",\"removed\":true}";
+    }
+    if (verb == "update") {
+      auto body = extract_json_object_body(request, "settings");
+      if (!body) return rpc_error_result(-32602, "settings object is required");
+      obs_data_t *settings = obs_data_create_from_json(("{" + *body + "}").c_str());
+      if (!settings) return rpc_error_result(-32602, "invalid settings object");
+      obs_source_update(source, settings);
+      obs_data_release(settings);
+    }
+    if (verb == "press") {
+      const auto name = extract_json_string(request, "property");
+      obs_properties_t *props = obs_source_properties(source);
+      obs_property_t *p = obs_properties_get(props, name.c_str());
+      if (!p || obs_property_get_type(p) != OBS_PROPERTY_BUTTON) {
+        obs_properties_destroy(props);
+        return rpc_error_result(-32602, "property is missing or is not a button");
+      }
+      const auto thread_id = proto_thread_id();
+      const bool returned = obs_property_button_clicked(p, source);
+      obs_properties_destroy(props);
+      return "{\"sourceId\":" + quote(id.c_str()) + ",\"property\":" + quote(name.c_str()) +
+             ",\"clicked\":true,\"callbackReturned\":" + (returned ? "true" : "false") +
+             ",\"hostThreadId\":" + std::to_string(thread_id) +
+             ",\"mainThreadId\":" + std::to_string(proto_main_thread_id) + "}";
+    }
+    obs_properties_t *props = obs_source_properties(source);
+    obs_data_t *settings = obs_source_get_settings(source);
+    const char *json = obs_data_get_json(settings);
+    std::string result = "{\"sourceId\":" + quote(id.c_str()) + ",\"kind\":" + quote(obs_source_get_id(source)) +
+      ",\"width\":" + std::to_string(obs_source_get_width(source)) +
+      ",\"height\":" + std::to_string(obs_source_get_height(source)) +
+      ",\"active\":" + (obs_source_active(source) ? "true" : "false") +
+      ",\"settings\":" + (json ? json : "{}") + ",\"properties\":" + properties(props) + "}";
+    obs_data_release(settings);
+    obs_properties_destroy(props);
+    return result;
+#else
+    (void)verb;
+    (void)request;
+    return rpc_error_result(-32603, "proto verbs require libobs");
+#endif
+  }
+private:
+  static std::string rpc_error_result(int code, const std::string &message) {
+    return "__error__:" + std::to_string(code) + ":" + message;
+  }
+  static std::string json_number(double value) {
+    if (!std::isfinite(value)) return "null";
+    std::ostringstream out;
+    out.imbue(std::locale::classic());
+    out << std::setprecision(17) << value;
+    return out.str();
+  }
+#if STREAMMATE_HAS_LIBOBS
+  static std::string quote(const char *s) { return "\"" + json_escape(s ? s : "") + "\""; }
+  static std::string properties(obs_properties_t *props) {
+    std::string out = "[";
+    for (auto *p = obs_properties_first(props); p; obs_property_next(&p)) {
+      if (out.size() > 1) out += ",";
+      const auto type = obs_property_get_type(p);
+      const char *names[] = {"invalid", "bool", "int", "float", "text", "path", "list", "color",
+                             "button", "font", "editable_list", "frame_rate", "group", "color_alpha"};
+      out += "{\"name\":" + quote(obs_property_name(p)) + ",\"type\":" + quote(names[type]) +
+        ",\"description\":" + quote(obs_property_description(p)) +
+        ",\"longDescription\":" + quote(obs_property_long_description(p)) +
+        ",\"visible\":" + (obs_property_visible(p) ? "true" : "false") +
+        ",\"enabled\":" + (obs_property_enabled(p) ? "true" : "false");
+      if (type == OBS_PROPERTY_INT) {
+        out += ",\"min\":" + std::to_string(obs_property_int_min(p)) + ",\"max\":" +
+          std::to_string(obs_property_int_max(p)) + ",\"step\":" + std::to_string(obs_property_int_step(p));
+      } else if (type == OBS_PROPERTY_FLOAT) {
+        out += ",\"min\":" + json_number(obs_property_float_min(p)) + ",\"max\":" +
+          json_number(obs_property_float_max(p)) + ",\"step\":" + json_number(obs_property_float_step(p));
+      } else if (type == OBS_PROPERTY_GROUP) {
+        out += ",\"children\":" + properties(obs_property_group_content(p));
+      } else if (type == OBS_PROPERTY_LIST) {
+        const auto format = obs_property_list_format(p);
+        const char *formats[] = {"invalid", "int", "float", "string", "bool"};
+        const char *lists[] = {"invalid", "editable", "list", "radio"};
+        out += ",\"listType\":" + quote(lists[obs_property_list_type(p)]) +
+          ",\"format\":" + quote(formats[format]) + ",\"items\":[";
+        for (size_t i = 0; i < obs_property_list_item_count(p); ++i) {
+          if (i) out += ",";
+          std::string value = "null";
+          switch (format) {
+          case OBS_COMBO_FORMAT_INT: value = std::to_string(obs_property_list_item_int(p, i)); break;
+          case OBS_COMBO_FORMAT_FLOAT: value = json_number(obs_property_list_item_float(p, i)); break;
+          case OBS_COMBO_FORMAT_STRING: value = quote(obs_property_list_item_string(p, i)); break;
+          case OBS_COMBO_FORMAT_BOOL: value = obs_property_list_item_bool(p, i) ? "true" : "false"; break;
+          default: break;
+          }
+          out += "{\"name\":" + quote(obs_property_list_item_name(p, i)) + ",\"value\":" + value +
+            ",\"disabled\":" + (obs_property_list_item_disabled(p, i) ? "true" : "false") + "}";
+        }
+        out += "]";
+      }
+      out += "}";
+    }
+    return out + "]";
+  }
+  std::map<std::string, obs_source_t *> sources_;
+#endif
+};
+
 class ControlServer {
 public:
   ControlServer(Options options, EngineLifecycle &engine, StateFile &state) : options_(std::move(options)), engine_(engine), state_(state) {
@@ -7077,6 +7231,8 @@ public:
     importer_.set_user_plugin_types(&engine_.user_plugin_types());
     build_command_table();
   }
+
+  void clear_proto_inputs() { proto_inputs_.clear(); }
 
   int run() {
     socket_t server = socket(AF_INET, SOCK_STREAM, 0);
@@ -7378,6 +7534,22 @@ private:
     add("replay.status", [this](socket_t fd, const std::string &id, const std::string &payload) {
       send_record_result(fd, id, record_replay_.replay_status(payload));
     });
+    // PROTOTYPE (streammate-pivot#37) — throwaway, never merge
+    add("proto.createInput", [this](socket_t fd, const std::string &id, const std::string &payload) {
+      send_renderer_result(fd, id, proto_inputs_.call("createInput", payload));
+    });
+    add("proto.props", [this](socket_t fd, const std::string &id, const std::string &payload) {
+      send_renderer_result(fd, id, proto_inputs_.call("props", payload));
+    });
+    add("proto.update", [this](socket_t fd, const std::string &id, const std::string &payload) {
+      send_renderer_result(fd, id, proto_inputs_.call("update", payload));
+    });
+    add("proto.press", [this](socket_t fd, const std::string &id, const std::string &payload) {
+      send_renderer_result(fd, id, proto_inputs_.call("press", payload));
+    });
+    add("proto.remove", [this](socket_t fd, const std::string &id, const std::string &payload) {
+      send_renderer_result(fd, id, proto_inputs_.call("remove", payload));
+    });
     add("host.shutdown", [this](socket_t fd, const std::string &id, const std::string &) {
       send_text_frame(fd, rpc_result(id, "{\"ok\":true}"));
       g_stop = 1;
@@ -7429,6 +7601,7 @@ private:
   Options options_;
   EngineLifecycle &engine_;
   StateFile &state_;
+  ProtoInputs proto_inputs_;
   RendererState renderer_;
   NativeOverlayManager native_overlays_;
   ObsImporter importer_;
@@ -7442,6 +7615,7 @@ private:
 } // namespace
 
 int main(int argc, char **argv) {
+  proto_main_thread_id = proto_thread_id();
 #if defined(_WIN32)
   // Graceful Windows lifecycle coverage uses host.shutdown; SIGINT remains a
   // useful console fallback, while SIGTERM/SIGPIPE do not have POSIX semantics.
@@ -7500,6 +7674,7 @@ int main(int argc, char **argv) {
 #else
     int result = server.run();
 #endif
+    server.clear_proto_inputs();
     engine.shutdown();
     return result;
   } catch (const std::exception &error) {

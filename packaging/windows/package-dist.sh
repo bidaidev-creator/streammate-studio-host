@@ -217,6 +217,9 @@ mkdir -p "$stage" "$plugins" "$plugin_data" "$core_data"
 
 cp "$host_bin" "$stage/studio-host.exe"
 cp "$smoke_bin" "$stage/studio-host-smoke.exe"
+# PROTOTYPE (streammate-pivot#37) — throwaway, never merge. Manifest these too.
+cp "$repo_root/prototype/windows-dshow/dshow-probe.ps1" "$stage/dshow-probe.ps1"
+cp "$repo_root/prototype/windows-dshow/README.md" "$stage/DSHOW-PROTOTYPE-README.md"
 
 copy_flat_dlls() {
   local source_dir="$1"
