@@ -22,11 +22,11 @@ class WindowsCiWorkflowTest(unittest.TestCase):
 
     def test_checkout_and_pinned_build_tools_are_wired(self) -> None:
         workflow = WORKFLOW.read_text(encoding="utf-8")
-        self.assertIn("uses: actions/checkout@v4", workflow)
+        self.assertIn("uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0", workflow)
         self.assertIn("submodules: recursive", workflow)
         self.assertIn("cmake==3.28.4", workflow)
         self.assertIn("ninja", workflow)
-        self.assertIn("uses: ilammy/msvc-dev-cmd@v1", workflow)
+        self.assertIn("uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756 # v1.13.0", workflow)
         self.assertIn("arch: x64", workflow)
         self.assertIn("-G Ninja", workflow)
 
@@ -150,7 +150,7 @@ class WindowsCiWorkflowTest(unittest.TestCase):
         self.assertIn("diff dist/sha256-manifest.txt dist-repack/sha256-manifest.txt", workflow)
         self.assertIn("cmp dist/StreamMateStudioHost-windows-x64.tar.gz", workflow)
         self.assertEqual(workflow.count('--source-revision "$GITHUB_SHA"'), 2)
-        self.assertIn("uses: actions/upload-artifact@v4", workflow)
+        self.assertIn("uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2", workflow)
         self.assertIn("name: streammate-studio-host-windows-x64", workflow)
         self.assertIn("dist/StreamMateStudioHost-windows-x64.tar.gz", workflow)
 
@@ -172,6 +172,21 @@ class WindowsCiWorkflowTest(unittest.TestCase):
         self.assertIn(
             "macOS: not registering windows-packaging (Windows-only contract)",
             cmake,
+        )
+
+    def test_actions_are_pinned_and_every_pwsh_step_stops_on_a_native_failure(self) -> None:
+        # The v2 candidate runner's workflow guard (streammate-pivot#118) fails
+        # a mutable action tag, and a pwsh step that runs on past a failing
+        # native command and keeps only the last one's exit code.
+        workflow = WORKFLOW.read_text(encoding="utf-8")
+        uses = [line.strip() for line in workflow.splitlines() if line.strip().startswith(("uses:", "- uses:"))]
+        self.assertGreaterEqual(len(uses), 5)
+        for line in uses:
+            with self.subTest(uses=line):
+                self.assertRegex(line, r"@[0-9a-f]{40}( |$)")
+        self.assertEqual(
+            workflow.count("shell: pwsh\n        run: |\n          $PSNativeCommandUseErrorActionPreference = $true\n"),
+            workflow.count("shell: pwsh"),
         )
 
 

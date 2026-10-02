@@ -17,7 +17,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           submodules: recursive
 
@@ -81,9 +81,9 @@ jobs:
           cmake --build build/obs --config RelWithDebInfo --target obs-outputs
           cmake --build build/obs --config RelWithDebInfo --target obs-x264
           cmake --build build/obs --config RelWithDebInfo --target rtmp-services
-          cmake --build build/obs --config RelWithDebInfo --target coreaudio-encoder || true
-          cmake --build build/obs --config RelWithDebInfo --target mac-videotoolbox || true
-          cmake --build build/obs --config RelWithDebInfo --target obs-ffmpeg || true
+          cmake --build build/obs --config RelWithDebInfo --target coreaudio-encoder
+          cmake --build build/obs --config RelWithDebInfo --target mac-videotoolbox
+          cmake --build build/obs --config RelWithDebInfo --target obs-ffmpeg
 
       # Spike #521 exit criterion 1: obs-browser MUST build against the pinned
       # libobs with the pinned CEF distribution (downloaded and hash-verified by
@@ -97,19 +97,22 @@ jobs:
           cmake --build build/obs --config RelWithDebInfo --target browser-helper_plugin
           cmake --build build/obs --config RelWithDebInfo --target browser-helper_renderer
 
+      # bash, for pipefail: GitHub's default shell runs `bash -e` without it,
+      # so a failing command before a pipe would pass unseen.
       - name: Survey CEF payload layout and linkage
+        shell: bash
         run: |
           set -x
           ls external/obs-studio/.deps
           find build/obs/plugins/obs-browser -maxdepth 3 \( -name '*.plugin' -o -name '*.app' \) -print
           cef_root="$(find external/obs-studio/.deps -maxdepth 1 -type d -name 'cef_binary_*' | head -n 1)"
-          ls "$cef_root" "$cef_root/Release" || true
+          ls "$cef_root" "$cef_root/Release"
           plugin_bin="$(find build/obs/plugins/obs-browser -path '*/obs-browser.plugin/Contents/MacOS/obs-browser' | head -n 1)"
           otool -L "$plugin_bin"
-          otool -l "$plugin_bin" | grep -A2 LC_RPATH || true
+          otool -l "$plugin_bin" | grep -A2 LC_RPATH
           helper_bin="$(find build/obs/plugins/obs-browser -path '*/OBS Helper.app/Contents/MacOS/OBS Helper' | head -n 1)"
           otool -L "$helper_bin"
-          otool -l "$helper_bin" | grep -A2 LC_RPATH || true
+          otool -l "$helper_bin" | grep -A2 LC_RPATH
 
       - name: Locate built libobs
         id: libobs
@@ -272,12 +275,13 @@ jobs:
       # plugins.report must show the registered-type deltas, every seeded
       # refusal class, restart determinism, and byte-identical user roots.
       - name: Run real user-plugin loading end-to-end against packaged app
+        shell: bash
         run: |
           depmiss="$RUNNER_TEMP/depmiss.plugin"
           rm -rf "$depmiss"
           cp -R build/host/streammate-test-source.plugin "$depmiss"
           bin="$depmiss/Contents/MacOS/streammate-test-source"
-          dep="$(otool -L "$bin" | awk 'NR>1 && /libobs/ {print $1; exit}')"
+          dep="$(otool -L "$bin" | awk 'NR>1 && /libobs/ && !found {print $1; found=1}')"
           test -n "$dep"
           install_name_tool -change "$dep" /nonexistent/streammate-missing-dep.dylib "$bin"
           codesign -s - -f "$bin"
@@ -318,21 +322,22 @@ jobs:
             dist/StreamMateStudioHost.app/Contents/MacOS/studio-host
 
       - name: Verify inside-out ad-hoc signature before upload
+        shell: bash
         run: |
           app="dist/StreamMateStudioHost.app"
           # Strict + recursive verification must run here: actions/upload-artifact
           # does not preserve the framework's Versions/Current symlinks, so a
           # post-download verify would be meaningless.
           codesign --verify --strict --deep --verbose=2 "$app"
-          outer="$(codesign -dvvv "$app" 2>&1 | awk -F= '/^Identifier=/{print $2; exit}')"
+          outer="$(codesign -dvvv "$app" 2>&1 | awk -F= '/^Identifier=/ && !found {print $2; found=1}')"
           test "$outer" = "com.streammate.studio-host"
           # Every nested component gets its own distinct per-component identifier,
           # namespaced under com.streammate.studio-host.vendored.* (never the
           # outer one). The framework's is exactly the vendored libobs id.
-          fw="$(codesign -dvvv "$app/Contents/Frameworks/libobs.framework" 2>&1 | awk -F= '/^Identifier=/{print $2; exit}')"
+          fw="$(codesign -dvvv "$app/Contents/Frameworks/libobs.framework" 2>&1 | awk -F= '/^Identifier=/ && !found {print $2; found=1}')"
           test "$fw" = "com.streammate.studio-host.vendored.libobs"
           for plugin in "$app"/Contents/PlugIns/obs-plugins/*.plugin; do
-            pid="$(codesign -dvvv "$plugin" 2>&1 | awk -F= '/^Identifier=/{print $2; exit}')"
+            pid="$(codesign -dvvv "$plugin" 2>&1 | awk -F= '/^Identifier=/ && !found {print $2; found=1}')"
             case "$pid" in
               com.streammate.studio-host.vendored.*) ;;
               *) echo "nested plugin identifier not namespaced: $pid" >&2; exit 1 ;;
@@ -382,7 +387,7 @@ jobs:
         run: tar -C dist -czf dist/StreamMateStudioHost.app.tar.gz StreamMateStudioHost.app sha256-manifest.txt THIRD-PARTY-NOTICES.md PAYLOAD-PROVENANCE.json
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: streammate-studio-host-macos-libobs
           path: dist/

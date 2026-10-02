@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import re
 import unittest
 from pathlib import Path
 
@@ -59,6 +60,20 @@ class MacosCiWorkflowTest(unittest.TestCase):
             upload_index,
             "repack-determinism check must run before the artifact upload",
         )
+
+    def test_actions_are_pinned_by_commit_and_no_exit_code_is_masked(self) -> None:
+        # The v2 candidate runner's workflow guard (streammate-pivot#118) fails
+        # a mutable action tag and an exit code a `|| true` swallows.
+        code = [line for line in WORKFLOW.read_text(encoding="utf-8").splitlines() if not line.lstrip().startswith("#")]
+        uses = [line.strip() for line in code if line.strip().startswith(("uses:", "- uses:"))]
+        self.assertGreaterEqual(len(uses), 2)
+        for line in uses:
+            with self.subTest(uses=line):
+                self.assertRegex(line, r"@[0-9a-f]{40}( |$)")
+        self.assertEqual([line for line in code if "|| true" in line], [])
+        for module in ["coreaudio-encoder", "mac-videotoolbox", "obs-ffmpeg"]:
+            with self.subTest(module=module):
+                self.assertTrue(any(re.search(rf"--target {module}$", line) for line in code))
 
 
 if __name__ == "__main__":
